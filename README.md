@@ -13,10 +13,10 @@ checkpoints without hand-tuning per model.
 from rwkv_quant import quantize
 
 # ~2x compression, near-lossless (+1.6% ppl on our 1.5B reference run)
-quantize("model.pth", "model.rwkvq", preset="medium")
+quantize("model.pth", "model.rwkvq", preset="reduction")
 
 # ~3.5x compression, moderate quality cost (+37.6% ppl on our reference run)
-quantize("model.pth", "model.rwkvq", preset="strong")
+quantize("model.pth", "model.rwkvq", preset="compression")
 ```
 
 Presets are a starting point, calibrated on `rwkv7-g1h-1.5b-ctx10240` — see

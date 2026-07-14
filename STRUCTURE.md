@@ -9,7 +9,7 @@ rwkv-quant/
 ├── rwkv_quant/
 │   ├── __init__.py
 │   ├── api.py                     # high-level entry points: quantize(), calibrate()
-│   ├── presets.py                 # "medium" / "strong" QuantConfig presets
+│   ├── presets.py                 # "reduction" / "compression" QuantConfig presets
 │   │
 │   ├── calibration/                # platform-agnostic. pure PyTorch. no backend
 │   │   ├── __init__.py             # code lives here -- this is the actual "brain"
@@ -86,7 +86,7 @@ produced by `calibration/` + `formats/writer.py` — no backend-specific
 calibration logic.
 
 **Two entry points, one underlying config type.** `api.py`'s `quantize()`
-accepts either a `preset` string (`"medium"` / `"strong"`, defined in
+accepts either a `preset` string (`"reduction"` / `"compression"`, defined in
 `presets.py`) for quick start, or an explicit `QuantConfig` for full
 control. Both paths end up as the same `QuantConfig` object consumed by
 `calibration/fake_quant.py` — presets are just pre-filled configs, not a

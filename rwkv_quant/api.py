@@ -8,10 +8,10 @@ from .presets import PRESETS
 from .calibration.group_config import QuantConfig
 
 
-def quantize(checkpoint_path: str, output_path: str, preset: str = "medium",
+def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
              config: "QuantConfig | None" = None):
     """
-    Quick-start: quantize(ckpt, out, preset="strong")
+    Quick-start: quantize(ckpt, out, preset="compression")
     Advanced:    quantize(ckpt, out, config=QuantConfig(proj=4, ...))
 
     preset игнорируется, если передан config.
