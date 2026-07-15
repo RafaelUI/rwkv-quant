@@ -12,7 +12,7 @@ import torch
 
 from .presets import PRESETS
 from .calibration import GROUPS, QuantConfig
-from .calibration.ablation import single_group_ablation, perplexity
+from .calibration.ablation import single_group_ablation, perplexity, combined_sanity_check
 from .models.rwkv7_ref import RWKV7Ref
 from .formats import save
 
@@ -96,7 +96,16 @@ def calibrate(checkpoint_path: str, eval_corpus_path: str, device: str = "mps",
             best_bits["small"] = 6
             clip_percentiles["small"] = small_clip_percentile
 
+    # single-group ablation выше оценивает каждую группу НЕЗАВИСИМО и не
+    # может поймать эффекты взаимодействия при одновременном квантовании
+    # (см. presets.py: все 4 LoRA-ветки на INT4 порознь безобидны, вместе --
+    # ~150x взрыв ppl). Обязательная проверка целиком перед выдачей конфига.
+    best_bits, outlier_fracs, final_ppl, final_delta = combined_sanity_check(
+        model, data, best_bits, outlier_fracs, clip_percentiles,
+        baseline_ppl=baseline_ppl, ppl_threshold_pct=ppl_threshold_pct, verbose=verbose)
+
     config = QuantConfig(clip_percentiles=clip_percentiles, outlier_fracs=outlier_fracs, **best_bits)
     if verbose:
         print(f"\nCalibrated config: {config}\noutlier_fracs={outlier_fracs}  clip={clip_percentiles}")
+        print(f"Финальный Δppl(целиком) = {final_delta:+.2f}%")
     return config

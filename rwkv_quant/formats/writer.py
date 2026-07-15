@@ -56,9 +56,21 @@ def _match_group(key: str):
     return None
 
 
+# models/rwkv7_ref.py НИКОГДА не квантует эти bias-термы LoRA-веток (w0/a0/v0
+# для world naming, *_lora_B.bias для custom) -- в forward они используются
+# raw, не через q(...) (см. rwkv7_ref.py: F.linear(..., t.w_lora_B_b) без
+# обёртки). Если квантовать их здесь вслепую по паттерну группы, реальная
+# упаковка расходится с тем, что calibrate()/fake_quant вообще оценивали --
+# бага была обнаружена эмпирически: w0 имеет форму (1,1,C), per-row RTN на
+# ней даёт ОДНУ scale на все C каналов decay-gate'а, что напрямую портит
+# рекуррентность на каждом токене каждого слоя (ppl 11.4 -> 248 на 1.5B
+# при w_lora=INT4, входит в состав объяснения взрыва COMPRESSION).
+_LORA_BIAS_SUFFIXES = (".w_lora_B.bias", ".a_lora_B.bias", ".v_lora_B.bias", ".w0", ".a0", ".v0")
+
+
 def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTensor:
     group = _match_group(key)
-    if group is None or w.dim() < 2:
+    if group is None or w.dim() < 2 or key.endswith(_LORA_BIAS_SUFFIXES):
         return QuantizedTensor(key=key, group=group or "other", bits=16, shape=tuple(w.shape),
                                 dense=w.to(torch.bfloat16))
 

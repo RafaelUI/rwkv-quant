@@ -68,6 +68,64 @@ def single_group_ablation(model, data, groups=None, bits_grid=(8, 4, 2), verbose
     return baseline_ppl, results
 
 
+def combined_sanity_check(model, data, best_bits, outlier_fracs, clip_percentiles,
+                           baseline_ppl=None, ppl_threshold_pct=5.0, explosion_multiplier=5.0,
+                           verbose=True):
+    """
+    Комбинаторная проверка перед тем, как calibrate() вернёт финальный
+    QuantConfig: single-group ablation оценивает каждую группу НЕЗАВИСИМО
+    и физически не может поймать эффекты ВЗАИМОДЕЙСТВИЯ при одновременном
+    квантовании нескольких групп. Пример из практики: все четыре LoRA-ветки
+    (w/a/v/g) на INT4 по отдельности безобидны (Δppl < 1%), но вместе дают
+    ~150x взрыв ppl на rwkv7-g1h-1.5b (11.4 -> 1708) -- см. presets.py.
+
+    Собирает финальный config целиком, меряет ppl НА НЁМ (не по группам),
+    и если результат взорвался сильнее разумного запаса на ожидаемый
+    комбинаторный эффект (explosion_multiplier * ppl_threshold_pct) --
+    откатывает САМУЮ агрессивно квантованную группу на шаг вверх по
+    битности и повторяет, пока не уложится в допуск или не кончится
+    бюджет попыток. Мутирует best_bits/outlier_fracs на месте и
+    возвращает их же для читаемости на стороне вызова.
+    """
+    baseline_ppl = baseline_ppl if baseline_ppl is not None else perplexity(model, data, QuantConfig())
+    BITS_LADDER = [2, 3, 4, 6, 8, 16]
+    explosion_threshold = ppl_threshold_pct * explosion_multiplier
+
+    def combined_ppl():
+        cfg = QuantConfig(clip_percentiles=clip_percentiles, outlier_fracs=outlier_fracs, **best_bits)
+        return perplexity(model, data, cfg)
+
+    ppl = combined_ppl()
+    delta = 100 * (ppl - baseline_ppl) / baseline_ppl
+    if verbose:
+        print(f"\n  [combined sanity check] Δppl(целиком)={delta:+.2f}%  (допуск {explosion_threshold:.1f}%)")
+
+    guard = 0
+    while delta > explosion_threshold and guard < 20:
+        guard += 1
+        candidates = [g for g in best_bits if best_bits[g] < 16]
+        if not candidates:
+            break
+        g = min(candidates, key=lambda g: best_bits[g])
+        cur = best_bits[g]
+        nxt = next((b for b in BITS_LADDER if b > cur), 16)
+        if verbose:
+            print(f"  [combined sanity check] откатываю {g}: INT{cur} -> INT{nxt} (самая агрессивная группа)")
+        best_bits[g] = nxt
+        if nxt >= 8:
+            outlier_fracs.pop(g, None)
+        ppl = combined_ppl()
+        delta = 100 * (ppl - baseline_ppl) / baseline_ppl
+        if verbose:
+            print(f"    -> Δppl(целиком)={delta:+.2f}%")
+
+    if delta > explosion_threshold and verbose:
+        print(f"  [combined sanity check] ВНИМАНИЕ: не уложился в допуск за {guard} попыток -- "
+              f"проверьте конфиг вручную")
+
+    return best_bits, outlier_fracs, ppl, delta
+
+
 def mixed_config_report(model, data, name: str, cfg: QuantConfig, state_dict, verbose=True):
     """Оценивает один смешанный конфиг: ppl, Δppl, размер, сжатие."""
     counts, incols, other = group_param_counts(state_dict)
