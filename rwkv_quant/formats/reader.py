@@ -9,7 +9,7 @@
 """
 import torch
 
-from .schema import QuantizedCheckpoint
+from .schema import QuantizedCheckpoint, int8_codes
 
 
 def load_raw(path: str) -> QuantizedCheckpoint:
@@ -19,7 +19,7 @@ def load_raw(path: str) -> QuantizedCheckpoint:
 def _dequantize_one(qt) -> torch.Tensor:
     if qt.bits >= 16:
         return qt.dense
-    w = (qt.codes.float() * qt.scale.float()).to(torch.bfloat16)
+    w = (int8_codes(qt).float() * qt.scale.float()).to(torch.bfloat16)
     if qt.outlier_indices is not None and qt.outlier_indices.numel() > 0:
         rows, cols = qt.outlier_indices[:, 0].long(), qt.outlier_indices[:, 1].long()
         w[rows, cols] = qt.outlier_values

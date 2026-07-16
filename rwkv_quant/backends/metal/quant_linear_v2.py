@@ -17,6 +17,7 @@ tests/test_quant_linear_v2.py.
 import numpy as np
 import mlx.core as mx
 
+from ...formats.schema import int8_codes
 from .quant_linear import _build_outlier_csr
 
 _kernel_cache = {}
@@ -76,13 +77,107 @@ constant uint TG    = {TG};
     return kern
 
 
+_packed_cache = {}
+
+R_PACKED = 8  # выходных строк на threadgroup: x-активации читаются один раз
+              # на R строк -- при GEMV именно суммарный трафик x (x читают ВСЕ
+              # threadgroup'ы, OUT/R раз) упирается в L2, а не codes в DRAM.
+              # Без блокировки packed был МЕДЛЕННЕЕ int8 (0.4-0.6x) при
+              # вдвое меньших codes; эмпирика M4: R=8/TG=32 head 2x vs int8.
+
+
+def _get_kernel_packed(IN: int, OUT: int, has_outliers: bool):
+    """GEMV по biased split-нибблам (schema.pack_int4): threadgroup из TG
+    потоков обслуживает R_PACKED строк, uchar4 = 8 колонок, распаковка --
+    два векторных &0xF / >>4 без знакового расширения, поправка -8*sum(x)
+    после цикла. Требования: IN % 8 == 0; OUT произвольный (guard)."""
+    key = (IN, OUT, has_outliers)
+    if key in _packed_cache:
+        return _packed_cache[key]
+
+    assert IN % 8 == 0, "packed-кернель требует IN % 8 == 0 (uchar4 = 8 колонок)"
+
+    # guard на хвостовой неполный блок строк -- ветка в горячем цикле ломает
+    # анроллинг (эмпирика: cmix 0.15 -> 0.31мс), поэтому компилируем её
+    # только когда OUT не делится на R (наши шапки 1.5B все делятся).
+    guard_hot  = "" if OUT % R_PACKED == 0 else "            if (row0 + j >= OUT_C) break;\n"
+    guard_tail = "" if OUT % R_PACKED == 0 else "        if (row >= OUT_C) break;\n"
+
+    hdr = f"""
+constant uint IN_C  = {IN};
+constant uint OUT_C = {OUT};
+constant uint TG    = {TG};
+constant uint R     = {R_PACKED};
+"""
+    outlier_body = """
+        uint start = row_offsets[row];
+        uint end   = row_offsets[row+1];
+        float oacc = 0.0f;
+        for (uint idx = start + lane; idx < end; idx += TG) {
+            uint c = (uint)outlier_cols[idx];
+            oacc += x[n*IN_C + c] * outlier_vals[idx];
+        }
+        a += oacc;
+""" if has_outliers else ""
+
+    body = """
+    uint g    = threadgroup_position_in_grid.x;   // блок из R строк
+    uint n    = threadgroup_position_in_grid.y;   // batch row
+    uint lane = thread_position_in_threadgroup.x;
+    uint row0 = g * R;
+
+    device const float4* x4 = (device const float4*)(x + n*IN_C);
+    float acc[R];
+    for (uint j = 0; j < R; j++) acc[j] = 0.0f;
+    float xs = 0.0f;
+
+    for (uint p = lane; p < IN_C/8; p += TG) {
+        float4 xa = x4[p], xb = x4[IN_C/8 + p];
+        xs += dot(xa, float4(1.0f)) + dot(xb, float4(1.0f));
+        for (uint j = 0; j < R; j++) {
+GUARD_HOT            uchar4 q = ((device const uchar4*)(codes + (row0+j)*(IN_C/2)))[p];
+            uchar4 lo = q & (uchar)0xF;
+            uchar4 hi = q >> 4;
+            acc[j] += dot(xa, float4(lo.x, lo.y, lo.z, lo.w))
+                    + dot(xb, float4(hi.x, hi.y, hi.z, hi.w));
+        }
+    }
+    for (uint j = 0; j < R; j++) {
+        uint row = row0 + j;
+GUARD_TAIL        // biased: sum(x*(n-8)) = sum(x*n) - 8*sum(x); частичные суммы по
+        // lane'ам согласованы (каждый lane вычитает свои 8*xs), scale --
+        // per-row константа, домножение до simd_sum эквивалентно.
+        float a = (acc[j] - 8.0f * xs) * (float)scale[row];
+""" + outlier_body + """
+        a = simd_sum(a);
+        if (lane == 0)
+            out[n*OUT_C + row] = a;
+    }
+"""
+    body = body.replace("GUARD_HOT", guard_hot).replace("GUARD_TAIL", guard_tail)
+    kern = mx.fast.metal_kernel(
+        name=f"quant_linear_v2p_{'spqr' if has_outliers else 'plain'}_{IN}_{OUT}",
+        input_names=["x", "codes", "scale", "row_offsets", "outlier_cols", "outlier_vals"],
+        output_names=["out"],
+        header=hdr, source=body,
+    )
+    _packed_cache[key] = kern
+    return kern
+
+
 class QuantLinearV2:
     """Drop-in замена QuantLinear (v1) с threadgroup-редукцией."""
 
     def __init__(self, qt):
         assert qt.bits < 16, "QuantLinearV2 только для квантованных тензоров"
         self.out_features, self.in_features = qt.shape
-        self.codes = mx.array(qt.codes.numpy())
+        self.packed = qt.codes_packed is not None and self.in_features % 8 == 0
+        if self.packed:
+            self.codes = mx.array(qt.codes_packed.numpy())  # uint8 нибблы, половина трафика
+        elif qt.codes is not None:
+            self.codes = mx.array(qt.codes.numpy())
+        else:  # packed-тензор с IN, не кратным 8 -- fallback на распаковку
+            self.codes = mx.array(int8_codes(qt).numpy())
         self.scale = mx.array(qt.scale.float().numpy().reshape(-1))
         self.row_offsets, self.outlier_cols, self.outlier_vals = _build_outlier_csr(
             qt.outlier_indices, qt.outlier_values, self.out_features)
@@ -92,10 +187,15 @@ class QuantLinearV2:
         lead_shape = x.shape[:-1]
         x2d = x.reshape(-1, self.in_features).astype(mx.float32)
         N = x2d.shape[0]
-        kern = _get_kernel_v2(self.in_features, self.out_features, self.has_outliers)
+        getk = _get_kernel_packed if self.packed else _get_kernel_v2
+        kern = getk(self.in_features, self.out_features, self.has_outliers)
+        if self.packed:
+            n_groups = (self.out_features + R_PACKED - 1) // R_PACKED
+        else:
+            n_groups = self.out_features
         out = kern(
             inputs=[x2d, self.codes, self.scale, self.row_offsets, self.outlier_cols, self.outlier_vals],
-            grid=(self.out_features * TG, N, 1), threadgroup=(TG, 1, 1),
+            grid=(n_groups * TG, N, 1), threadgroup=(TG, 1, 1),
             output_shapes=[(N, self.out_features)],
             output_dtypes=[mx.float32],
         )[0]

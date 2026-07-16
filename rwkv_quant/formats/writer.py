@@ -9,7 +9,7 @@ import torch
 
 from ..calibration.group_config import QuantConfig
 from ..calibration.outlier_scan import GROUP_KEY_PATTERNS
-from .schema import QuantizedTensor, QuantizedCheckpoint
+from .schema import QuantizedTensor, QuantizedCheckpoint, pack_int4
 
 
 def _real_quantize(w: torch.Tensor, bits: int):
@@ -68,6 +68,17 @@ def _match_group(key: str):
 _LORA_BIAS_SUFFIXES = (".w_lora_B.bias", ".a_lora_B.bias", ".v_lora_B.bias", ".w0", ".a0", ".v0")
 
 
+def _make_qt(key, group, bits, shape, codes, scale, oi=None, ov=None):
+    """bits <= 4 -> нибблы (codes_packed), иначе int8 codes as-is."""
+    if bits <= 4:
+        return QuantizedTensor(key=key, group=group, bits=bits, shape=tuple(shape),
+                               codes_packed=pack_int4(codes), scale=scale,
+                               outlier_indices=oi, outlier_values=ov)
+    return QuantizedTensor(key=key, group=group, bits=bits, shape=tuple(shape),
+                           codes=codes, scale=scale,
+                           outlier_indices=oi, outlier_values=ov)
+
+
 def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTensor:
     group = _match_group(key)
     if group is None or w.dim() < 2 or key.endswith(_LORA_BIAS_SUFFIXES):
@@ -81,16 +92,14 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTen
 
     if group in cfg.outlier_fracs:
         codes, scale, oi, ov = _real_quantize_sparse_outlier(w, bits, cfg.outlier_fracs[group])
-        return QuantizedTensor(key=key, group=group, bits=bits, shape=tuple(w.shape),
-                                codes=codes, scale=scale, outlier_indices=oi, outlier_values=ov)
+        return _make_qt(key, group, bits, w.shape, codes, scale, oi, ov)
 
     # clip_percentiles игнорируется здесь по конструкции: percentile-clipping
     # хорош для измерения ppl (fake_quant), но для реальной упаковки нужен
     # либо SpQR (outlier_fracs), либо обычный RTN -- см. README про то, почему
     # clipping вредит dense-группам.
     codes, scale = _real_quantize(w, bits)
-    return QuantizedTensor(key=key, group=group, bits=bits, shape=tuple(w.shape),
-                            codes=codes, scale=scale)
+    return _make_qt(key, group, bits, w.shape, codes, scale)
 
 
 def save(state_dict: dict, config: QuantConfig, output_path: str,

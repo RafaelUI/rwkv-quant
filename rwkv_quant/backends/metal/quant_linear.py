@@ -11,6 +11,8 @@ writer._real_quantize_sparse_outlier), поэтому outlier-коррекция
 import numpy as np
 import mlx.core as mx
 
+from ...formats.schema import int8_codes
+
 
 def _build_outlier_csr(outlier_indices, outlier_values, n_rows):
     """torch [n_outliers,2] (row,col) + [n_outliers] значения ->
@@ -84,7 +86,7 @@ class QuantLinear:
         # qt: rwkv_quant.formats.schema.QuantizedTensor, bits < 16
         assert qt.bits < 16, "QuantLinear только для квантованных тензоров"
         self.out_features, self.in_features = qt.shape
-        self.codes = mx.array(qt.codes.numpy())          # int8 [out, in]
+        self.codes = mx.array(int8_codes(qt).numpy())    # int8 [out, in] (packed распаковывается: v1 -- референс)
         self.scale = mx.array(qt.scale.float().numpy().reshape(-1))  # fp32 [out]
         self.row_offsets, self.outlier_cols, self.outlier_vals = _build_outlier_csr(
             qt.outlier_indices, qt.outlier_values, self.out_features)

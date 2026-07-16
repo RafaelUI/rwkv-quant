@@ -1,1 +1,6 @@
-Tests/
+__pycache__/
+*.pyc
+.DS_Store
+tests/venv/
+*.log
+nohup.out
