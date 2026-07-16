@@ -36,7 +36,13 @@ import sys
 import mlx.core as mx
 
 from ...formats.reader import _dequantize_one
-from .quant_linear import QuantLinear
+from .quant_linear import QuantLinear  # noqa: F401 (v1, референс)
+from .quant_linear_v2 import QuantLinearV2
+
+# Реализация Linear-кернеля для всей модели. v2 (threadgroup-редукция,
+# char4-загрузки) численно эквивалентна v1 (tests/test_quant_linear_v2.py)
+# и быстрее на всех shapes 1.5B; v1 остаётся референсом.
+_QUANT_LINEAR_IMPL = QuantLinearV2
 
 _RWKV_METAL_PATH = os.environ.get("RWKV_METAL_PATH", os.path.expanduser("~/Develop/rwkv-metal"))
 if _RWKV_METAL_PATH not in sys.path:
@@ -97,7 +103,7 @@ def _linear(qt):
     """Linear-подобный тензор [out,in] (proj/cmix/head): QuantLinear если
     реально квантован (bits<16), иначе dense-обёртка с тем же интерфейсом."""
     if qt.bits < 16:
-        return QuantLinear(qt)
+        return _QUANT_LINEAR_IMPL(qt)
     return _DenseLinear(mx.array(qt.dense.float().numpy()))
 
 
