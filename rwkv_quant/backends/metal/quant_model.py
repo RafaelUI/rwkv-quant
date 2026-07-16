@@ -52,34 +52,13 @@ from rwkv_metal.kernel.wkv7 import wkv7_train, wkv7_infer, CHUNK  # noqa: E402
 
 
 def _wkv_stateful(r, w, k, v, a, b, state):
-    """Прогоняет произвольный T через wkv7_infer чанками по CHUNK (см.
-    rwkv_metal.kernel.wkv7.CHUNK, сейчас 16),
-    неся state между вызовами. Хвостовой неполный чанк паддится no-op
-    шагами (w=1, v=0, a=0 -> state*1 + 0 + 0 = state, доказано по формуле
-    рекуррентности в kernel/wkv7.py:279). Один и тот же путь обслуживает
-    и prefill произвольной длины, и single-token decode (T=1) -- разница
-    только в T на входе, код один."""
-    B, T, H, S = r.shape
-    outs = []
-    pos = 0
-    while pos < T:
-        n = min(CHUNK, T - pos)
-        r_c = r[:, pos:pos+n]; w_c = w[:, pos:pos+n]; k_c = k[:, pos:pos+n]
-        v_c = v[:, pos:pos+n]; a_c = a[:, pos:pos+n]; b_c = b[:, pos:pos+n]
-        if n < CHUNK:
-            pad = CHUNK - n
-            zeros = mx.zeros((B, pad, H, S))
-            ones = mx.ones((B, pad, H, S))
-            r_c = mx.concatenate([r_c, zeros], axis=1)
-            w_c = mx.concatenate([w_c, ones], axis=1)
-            k_c = mx.concatenate([k_c, zeros], axis=1)
-            v_c = mx.concatenate([v_c, zeros], axis=1)
-            a_c = mx.concatenate([a_c, zeros], axis=1)
-            b_c = mx.concatenate([b_c, zeros], axis=1)
-        out_c, state = wkv7_infer(r_c, w_c, k_c, v_c, a_c, b_c, state)
-        outs.append(out_c[:, :n])
-        pos += n
-    return mx.concatenate(outs, axis=1), state
+    """Прямой вызов wkv7_infer с произвольным T (>= 1): rwkv-metal с
+    параметризованным infer-кернелем (кеш по (H, T)) принимает любой T,
+    паддинг/чанкинг больше не нужны. Один путь обслуживает и prefill
+    произвольной длины, и single-token decode (T=1) без CHUNKx лишней
+    работы, побитово эквивалентно прежнему chunked+padding пути
+    (tests/test_wkv_var_model.py: ru60m и 1.5B, max_abs=0.0)."""
+    return wkv7_infer(r, w, k, v, a, b, state)
 
 
 def _dense(qt) -> mx.array:
