@@ -84,9 +84,24 @@ def _wkv_stateful(r, w, k, v, a, b, state):
 
 def _dense(qt) -> mx.array:
     """QuantizedTensor -> mx.array. Дороже (полный dequant), для всего,
-    что НЕ идёт через QuantLinear."""
+    что НЕ идёт через QuantLinear.
+
+    2D-матрицы (LoRA A/B и т.п.) храним в fp16: они memory-bound при
+    decode, половина трафика; активации остаются fp32, MLX промоутит
+    при матмуле. 1D-параметры (LN/GroupNorm, token-shift миксы) — fp32:
+    трафик нулевой, точность нормализаций важнее."""
     t = _dequantize_one(qt) if qt.bits < 16 else qt.dense
-    return mx.array(t.float().numpy())
+    arr = mx.array(t.float().numpy())
+    if arr.ndim == 2 and min(arr.shape) >= 32:
+        return arr.astype(mx.float16)
+    return arr
+
+
+def _mm(x, w):
+    """x @ w.T с приведением x к dtype весов (fp16 dense) и результата
+    обратно к dtype x. Избегает рантайм-каста весов fp16->fp32 в MLX
+    (полный fp32-трафик), который сводил на нет fp16-хранение."""
+    return (x.astype(w.dtype) @ w.T).astype(x.dtype)
 
 
 class _DenseLinear:
@@ -96,7 +111,7 @@ class _DenseLinear:
         self.w = w  # [out, in]
 
     def __call__(self, x):
-        return x @ self.w.T
+        return _mm(x, self.w)
 
 
 def _linear(qt):
@@ -104,7 +119,7 @@ def _linear(qt):
     реально квантован (bits<16), иначе dense-обёртка с тем же интерфейсом."""
     if qt.bits < 16:
         return _QUANT_LINEAR_IMPL(qt)
-    return _DenseLinear(mx.array(qt.dense.float().numpy()))
+    return _DenseLinear(mx.array(qt.dense.float().numpy()).astype(mx.float16))
 
 
 def l2_norm(x):
@@ -211,12 +226,12 @@ class QuantTMix:
         k = self.k_proj(xk).reshape(B, T, H, S)
         v = self.v_proj(xv).reshape(B, T, H, S)
 
-        g = (mx.sigmoid(xg @ self.g_lora_A.T) @ self.g_lora_B_w.T)
+        g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
 
-        a = mx.sigmoid((xa @ self.a_lora_A.T) @ self.a_lora_B_w.T + self.a_lora_B_b)
+        a = mx.sigmoid(_mm(_mm(xa, self.a_lora_A), self.a_lora_B_w) + self.a_lora_B_b)
         a = a.reshape(B, T, H, S)
 
-        w = (mx.tanh(xw @ self.w_lora_A.T)) @ self.w_lora_B_w.T + self.w_lora_B_b
+        w = _mm(mx.tanh(_mm(xw, self.w_lora_A)), self.w_lora_B_w) + self.w_lora_B_b
         w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
         w = w.reshape(B, T, H, S)
 
@@ -226,7 +241,7 @@ class QuantTMix:
         if self.layer_id == 0:
             v_first = v
         else:
-            vv = mx.sigmoid((xv @ self.v_lora_A.T) @ self.v_lora_B_w.T + self.v_lora_B_b).reshape(B, T, H, S)
+            vv = mx.sigmoid(_mm(_mm(xv, self.v_lora_A), self.v_lora_B_w) + self.v_lora_B_b).reshape(B, T, H, S)
             v = v + (v_first - v) * vv
 
         out = wkv7_train(r, w, k, v, -kk, kk * a)
@@ -265,12 +280,12 @@ class QuantTMix:
         k = self.k_proj(xk).reshape(B, T, H, S)
         v = self.v_proj(xv).reshape(B, T, H, S)
 
-        g = (mx.sigmoid(xg @ self.g_lora_A.T) @ self.g_lora_B_w.T)
+        g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
 
-        a = mx.sigmoid((xa @ self.a_lora_A.T) @ self.a_lora_B_w.T + self.a_lora_B_b)
+        a = mx.sigmoid(_mm(_mm(xa, self.a_lora_A), self.a_lora_B_w) + self.a_lora_B_b)
         a = a.reshape(B, T, H, S)
 
-        w = (mx.tanh(xw @ self.w_lora_A.T)) @ self.w_lora_B_w.T + self.w_lora_B_b
+        w = _mm(mx.tanh(_mm(xw, self.w_lora_A)), self.w_lora_B_w) + self.w_lora_B_b
         w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
         w = w.reshape(B, T, H, S)
 
@@ -280,7 +295,7 @@ class QuantTMix:
         if self.layer_id == 0:
             v_first = v
         else:
-            vv = mx.sigmoid((xv @ self.v_lora_A.T) @ self.v_lora_B_w.T + self.v_lora_B_b).reshape(B, T, H, S)
+            vv = mx.sigmoid(_mm(_mm(xv, self.v_lora_A), self.v_lora_B_w) + self.v_lora_B_b).reshape(B, T, H, S)
             v = v + (v_first - v) * vv
 
         out, new_wkv_state = _wkv_stateful(r, w, k, v, -kk, kk * a, wkv_state)
