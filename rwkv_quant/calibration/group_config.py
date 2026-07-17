@@ -18,7 +18,7 @@ GROUPS = ["proj", "w_lora", "a_lora", "v_lora", "g_lora", "small", "cmix", "emb_
 
 class QuantConfig:
     def __init__(self, clip_percentiles=None, outlier_fracs=None,
-                 bits_overrides=None, **bits_per_group):
+                 bits_overrides=None, group_scale=None, **bits_per_group):
         self.bits = {g: 16 for g in GROUPS}
         self.bits.update(bits_per_group)
         self.clip_percentiles = clip_percentiles or {}
@@ -29,6 +29,11 @@ class QuantConfig:
         # только в writer.quantize_tensor (реальный бэкенд); fake_quant
         # работает по группам и overrides не видит.
         self.bits_overrides = bits_overrides or {}
+        # group_scale: {группа: размер блока колонок} -- ПРОТОТИП group-wise
+        # scale (см. writer._groupwise_fake_dequant): тензор квантуется
+        # асимметрично по блокам gs колонок и хранится ДЕКВАНТОВАННЫМ dense
+        # bf16. Только для замера ppl; SpQR на таких группах не применяется.
+        self.group_scale = group_scale or {}
 
     def __repr__(self):
         r = "QuantConfig(" + ", ".join(f"{g}={self.bits[g]}" for g in GROUPS)

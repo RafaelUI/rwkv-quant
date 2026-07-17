@@ -144,6 +144,43 @@ CASES = {
         outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
         bits_overrides={"cmix.value.weight": 8, "ffn.value.weight": 8, "head.weight": 8},
     ),
+    # Group-wise scale прототип (per-32 асимметрично, как Q4_K; SpQR на
+    # gw-группах выключен -- локальные scale поглощают выбросы сами).
+    "gw32_cmix": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "emb_head": 0.02},
+        group_scale={"cmix": 32},
+    ),
+    "gw32_all": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32},
+    ),
+    "gw64_all": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        group_scale={"proj": 64, "cmix": 64, "emb_head": 64},
+    ),
+    # Композит: gw32 везде (int4) + INT8 на топ-чувствительных местах из
+    # №4d (cmix.value, head, small). INT8-тензоры тоже идут через gw32
+    # (асимметричный int8 -- строго не хуже per-row).
+    "gw32_plus": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        bits_overrides={"cmix.value.weight": 8, "ffn.value.weight": 8, "head.weight": 8},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32},
+    ),
+    # Гибрид: gw32 ТОЛЬКО на cmix (где он доказанно лучше per-row+SpQR:
+    # 15.88 vs 16.95 в изоляции), остальное как compression_plus.
+    # cmix.value через override -> gw32-int8.
+    "gw32_hybrid": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={"proj": 0.02, "emb_head": 0.02},
+        bits_overrides={"cmix.value.weight": 8, "ffn.value.weight": 8, "head.weight": 8},
+        group_scale={"cmix": 32},
+    ),
     "compression_fixed": QuantConfig(
         proj=4, cmix=4, emb_head=4,
         w_lora=4, a_lora=4, v_lora=4, g_lora=8,

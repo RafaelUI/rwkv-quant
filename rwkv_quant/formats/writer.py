@@ -49,6 +49,27 @@ def _real_quantize_sparse_outlier(w: torch.Tensor, bits: int, outlier_frac: floa
     return codes, scale.to(torch.float16), outlier_indices, outlier_values
 
 
+def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int) -> torch.Tensor:
+    """ПРОТОТИП group-wise scale (ядро K-квантов): асимметричный RTN на блок
+    из gs колонок (scale + min на блок), сразу деквантованный обратно.
+    Хранится как dense bf16 -> реальный пайплайн меряет ppl именно этой
+    схемы без написания формата/кернеля. НЕ для продакшена: размер dense.
+    Оверхед будущего формата: 2xfp16 на gs=32 элементов = +1 бит/элемент
+    (int4 -> eff 5.0 бит); с fp8-scale или Q4_K-style суперблоками меньше."""
+    w32 = w.float()
+    OUT, IN = w32.shape
+    pad = (-IN) % gs
+    wp = torch.nn.functional.pad(w32, (0, pad)) if pad else w32
+    wg = wp.view(OUT, wp.shape[1] // gs, gs)
+    mn = wg.amin(dim=2, keepdim=True)
+    mx = wg.amax(dim=2, keepdim=True)
+    qmax = 2 ** bits - 1
+    scale = ((mx - mn) / qmax).clamp_min(1e-8)
+    q = torch.clamp(torch.round((wg - mn) / scale), 0, qmax)
+    deq = (q * scale + mn).view(OUT, -1)[:, :IN]
+    return deq
+
+
 def _match_group(key: str):
     for group, pats in GROUP_KEY_PATTERNS.items():
         if any(key.endswith(pat) or pat in key for pat in pats):
@@ -90,6 +111,11 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTen
         if pat in key:
             bits = b
             break
+    gs = getattr(cfg, "group_scale", {}).get(group)
+    if gs and bits < 16:
+        deq = _groupwise_fake_dequant(w, bits, gs)
+        return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
+                                dense=deq.to(torch.bfloat16))
     if bits >= 16:
         return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
                                 dense=w.to(torch.bfloat16))
