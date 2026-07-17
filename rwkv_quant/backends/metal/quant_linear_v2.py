@@ -24,6 +24,13 @@ _kernel_cache = {}
 
 TG = 32  # потоков на выходную фичу; 32 = один simdgroup, редукция без барьеров
 
+GEMM_MIN_BATCH = 16  # N >= порога: dequant fp16 + mx.matmul (GEMM-путь префилла).
+                     # GEMV-кернели перечитывают веса на КАЖДУЮ строку батча
+                     # (нулевой реюз, см. NEXT_SESSION "Резервы"); dequant-путь
+                     # платит ~4.5 байта/элемент однократно (read codes + write
+                     # fp16 + matmul read) против N*(0.5-1) байт у GEMV --
+                     # брейк-ивен ~N=8-16, дальше выигрыш растёт с N.
+
 
 def _get_kernel_v2(IN: int, OUT: int, has_outliers: bool):
     key = (IN, OUT, has_outliers)
@@ -184,11 +191,43 @@ class QuantLinearV2:
         self.row_offsets, self.outlier_cols, self.outlier_vals = _build_outlier_csr(
             qt.outlier_indices, qt.outlier_values, self.out_features)
         self.has_outliers = qt.outlier_indices is not None and qt.outlier_indices.numel() > 0
+        if self.has_outliers:
+            oidx = qt.outlier_indices.numpy()
+            self._out_rows = mx.array(oidx[:, 0].astype(np.int32))
+            self._out_cols = mx.array(oidx[:, 1].astype(np.int32))
+            self._out_vals = mx.array(qt.outlier_values.float().numpy())
+
+    def _dequant_w(self):
+        """codes(+scale+outliers) -> fp16 [out, in] на GPU. Временный тензор
+        на один вызов (не кешируется: резидентный fp16 съел бы весь выигрыш
+        по памяти от квантования). codes нулевые в outlier-позициях
+        (writer._real_quantize_sparse_outlier), поэтому scatter-add --
+        чистое дополнение. ВСЯ арифметика в fp16: int-коды <= 127 в fp16
+        точны, потеря только на округлении scale/произведения (та же, что
+        у fp16-dense пути); fp32-промежутки здесь стоили бы 512MB
+        транзиента на head (65536x2048) на каждый вызов."""
+        if self.packed:
+            lo = (self.codes & 0xF).astype(mx.float16) - 8.0
+            hi = (self.codes >> 4).astype(mx.float16) - 8.0
+            w = mx.concatenate([lo, hi], axis=1)[:, : self.in_features]
+        else:
+            w = self.codes.astype(mx.float16)
+        w = w * self.scale.astype(mx.float16)[:, None]
+        if self.has_outliers:
+            w = w.at[self._out_rows, self._out_cols].add(self._out_vals.astype(mx.float16))
+        return w
 
     def __call__(self, x):
         lead_shape = x.shape[:-1]
         x2d = x.reshape(-1, self.in_features).astype(mx.float32)
         N = x2d.shape[0]
+        if N >= GEMM_MIN_BATCH:
+            # GEMM-путь префилла: один dequant + оптимизированный matmul MLX
+            # с реюзом весов по батчу; fp16-операнды (как dense-путь модели),
+            # выход fp32 -- интерфейс идентичен GEMV-веткам.
+            w = self._dequant_w()
+            out = mx.matmul(x2d.astype(mx.float16), w.T).astype(mx.float32)
+            return out.reshape(*lead_shape, self.out_features)
         getk = _get_kernel_packed if self.packed else _get_kernel_v2
         kern = getk(self.in_features, self.out_features, self.has_outliers)
         if self.packed:
