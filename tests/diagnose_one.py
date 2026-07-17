@@ -205,6 +205,17 @@ CASES = {
         outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
         act_stats_path="/tmp/act_stats_1p5b.pt",
     ),
+    # Проверка устойчивости AW к калибровочному корпусу: та же конфигурация,
+    # что aw_small8 (14.017 на статистике harrier-среза [8:16]), но E[x^2]
+    # собран на ЛИТЕРАТУРНОМ пользовательском тексте (~/Develop/test.txt,
+    # /tmp/calib_user.pt) -- другой домен. Если ppl держится ~14 --
+    # взвешивание ловит структуру модели, а не специфику корпуса.
+    "aw_small8_usercalib": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        act_stats_path="/tmp/act_stats_user.pt",
+    ),
     "compression_fixed": QuantConfig(
         proj=4, cmix=4, emb_head=4,
         w_lora=4, a_lora=4, v_lora=4, g_lora=8,

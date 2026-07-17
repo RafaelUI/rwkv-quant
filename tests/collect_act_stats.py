@@ -10,8 +10,13 @@ from rwkv_quant.models.rwkv7_ref import RWKV7Ref
 CKPT_PTH = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
 CORPUS = os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_world.pt")
 
+# argv: [corpus_path] [out_path] [slice]; дефолты -- прежнее поведение
+corpus = sys.argv[1] if len(sys.argv) > 1 else CORPUS
+out_path = sys.argv[2] if len(sys.argv) > 2 else "/tmp/act_stats_1p5b.pt"
+sl = sys.argv[3] if len(sys.argv) > 3 else "8:16"
+a, b = (int(x) if x else None for x in sl.split(":"))
 model = RWKV7Ref(CKPT_PTH, device="cpu", dtype=torch.bfloat16)
-data = torch.load(CORPUS)[8:16]
+data = torch.load(corpus)[a:b]
 ref_mod.ACT_RECORDER = {}
 t0 = time.time()
 with torch.no_grad():
@@ -19,5 +24,5 @@ with torch.no_grad():
         model.forward(data[i:i+1, :-1])
         print(f"chunk {i+1}/{data.shape[0]} {time.time()-t0:.0f}s", flush=True)
 stats = {k: (ss / max(n, 1)) for k, (ss, n) in ref_mod.ACT_RECORDER.items()}
-torch.save(stats, "/tmp/act_stats_1p5b.pt")
-print(f"saved {len(stats)} tensors -> /tmp/act_stats_1p5b.pt")
+torch.save(stats, out_path)
+print(f"saved {len(stats)} tensors -> {out_path}")
