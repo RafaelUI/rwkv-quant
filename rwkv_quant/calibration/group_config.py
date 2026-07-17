@@ -17,12 +17,22 @@ GROUPS = ["proj", "w_lora", "a_lora", "v_lora", "g_lora", "small", "cmix", "emb_
 
 
 class QuantConfig:
-    def __init__(self, clip_percentiles=None, outlier_fracs=None, **bits_per_group):
+    def __init__(self, clip_percentiles=None, outlier_fracs=None,
+                 bits_overrides=None, **bits_per_group):
         self.bits = {g: 16 for g in GROUPS}
         self.bits.update(bits_per_group)
         self.clip_percentiles = clip_percentiles or {}
         self.outlier_fracs = outlier_fracs or {}
+        # bits_overrides: {подстрока ключа: bits} -- точечная битность для
+        # ОТДЕЛЬНЫХ матриц поверх групповой (диагностика внутри групп:
+        # r/k/v/o в proj, key/value в cmix, emb vs head). Применяется
+        # только в writer.quantize_tensor (реальный бэкенд); fake_quant
+        # работает по группам и overrides не видит.
+        self.bits_overrides = bits_overrides or {}
 
     def __repr__(self):
-        return "QuantConfig(" + ", ".join(f"{g}={self.bits[g]}" for g in GROUPS) + ")"
+        r = "QuantConfig(" + ", ".join(f"{g}={self.bits[g]}" for g in GROUPS)
+        if self.bits_overrides:
+            r += ", overrides=" + repr(self.bits_overrides)
+        return r + ")"
 

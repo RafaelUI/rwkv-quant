@@ -86,6 +86,10 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTen
                                 dense=w.to(torch.bfloat16))
 
     bits = cfg.bits[group]
+    for pat, b in getattr(cfg, "bits_overrides", {}).items():
+        if pat in key:
+            bits = b
+            break
     if bits >= 16:
         return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
                                 dense=w.to(torch.bfloat16))

@@ -41,6 +41,109 @@ CASES = {
         small=6,
         outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
     ),
+    # Атрибуция потерь COMPRESSION (+48.3%): поднимаем ПО ОДНОЙ группе до
+    # INT8, остальное как в compression_fixed. SpQR-фракции не трогаем
+    # (на INT8 SpQR в шуме, см. compression_g8_spqr) -- меняется одна
+    # переменная: битность группы. Реальный бэкенд, срез [:8].
+    "attrib_proj8": QuantConfig(
+        proj=8, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+    ),
+    "attrib_cmix8": QuantConfig(
+        proj=4, cmix=8, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+    ),
+    "attrib_emb8": QuantConfig(
+        proj=4, cmix=4, emb_head=8,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+    ),
+    "attrib_small8": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+    ),
+    "attrib_wav8": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=8, a_lora=8, v_lora=8, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+    ),
+    # Уточнения атрибуции: small dense (векторы ~150KB суммарно -- размер
+    # ноль, был ли смысл в INT6?) и w/a/v dense (проверка немонотонности:
+    # INT8 дал ppl ХУЖЕ INT4 -- 20.34 vs 16.95; если dense тоже хуже,
+    # это интерференция ошибок групп, класс явлений бага №1).
+    "attrib_small16": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=16,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+    ),
+    "attrib_wav16": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=16, a_lora=16, v_lora=16, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+    ),
+    # Разрез ВНУТРИ групп (bits_overrides): одна матрица -> INT8, остальное
+    # как compression_fixed (16.947). Паттерны кроют оба naming'а.
+    "inner_proj_r": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"r_proj.weight": 8, "att.receptance.weight": 8},
+    ),
+    "inner_proj_k": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"k_proj.weight": 8, "att.key.weight": 8},
+    ),
+    "inner_proj_v": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"v_proj.weight": 8, "att.value.weight": 8},
+    ),
+    "inner_proj_o": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"o_proj.weight": 8, "att.output.weight": 8},
+    ),
+    "inner_cmix_key": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"cmix.key.weight": 8, "ffn.key.weight": 8},
+    ),
+    "inner_cmix_val": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"cmix.value.weight": 8, "ffn.value.weight": 8},
+    ),
+    "inner_emb": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"emb.weight": 8},
+    ),
+    "inner_head": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"head.weight": 8},
+    ),
+    # Кандидат COMPRESSION+: топ-3 чувствительных места из inner-атрибуции
+    # (cmix.value -1.47, small -1.50, head -0.80) в INT8, цена ~+268MB.
+    # Аддитивность МЕЖДУ группами не гарантирована (см. attrib_wav8/16) --
+    # только замер. Совпадает с рецептом Q4_K_M (Q6_K на ffn_down/attn_v).
+    "compression_plus": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"cmix.value.weight": 8, "ffn.value.weight": 8, "head.weight": 8},
+    ),
     "compression_fixed": QuantConfig(
         proj=4, cmix=4, emb_head=4,
         w_lora=4, a_lora=4, v_lora=4, g_lora=8,
