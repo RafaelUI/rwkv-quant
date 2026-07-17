@@ -85,6 +85,108 @@ constant uint TG    = {TG};
 
 
 _packed_cache = {}
+_packed_v3_cache = {}
+
+# Выбор packed-GEMV в __call__: v3 (uint4-загрузки, 32 колонки/инструкцию)
+# против v2 (uchar4, 8 колонок). Флаг -- для A/B бенчей чередованием в
+# одном процессе (tests/bench_gemv_v3.py); прод-значение фиксируется по
+# результату A/B. Итог A/B (bench_gemv_v3, батчевый eval, медианы
+# чередующихся раундов): ПАРИТЕТ на всех формах (~90-96 GB/s у обоих) --
+# ширина загрузок не лимитер; ~90 GB/s на кернель упираются в что-то ещё
+# (окупансность 32 потока/8 строк? латентность?). v3 выключен, оставлен
+# как площадка для следующих гипотез (больше simdgroup на строку, split-K).
+PACKED_V3 = False
+
+
+def _get_kernel_packed_v3(IN: int, OUT: int, has_outliers: bool):
+    """v3 GEMV по biased split-нибблам: как v2, но чтение кодов uint4
+    (16 байт = 32 колонки за загрузку, вчетверо шире uchar4). Мотивация --
+    Metal trace decode: GPU busy ~93%, ALU 32%, полоса ~90-100 GB/s из
+    ~275 достижимых => кернели не выбирают память; скалярно-узкие загрузки
+    -- первый подозреваемый. Распаковка: u & 0x0F0F0F0F / (u>>4) &
+    0x0F0F0F0F + as_type<uchar4> -- те же biased-нибблы, поправка -8*xs
+    как в v2. Требование IN % 32 == 0 (иначе __call__ падает на v2)."""
+    key = (IN, OUT, has_outliers)
+    if key in _packed_v3_cache:
+        return _packed_v3_cache[key]
+
+    assert IN % 32 == 0
+
+    guard_hot  = "" if OUT % R_PACKED == 0 else "            if (row0 + j >= OUT_C) break;\n"
+    guard_tail = "" if OUT % R_PACKED == 0 else "        if (row >= OUT_C) break;\n"
+
+    hdr = f"""
+constant uint IN_C  = {IN};
+constant uint OUT_C = {OUT};
+constant uint TG    = {TG};
+constant uint R     = {R_PACKED};
+"""
+    outlier_body = """
+        uint start = row_offsets[row];
+        uint end   = row_offsets[row+1];
+        float oacc = 0.0f;
+        for (uint idx = start + lane; idx < end; idx += TG) {
+            uint c = (uint)outlier_cols[idx];
+            oacc += x[n*IN_C + c] * outlier_vals[idx];
+        }
+        a += oacc;
+""" if has_outliers else ""
+
+    body = """
+    uint g    = threadgroup_position_in_grid.x;   // блок из R строк
+    uint n    = threadgroup_position_in_grid.y;   // batch row
+    uint lane = thread_position_in_threadgroup.x;
+    uint row0 = g * R;
+
+    device const float4* x4 = (device const float4*)(x + n*IN_C);
+    float acc[R];
+    for (uint j = 0; j < R; j++) acc[j] = 0.0f;
+    float xs = xsum[n] / (float)TG;
+
+    // p -- индекс uint4-блока: байты p*16..p*16+15 строки, т.е. lo-колонки
+    // p*16..+15 и hi-колонки IN/2+p*16..+15 (split-раскладка pack_int4)
+    for (uint p = lane; p < IN_C/32; p += TG) {
+        float4 xa0 = x4[p*4+0], xa1 = x4[p*4+1], xa2 = x4[p*4+2], xa3 = x4[p*4+3];
+        float4 xb0 = x4[IN_C/8 + p*4+0], xb1 = x4[IN_C/8 + p*4+1],
+               xb2 = x4[IN_C/8 + p*4+2], xb3 = x4[IN_C/8 + p*4+3];
+        for (uint j = 0; j < R; j++) {
+GUARD_HOT            uint4 q = ((device const uint4*)(codes + (row0+j)*(IN_C/2)))[p];
+            uchar4 l0 = as_type<uchar4>(q.x & 0x0F0F0F0Fu);
+            uchar4 l1 = as_type<uchar4>(q.y & 0x0F0F0F0Fu);
+            uchar4 l2 = as_type<uchar4>(q.z & 0x0F0F0F0Fu);
+            uchar4 l3 = as_type<uchar4>(q.w & 0x0F0F0F0Fu);
+            uchar4 h0 = as_type<uchar4>((q.x >> 4) & 0x0F0F0F0Fu);
+            uchar4 h1 = as_type<uchar4>((q.y >> 4) & 0x0F0F0F0Fu);
+            uchar4 h2 = as_type<uchar4>((q.z >> 4) & 0x0F0F0F0Fu);
+            uchar4 h3 = as_type<uchar4>((q.w >> 4) & 0x0F0F0F0Fu);
+            acc[j] += dot(xa0, float4(l0.x, l0.y, l0.z, l0.w))
+                    + dot(xa1, float4(l1.x, l1.y, l1.z, l1.w))
+                    + dot(xa2, float4(l2.x, l2.y, l2.z, l2.w))
+                    + dot(xa3, float4(l3.x, l3.y, l3.z, l3.w))
+                    + dot(xb0, float4(h0.x, h0.y, h0.z, h0.w))
+                    + dot(xb1, float4(h1.x, h1.y, h1.z, h1.w))
+                    + dot(xb2, float4(h2.x, h2.y, h2.z, h2.w))
+                    + dot(xb3, float4(h3.x, h3.y, h3.z, h3.w));
+        }
+    }
+    for (uint j = 0; j < R; j++) {
+        uint row = row0 + j;
+GUARD_TAIL        float a = (acc[j] - 8.0f * xs) * (float)scale[row];
+""" + outlier_body + """
+        a = simd_sum(a);
+        if (lane == 0)
+            out[n*OUT_C + row] = a;
+    }
+"""
+    body = body.replace("GUARD_HOT", guard_hot).replace("GUARD_TAIL", guard_tail)
+    kern = mx.fast.metal_kernel(
+        name=f"quant_linear_v3p_{'spqr' if has_outliers else 'plain'}_{IN}_{OUT}",
+        input_names=["x", "codes", "scale", "row_offsets", "outlier_cols", "outlier_vals", "xsum"],
+        output_names=["out"],
+        header=hdr, source=body,
+    )
+    _packed_v3_cache[key] = kern
+    return kern
 
 R_PACKED = 8  # выходных строк на threadgroup: x-активации читаются один раз
               # на R строк -- при GEMV именно суммарный трафик x (x читают ВСЕ
@@ -228,7 +330,11 @@ class QuantLinearV2:
             w = self._dequant_w()
             out = mx.matmul(x2d.astype(mx.float16), w.T).astype(mx.float32)
             return out.reshape(*lead_shape, self.out_features)
-        getk = _get_kernel_packed if self.packed else _get_kernel_v2
+        use_v3 = self.packed and PACKED_V3 and self.in_features % 32 == 0
+        if use_v3:
+            getk = _get_kernel_packed_v3
+        else:
+            getk = _get_kernel_packed if self.packed else _get_kernel_v2
         kern = getk(self.in_features, self.out_features, self.has_outliers)
         if self.packed:
             n_groups = (self.out_features + R_PACKED - 1) // R_PACKED
