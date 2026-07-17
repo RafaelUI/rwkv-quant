@@ -129,11 +129,13 @@ constant uint R     = {R_PACKED};
     device const float4* x4 = (device const float4*)(x + n*IN_C);
     float acc[R];
     for (uint j = 0; j < R; j++) acc[j] = 0.0f;
-    float xs = 0.0f;
+    // sum(x) для biased-поправки предвычислен снаружи (xsum[n]): раньше
+    // каждый из OUT/R threadgroup'ов считал его заново -- ~11% ALU кернеля
+    // (2 dot из 18 на итерацию) на одно и то же число.
+    float xs = xsum[n] / (float)TG;  // делим на TG: каждый lane вычтет свою долю до simd_sum
 
     for (uint p = lane; p < IN_C/8; p += TG) {
         float4 xa = x4[p], xb = x4[IN_C/8 + p];
-        xs += dot(xa, float4(1.0f)) + dot(xb, float4(1.0f));
         for (uint j = 0; j < R; j++) {
 GUARD_HOT            uchar4 q = ((device const uchar4*)(codes + (row0+j)*(IN_C/2)))[p];
             uchar4 lo = q & (uchar)0xF;
@@ -157,7 +159,7 @@ GUARD_TAIL        // biased: sum(x*(n-8)) = sum(x*n) - 8*sum(x); частичн�
     body = body.replace("GUARD_HOT", guard_hot).replace("GUARD_TAIL", guard_tail)
     kern = mx.fast.metal_kernel(
         name=f"quant_linear_v2p_{'spqr' if has_outliers else 'plain'}_{IN}_{OUT}",
-        input_names=["x", "codes", "scale", "row_offsets", "outlier_cols", "outlier_vals"],
+        input_names=["x", "codes", "scale", "row_offsets", "outlier_cols", "outlier_vals", "xsum"],
         output_names=["out"],
         header=hdr, source=body,
     )
@@ -191,10 +193,12 @@ class QuantLinearV2:
         kern = getk(self.in_features, self.out_features, self.has_outliers)
         if self.packed:
             n_groups = (self.out_features + R_PACKED - 1) // R_PACKED
+            extra = [mx.sum(x2d, axis=-1)]  # xsum[n]: один мелкий кернель вместо OUT/R пересчётов внутри GEMV
         else:
             n_groups = self.out_features
+            extra = []
         out = kern(
-            inputs=[x2d, self.codes, self.scale, self.row_offsets, self.outlier_cols, self.outlier_vals],
+            inputs=[x2d, self.codes, self.scale, self.row_offsets, self.outlier_cols, self.outlier_vals] + extra,
             grid=(n_groups * TG, N, 1), threadgroup=(TG, 1, 1),
             output_shapes=[(N, self.out_features)],
             output_dtypes=[mx.float32],

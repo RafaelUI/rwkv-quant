@@ -13,13 +13,17 @@ import rwkv_quant.backends.metal.quant_model as qm
 CKPT = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
 OUT_Q = "/tmp/compression_packed.rwkvq"
 
-sd = torch.load(CKPT, map_location="cpu")
-t0 = time.time()
-save(sd, COMPRESSION, OUT_Q, naming="world", n_layer=24, n_embd=2048,
-     head_size=64, vocab_size=65536)
-del sd
-size_mb = os.path.getsize(OUT_Q) / 1e6
-print(f"файл: {size_mb:.0f} MB  [{time.time()-t0:.0f}s]", flush=True)
+# Переиспользуем готовый .rwkvq: полная переквантовка 1.5B раздувает RSS
+# (torch-копии) и через page-outs портит последующий замер decode -- две
+# "аномалии" 27мс против честных 16 были именно этим.
+if not os.path.exists(OUT_Q):
+    sd = torch.load(CKPT, map_location="cpu")
+    t0 = time.time()
+    save(sd, COMPRESSION, OUT_Q, naming="world", n_layer=24, n_embd=2048,
+         head_size=64, vocab_size=65536)
+    del sd
+    print(f"квантовка: {time.time()-t0:.0f}s", flush=True)
+print(f"файл: {os.path.getsize(OUT_Q)/1e6:.0f} MB", flush=True)
 
 ckpt = load_raw(OUT_Q)
 n_packed = sum(1 for t in ckpt.tensors.values() if t.codes_packed is not None)
@@ -30,13 +34,19 @@ model = qm.QuantRWKV7(ckpt)
 states = model.init_state(1)
 idx = mx.array(np.array([[123]], dtype=np.int64))
 
+def _flat(st):
+    return [s for x in st for s in x if s is not None]
+
 def spin(seconds):
     global states
     t_end = time.perf_counter() + seconds
     n = 0
     while time.perf_counter() < t_end:
         logits, states = model.step(idx, states)
-        mx.eval(logits)
+        # ВАЖНО: eval'ить logits И states. Ленивые state-ноды между
+        # итерациями ломают конвейер (compiled-шаг материализует входы
+        # синхронно): наблюдалось 26-27 мс/ток вместо честных 16.
+        mx.eval(logits, *_flat(states))
         n += 1
     return n
 

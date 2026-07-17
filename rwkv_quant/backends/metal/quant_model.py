@@ -367,6 +367,32 @@ class QuantRWKV7:
             QuantBlock(tensors, f"blocks.{i}.", self.naming, i, self.n_head, self.head_size)
             for i in range(self.n_layer)
         ]
+        self._materialize()
+
+    def _materialize(self):
+        """Принудительный eval всех параметров. КРИТИЧНО для mx.compile:
+        _dense() строит ленивые astype-ноды (fp32->fp16); если mx.compile
+        трассирует шаг ДО их материализации, касты захватываются в граф и
+        пересчитываются на КАЖДЫЙ вызов (fp32-трафик всех dense-весов:
+        16 vs 26 мс/ток на COMPRESSION, бистабильность зависела от того,
+        успел ли eager-вызов материализовать веса до первого model.step)."""
+        arrs = []
+        def collect(obj, depth=0):
+            if depth > 3:
+                return
+            for v in vars(obj).values():
+                if isinstance(v, mx.array):
+                    arrs.append(v)
+                elif isinstance(v, (list, tuple)):
+                    for it in v:
+                        if isinstance(it, mx.array):
+                            arrs.append(it)
+                        elif hasattr(it, "__dict__"):
+                            collect(it, depth+1)
+                elif hasattr(v, "__dict__"):
+                    collect(v, depth+1)
+        collect(self)
+        mx.eval(arrs)
 
     def __call__(self, idx: mx.array) -> mx.array:
         x = self.emb_weight[idx]
@@ -397,11 +423,16 @@ class QuantRWKV7:
             self._step_compiled = mx.compile(self.forward_stateful)
         return self._step_compiled
 
-    def forward_stateful(self, idx: mx.array, states):
+    def forward_stateful(self, idx: mx.array, states, last_only: bool = False):
         """idx: [B, T] -- T=1 для single-token decode, T>1 для prefill
         произвольной длины (внутри чанкуется по 32 автоматически).
         states: список per-layer state из init_state() или предыдущего
-        вызова. Возвращает (logits, new_states)."""
+        вызова. Возвращает (logits, new_states).
+
+        last_only=True: head считается только для последней позиции
+        (logits [B, 1, V]) -- для prefill в генерации, где нужен лишь
+        следующий токен, это убирает (T-1)/T работы head'а (65536x2048 на
+        1.5B). Дефолт False сохраняет полные логиты (ppl, тесты)."""
         x = self.emb_weight[idx]
         x = _layer_norm(x, self.ln0_w, self.ln0_b)
         v_first = None
@@ -410,4 +441,6 @@ class QuantRWKV7:
             x, v_first, new_state = block.step(x, v_first, state)
             new_states.append(new_state)
         x = _layer_norm(x, self.ln_out_w, self.ln_out_b)
+        if last_only and x.shape[1] > 1:
+            x = x[:, -1:]
         return self.head(x), new_states
