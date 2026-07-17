@@ -152,6 +152,123 @@ CASES = {
         outlier_fracs={"proj": 0.02, "emb_head": 0.02},
         group_scale={"cmix": 32},
     ),
+    # MXFP4-вариант gw32_cmix (развилка формата v2, №4i): тот же блок 32,
+    # но E8M0-scale + E2M1 вместо асимметричного fp16 scale+min.
+    # Сравнивать с gw32_cmix=15.876 и baseline compression_fixed=16.947.
+    "mxfp4_cmix": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "emb_head": 0.02},
+        group_scale={"cmix": 32},
+        group_scale_mode={"cmix": "mxfp4"},
+    ),
+    # MXFP4 + SpQR(2%) на cmix: выбросы в sparse, блоки квантуют остаток.
+    # Последний шанс MXFP4-семантики: асимметрии у E8M0+E2M1 нет, хвосты
+    # может спасти только sparse. Сравнивать с mxfp4_cmix=17.216,
+    # gw32_cmix=15.876, baseline=16.947.
+    "mxfp4_cmix_spqr": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        group_scale={"cmix": 32},
+        group_scale_mode={"cmix": "mxfp4"},
+    ),
+    # Q4_K-стиль хранение scale/min: суперблок 256 (8x32), 6-битные
+    # scale/min против пары fp16 на суперблок => 4.5 бит/элемент против
+    # 5.0 у чистого gw32. Вопрос: сколько ppl стоит квантование scale.
+    # Сравнивать с gw32_cmix=15.876.
+    "gw32sb6_cmix": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "emb_head": 0.02},
+        group_scale={"cmix": 32},
+        group_scale_mode={"cmix": "asym_sb6"},
+    ),
+    # sb6 + грид/LS-поиск scale/min на блоке (make_qkx2-стиль). Тот же
+    # формат 4.5 бит, меняются только значения. Сравнивать с
+    # gw32sb6_cmix=16.075 и gw32_cmix(fp16)=15.876.
+    "gw32sb6s_cmix": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "emb_head": 0.02},
+        group_scale={"cmix": 32},
+        group_scale_mode={"cmix": "asym_sb6_search"},
+    ),
+    # AW-взвешенный поиск в gw32sb6 (E[x^2] в критерии грида и LS).
+    # Формат тот же 4.5 бит. Сравнивать с gw32sb6s_cmix=16.038,
+    # gw32_cmix(fp16)=15.876. Остальные int4-группы идут per-row-AW
+    # (act_stats_path работает на них как в aw_* кейсах №4f).
+    "aw_gw32sb6_cmix": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "emb_head": 0.02},
+        group_scale={"cmix": 32},
+        group_scale_mode={"cmix": "asym_sb6_aw"},
+        # только ffn-ключи: proj/emb_head остаются на обычном per-row+SpQR,
+        # чтобы сравнение с gw32sb6s_cmix изолировало эффект AW на cmix
+        act_stats_path="/tmp/act_stats_ffn.pt",
+    ),
+    # КОМПОЗИТ -- претендент на новый COMPRESSION-пресет: полная AW-статистика
+    # (per-row-AW+SpQR на proj/emb_head), gw32sb6+AW-поиск на cmix, small=8.
+    # Сравнивать с aw_small8=14.017 (1181MB); cmix на 4.5 бит => ~+35MB.
+    "aw_v2_composite": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={"proj": 0.02, "emb_head": 0.02},
+        group_scale={"cmix": 32},
+        group_scale_mode={"cmix": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # ОДНОРОДНЫЙ v2: gw32sb6+AW на ВСЕХ int4-группах (proj/cmix/emb_head),
+    # SpQR полностью выключен -- проверка "один кернель, одна раскладка".
+    # emb без статистики (вход -- индексы) => невзвешенный поиск, ок.
+    # Сравнивать с aw_v2_composite=13.757 (~1216MB); однородный ~1251MB
+    # (proj/emb_head тоже 4.5 бит вместо ~4.3 c per-row+SpQR).
+    "aw_v2_uniform": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Эмуляция MLX INT6 (rwkv7-1.5B-g1g-mlx-6bit): асимметричный RTN,
+    # группа 64, fp16 scale/bias -- схема совпадает с нашим gw-путём
+    # (mode asym) 1:1. Отличие от оригинала: у MLX lora-up (IN=96/64)
+    # остались fp16, у нас тоже 6 бит -- эффект пренебрежим. ~1.19GB.
+    # Сравнивать с aw_v2_uniform=13.525 (~1251MB), REDUCTION=13.15 (1530MB).
+    "mlx_int6_emu": QuantConfig(
+        proj=6, cmix=6, emb_head=6,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=6, small=16,
+        outlier_fracs={},
+        group_scale={"proj": 64, "cmix": 64, "emb_head": 64,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64, "g_lora": 64},
+    ),
+    # Якорь: всё bf16, без квантования. Абсолютный ноль деградации.
+    "bf16_baseline": QuantConfig(
+        proj=16, cmix=16, emb_head=16,
+        w_lora=16, a_lora=16, v_lora=16, g_lora=16, small=16,
+        outlier_fracs={},
+    ),
+    # aw_v2_uniform, но small=16: гипотеза -- small-тензоры (decay/x_x/ln)
+    # были главным источником деградации всей линейки. Цена: единицы MB.
+    "aw_v2_uniform_s16": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=16,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Верифицированный int8-якорь на текущем корпусе (REDUCTION 13.15 --
+    # предположительно до-корпусная эра, требовал перепроверки).
+    "int8_perrow": QuantConfig(
+        proj=8, cmix=8, emb_head=8,
+        w_lora=8, a_lora=8, v_lora=8, g_lora=8, small=8,
+        outlier_fracs={},
+    ),
     "gw32_all": QuantConfig(
         proj=4, cmix=4, emb_head=4,
         w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,

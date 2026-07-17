@@ -112,7 +112,8 @@ def _weighted_quantize(w, bits, ex2, outlier_frac=0.0):
     return codes, scale.to(torch.float16), None, None
 
 
-def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int) -> torch.Tensor:
+def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int,
+                            sb: int = 0, sb_bits: int = 6, ex2=None) -> torch.Tensor:
     """ПРОТОТИП group-wise scale (ядро K-квантов): асимметричный RTN на блок
     из gs колонок (scale + min на блок), сразу деквантованный обратно.
     Хранится как dense bf16 -> реальный пайплайн меряет ppl именно этой
@@ -128,8 +129,127 @@ def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int) -> torch.Tensor
     mx = wg.amax(dim=2, keepdim=True)
     qmax = 2 ** bits - 1
     scale = ((mx - mn) / qmax).clamp_min(1e-8)
+    if ex2 is not None:
+        # AW: вес колонки = E[x^2] её входного канала (см. №4f). Влияет
+        # только на критерий поиска и LS, формат/раскладка не меняются.
+        ev = ex2.float().clamp_min(1e-12)
+        evp = torch.nn.functional.pad(ev, (0, pad)) if pad else ev
+        evg = evp.view(1, wp.shape[1] // gs, gs)
+    else:
+        evg = None
+    if sb and sb_bits < 0:  # sb_bits < 0: |sb_bits| + грид-поиск scale/min
+        # 1) грид по фактору scale, 2) LS-дообводка (s, m) по выбранным
+        # кодам (замкнутая форма на блок), 3) суперблочное квантование.
+        # Аналог make_qkx2_quants (llama.cpp) поверх нашей раскладки.
+        best_s, best_m, best_e = scale.clone(), mn.clone(), None
+        for f in (0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1.0, 1.05):
+            sc = scale * f
+            q = torch.clamp(torch.round((wg - mn) / sc), 0, qmax)
+            # LS: min_{s,m} sum (w - q*s - m)^2 на блок
+            if evg is None:
+                qm_ = q.mean(dim=2, keepdim=True); wm_ = wg.mean(dim=2, keepdim=True)
+                cov = ((q - qm_) * (wg - wm_)).sum(dim=2, keepdim=True)
+                var = ((q - qm_) ** 2).sum(dim=2, keepdim=True).clamp_min(1e-12)
+            else:  # взвешенная LS: те же формулы со средними по весам evg
+                wsum = evg.sum(dim=2, keepdim=True)
+                qm_ = (evg * q).sum(dim=2, keepdim=True) / wsum
+                wm_ = (evg * wg).sum(dim=2, keepdim=True) / wsum
+                cov = (evg * (q - qm_) * (wg - wm_)).sum(dim=2, keepdim=True)
+                var = (evg * (q - qm_) ** 2).sum(dim=2, keepdim=True).clamp_min(1e-12)
+            s_ls = cov / var; m_ls = wm_ - s_ls * qm_
+            s_ls = torch.where(s_ls > 1e-8, s_ls, sc)  # деградир. блоки
+            q2 = torch.clamp(torch.round((wg - m_ls) / s_ls), 0, qmax)
+            e2 = (q2 * s_ls + m_ls - wg) ** 2
+            err = ((e2 if evg is None else evg * e2)).sum(dim=2, keepdim=True)
+            if best_e is None:
+                best_s, best_m, best_e = s_ls, m_ls, err
+            else:
+                b = err < best_e
+                best_s = torch.where(b, s_ls, best_s)
+                best_m = torch.where(b, m_ls, best_m)
+                best_e = torch.minimum(best_e, err)
+        scale, mn = best_s.clamp_min(1e-8), best_m
+        sb_bits = -sb_bits
+    if sb:
+        # Q4_K-стиль: суперблок из sb блоков; scale/min блоков квантуются в
+        # sb_bits против одной пары fp16 на суперблок (d, dm). Коды весов
+        # выбираются ПОСЛЕ квантования scale/min (как в llama.cpp) -- ошибка
+        # scale частично компенсируется выбором кодов. Бюджет при gs=32,
+        # sb=8, sb_bits=6: 4 + (2*6)/32 + (2*16)/256 = 4.5 бит/элемент.
+        nb = scale.shape[1]
+        pad_b = (-nb) % sb
+        if pad_b:
+            scale = torch.nn.functional.pad(scale, (0, 0, 0, pad_b))
+            mn = torch.nn.functional.pad(mn, (0, 0, 0, pad_b))
+        ssb = scale.view(OUT, -1, sb, 1); msb = mn.view(OUT, -1, sb, 1)
+        smax = 2 ** sb_bits - 1                      # unsigned для scale>0
+        d = (ssb.amax(dim=2, keepdim=True) / smax).clamp_min(1e-12)
+        qs = torch.clamp(torch.round(ssb / d), 1, smax)
+        scale_q = (qs * d).view(OUT, -1, 1)[:, :nb + pad_b][:, :nb]
+        mmax = 2 ** (sb_bits - 1) - 1                # signed для min
+        dm = (msb.abs().amax(dim=2, keepdim=True) / mmax).clamp_min(1e-12)
+        qm = torch.clamp(torch.round(msb / dm), -mmax, mmax)
+        mn_q = (qm * dm).view(OUT, -1, 1)[:, :nb + pad_b][:, :nb]
+        # fp16-раунд-трип может занулить scale у (почти) константных
+        # блоков (qs*d < 6e-8 -> half underflow) -> 0/0 = NaN в кодах.
+        scale = scale_q.half().float().clamp_min(1e-8); mn = mn_q.half().float()
     q = torch.clamp(torch.round((wg - mn) / scale), 0, qmax)
     deq = (q * scale + mn).view(OUT, -1)[:, :IN]
+    return deq
+
+
+
+
+_E2M1_GRID = None
+def _mxfp4_fake_dequant(w: torch.Tensor, gs: int, outlier_frac: float = 0.0) -> torch.Tensor:
+    """ПРОТОТИП MXFP4 (OCP MX): блок gs колонок, shared E8M0 scale (степень
+    двойки), элементы FP4 E2M1 (+-{0,.5,1,1.5,2,3,4,6}). Экспонента блока
+    выбирается перебором e0-1/e0/e0+1 по MSE блока (e0 = минимальная без
+    клиппинга) -- честный best-effort, симметрично scale-гриду асимметричного
+    RTN (_groupwise_fake_dequant). Выход dense bf16 (fake-dequant), формат и
+    кернель не пишутся до валидации идеи. Эфф. битность: 4 + 8/gs = 4.25
+    бит/элемент при gs=32 (против 5.0 у асимметричного gw32 c 2xfp16)."""
+    global _E2M1_GRID
+    if _E2M1_GRID is None:
+        _E2M1_GRID = (torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.]),
+                      torch.tensor([.25, .75, 1.25, 1.75, 2.5, 3.5, 5.]))
+    grid, mids = _E2M1_GRID
+    w32 = w.float()
+    OUT, IN = w32.shape
+    omask = None
+    if outlier_frac > 0.0:
+        # SpQR-семантика как в _real_quantize_sparse_outlier: per-row top-k
+        # по |w|, выбросы уходят в sparse (здесь: возвращаются verbatim),
+        # блоки квантуют остаток -- amax/экспонента без хвостов.
+        k = max(1, int(round(IN * outlier_frac)))
+        kth = torch.topk(w32.abs(), k, dim=1, largest=True).values[:, -1:].clamp_min(1e-20)
+        omask = w32.abs() >= kth
+        w_body = torch.where(omask, torch.zeros_like(w32), w32)
+    else:
+        w_body = w32
+    pad = (-IN) % gs
+    wp = torch.nn.functional.pad(w_body, (0, pad)) if pad else w_body
+    wg = wp.view(OUT, wp.shape[1] // gs, gs)
+    amax = wg.abs().amax(dim=2, keepdim=True).clamp_min(1e-12)
+    e0 = torch.ceil(torch.log2(amax / 6.0))
+    best_deq, best_err = None, None
+    for de in (-1.0, 0.0, 1.0):
+        scale = torch.pow(2.0, e0 + de)
+        v = wg / scale
+        sign = torch.sign(v)
+        a = v.abs().clamp(max=6.0)
+        qa = grid[torch.bucketize(a, mids)]
+        deq = sign * qa * scale
+        err = ((deq - wg) ** 2).sum(dim=2, keepdim=True)
+        if best_deq is None:
+            best_deq, best_err = deq, err
+        else:
+            better = err < best_err
+            best_deq = torch.where(better, deq, best_deq)
+            best_err = torch.minimum(best_err, err)
+    deq = best_deq.view(OUT, -1)[:, :IN]
+    if omask is not None:
+        deq = torch.where(omask, w32, deq)
     return deq
 
 
@@ -175,6 +295,25 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTen
             bits = b
             break
     sp = getattr(cfg, "act_stats_path", None)
+    # gw-ветка РАНЬШЕ act_stats: иначе группа с group_scale и статистикой
+    # ушла бы в per-row-AW и до блочного пути не дошла. AW внутри gw --
+    # через режим asym_sb6_aw (ex2 в критерий поиска/LS).
+    gs = getattr(cfg, "group_scale", {}).get(group)
+    if gs and bits < 16:
+        mode = getattr(cfg, "group_scale_mode", {}).get(group, "asym")
+        if mode == "mxfp4":
+            deq = _mxfp4_fake_dequant(w, gs, cfg.outlier_fracs.get(group, 0.0))
+        elif mode == "asym_sb6":
+            deq = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=6)
+        elif mode == "asym_sb6_search":
+            deq = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=-6)
+        elif mode == "asym_sb6_aw":
+            ex2 = _load_act_stats(sp).get(key) if sp else None
+            deq = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=-6, ex2=ex2)
+        else:
+            deq = _groupwise_fake_dequant(w, bits, gs)
+        return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
+                                dense=deq.to(torch.bfloat16))
     if sp and bits < 16:
         stats = _load_act_stats(sp)
         if key in stats:
@@ -183,11 +322,6 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTen
             return _make_qt(key, group, bits, w.shape, codes, scale, oi, ov)
         # нет статистики (emb: вход -- индексы токенов; LoRA не писали) --
         # проваливаемся в обычный путь ниже
-    gs = getattr(cfg, "group_scale", {}).get(group)
-    if gs and bits < 16:
-        deq = _groupwise_fake_dequant(w, bits, gs)
-        return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
-                                dense=deq.to(torch.bfloat16))
     if bits >= 16:
         return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
                                 dense=w.to(torch.bfloat16))

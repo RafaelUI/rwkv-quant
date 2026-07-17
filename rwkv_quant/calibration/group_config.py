@@ -18,7 +18,8 @@ GROUPS = ["proj", "w_lora", "a_lora", "v_lora", "g_lora", "small", "cmix", "emb_
 
 class QuantConfig:
     def __init__(self, clip_percentiles=None, outlier_fracs=None,
-                 bits_overrides=None, group_scale=None, act_stats_path=None,
+                 bits_overrides=None, group_scale=None, group_scale_mode=None,
+                 act_stats_path=None,
                  **bits_per_group):
         self.bits = {g: 16 for g in GROUPS}
         self.bits.update(bits_per_group)
@@ -35,6 +36,11 @@ class QuantConfig:
         # асимметрично по блокам gs колонок и хранится ДЕКВАНТОВАННЫМ dense
         # bf16. Только для замера ppl; SpQR на таких группах не применяется.
         self.group_scale = group_scale or {}
+        # group_scale_mode: {группа: "asym"|"mxfp4"} -- схема блочного
+        # квантования для групп из group_scale. "asym" (дефолт) =
+        # асимметричный RTN (scale+min на блок); "mxfp4" = OCP MXFP4
+        # (E8M0 shared scale, элементы E2M1) -- см. writer._mxfp4_fake_dequant.
+        self.group_scale_mode = group_scale_mode or {}
         # act_stats_path: путь к {key: E[x^2] по входным каналам} (см.
         # tests/collect_act_stats.py). Если задан, writer квантует тензоры
         # с имеющейся статистикой activation-aware (взвешенный RTN +
