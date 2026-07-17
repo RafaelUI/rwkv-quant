@@ -20,6 +20,21 @@ from ..calibration import QuantConfig, q
 from .naming import detect_naming
 
 
+# Рекордер E[x^2] по входным каналам квантуемых матриц (activation-aware
+# квантование, imatrix-стиль). None = выключен, накладных расходов нет.
+# Включается tests/collect_act_stats.py; ключи = state_dict-ключи (world).
+ACT_RECORDER = None
+
+
+def _rec(name, x):
+    if ACT_RECORDER is None:
+        return
+    v = x.detach().float().reshape(-1, x.shape[-1])
+    e = ACT_RECORDER.setdefault(name, [torch.zeros(v.shape[1]), 0])
+    e[0] += (v * v).sum(dim=0).cpu()
+    e[1] += v.shape[0]
+
+
 class TMix:
     __slots__ = (
         "x_r", "x_w", "x_k", "x_v", "x_a", "x_g",
@@ -169,6 +184,9 @@ class RWKV7Ref(nn.Module):
         xa = x + xx * t.x_a
         xg = x + xx * t.x_g
 
+        _rec(f"blocks.{layer_id}.att.receptance.weight", xr)
+        _rec(f"blocks.{layer_id}.att.key.weight", xk)
+        _rec(f"blocks.{layer_id}.att.value.weight", xv)
         r = xr @ q(t.r_proj, "proj", cfg).T
         w_ = -F.softplus(-(F.linear(torch.tanh(xw @ q(t.w_lora_A, "w_lora", cfg).T),
                                      q(t.w_lora_B_w, "w_lora", cfg), t.w_lora_B_b))) - 0.5
@@ -201,7 +219,9 @@ class RWKV7Ref(nn.Module):
         bonus = ((r.view(B, T, H, N) * k.view(B, T, H, N) * r_k).sum(dim=-1, keepdim=True)
                  * v.view(B, T, H, N)).view(B, T, C)
         out = out + bonus
-        out = (out * g) @ q(t.o_proj, "proj", cfg).T
+        og = out * g
+        _rec(f"blocks.{layer_id}.att.output.weight", og)
+        out = og @ q(t.o_proj, "proj", cfg).T
         return out, v_first
 
     @staticmethod
@@ -225,10 +245,12 @@ class RWKV7Ref(nn.Module):
             out[:, tt, :] = (state @ rr).view(B, H, N)
         return out.view(B, T, C)
 
-    def _cmix_forward(self, x, c: CMix, cfg: QuantConfig):
+    def _cmix_forward(self, x, c: CMix, cfg: QuantConfig, layer_id: int = -1):
         xx = self._time_shift(x) - x
         k = x + xx * c.x_k
+        _rec(f"blocks.{layer_id}.ffn.key.weight", k)
         k = torch.relu(k @ q(c.key, "cmix", cfg).T) ** 2
+        _rec(f"blocks.{layer_id}.ffn.value.weight", k)
         return k @ q(c.value, "cmix", cfg).T
 
     def forward(self, idx: torch.Tensor, cfg: QuantConfig = None):
@@ -243,8 +265,9 @@ class RWKV7Ref(nn.Module):
             att, v_first = self._tmix_forward(xn, v_first, self.tmix[i], i, cfg)
             x = x + att
             xn2 = F.layer_norm(x.float(), (self.n_embd,), self.ln2_w[i].float(), self.ln2_b[i].float()).to(x.dtype)
-            x = x + self._cmix_forward(xn2, self.cmix[i], cfg)
+            x = x + self._cmix_forward(xn2, self.cmix[i], cfg, i)
 
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln_out_w.float(), self.ln_out_b.float()).to(x.dtype)
+        _rec("head.weight", x)
         logits = x @ q(self.head_weight, "emb_head", cfg).T
         return logits

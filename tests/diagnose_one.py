@@ -181,6 +181,30 @@ CASES = {
         bits_overrides={"cmix.value.weight": 8, "ffn.value.weight": 8, "head.weight": 8},
         group_scale={"cmix": 32},
     ),
+    # Activation-aware (imatrix-гипотеза №4e): те же битности, что
+    # compression_fixed / compression_plus, но scale и SpQR-отбор взвешены
+    # E[x^2] с калибровочного среза [8:16].
+    "aw_compression": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=6,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    "aw_plus": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        bits_overrides={"cmix.value.weight": 8, "ffn.value.weight": 8, "head.weight": 8},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # aw_compression + small=8: small суммарно ~150KB, размер файла тот же
+    # 1181MB; кандидат на замену пресета COMPRESSION.
+    "aw_small8": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
     "compression_fixed": QuantConfig(
         proj=4, cmix=4, emb_head=4,
         w_lora=4, a_lora=4, v_lora=4, g_lora=8,

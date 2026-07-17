@@ -49,6 +49,69 @@ def _real_quantize_sparse_outlier(w: torch.Tensor, bits: int, outlier_frac: floa
     return codes, scale.to(torch.float16), outlier_indices, outlier_values
 
 
+_ACT_STATS_CACHE = {}
+
+
+def _load_act_stats(path):
+    if path not in _ACT_STATS_CACHE:
+        _ACT_STATS_CACHE[path] = torch.load(path)
+    return _ACT_STATS_CACHE[path]
+
+
+def _weighted_rtn_rows(w32, bits, ex2, chunk=2048):
+    """Per-row RTN с activation-aware выбором scale (imatrix-стиль):
+    для каждой строки грид по s=amax/qmax*f, f in [0.5..1.05], критерий
+    sum_j ex2_j*(w_j - q_j*s)^2; затем s уточняется взвешенным LS по
+    выбранным кодам: s* = sum(ex2*w*q)/sum(ex2*q*q). Возвращает
+    (codes int8, scale fp32 [rows,1]). ex2 нормируется -> численно
+    безопасно и не влияет на argmin."""
+    qmax = 2 ** (bits - 1) - 1
+    ex2 = (ex2 / ex2.mean().clamp_min(1e-12)).view(1, -1)
+    fs = torch.linspace(0.5, 1.05, 23)
+    out_codes, out_scale = [], []
+    for r0 in range(0, w32.shape[0], chunk):
+        wc = w32[r0:r0 + chunk]                                  # [R, IN]
+        amax = wc.abs().amax(dim=1, keepdim=True).clamp_min(1e-8)
+        base = (amax / qmax)                                     # [R, 1]
+        best_err = torch.full((wc.shape[0],), float("inf"))
+        best_q = torch.zeros_like(wc, dtype=torch.int8)
+        for f in fs:
+            sc = base * f
+            qc = torch.clamp(torch.round(wc / sc), -qmax - 1, qmax)
+            err = (ex2 * (wc - qc * sc) ** 2).sum(dim=1)
+            m = err < best_err
+            best_err = torch.where(m, err, best_err)
+            best_q[m] = qc[m].to(torch.int8)
+        qf = best_q.float()
+        num = (ex2 * wc * qf).sum(dim=1, keepdim=True)
+        den = (ex2 * qf * qf).sum(dim=1, keepdim=True).clamp_min(1e-12)
+        out_codes.append(best_q)
+        out_scale.append(num / den)
+    return torch.cat(out_codes), torch.cat(out_scale)
+
+
+def _weighted_quantize(w, bits, ex2, outlier_frac=0.0):
+    """Activation-aware вариант _real_quantize(_sparse_outlier): выбросы
+    отбираются по ex2*w^2 (цена ошибки), не по |w|; scale -- взвешенный
+    грид (см. _weighted_rtn_rows). Формат вывода идентичен обычному."""
+    w32 = w.float()
+    if outlier_frac > 0:
+        n_cols = w32.shape[1]
+        k = max(1, int(round(n_cols * outlier_frac)))
+        cost = w32 * w32 * ex2.view(1, -1)
+        kth = torch.topk(cost, k, dim=1, largest=True).values[:, -1:].clamp_min(1e-20)
+        mask = cost >= kth
+        w_dense = torch.where(mask, torch.zeros_like(w32), w32)
+        codes, scale = _weighted_rtn_rows(w_dense, bits, ex2)
+        codes = torch.where(mask, torch.zeros_like(codes), codes)
+        rows, cols = torch.where(mask)
+        oi = torch.stack([rows, cols], dim=1).to(torch.int32)
+        ov = w32[rows, cols].to(torch.bfloat16)
+        return codes, scale.to(torch.float16), oi, ov
+    codes, scale = _weighted_rtn_rows(w32, bits, ex2)
+    return codes, scale.to(torch.float16), None, None
+
+
 def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int) -> torch.Tensor:
     """ПРОТОТИП group-wise scale (ядро K-квантов): асимметричный RTN на блок
     из gs колонок (scale + min на блок), сразу деквантованный обратно.
@@ -111,6 +174,15 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTen
         if pat in key:
             bits = b
             break
+    sp = getattr(cfg, "act_stats_path", None)
+    if sp and bits < 16:
+        stats = _load_act_stats(sp)
+        if key in stats:
+            frac = cfg.outlier_fracs.get(group, 0.0)
+            codes, scale, oi, ov = _weighted_quantize(w, bits, stats[key], frac)
+            return _make_qt(key, group, bits, w.shape, codes, scale, oi, ov)
+        # нет статистики (emb: вход -- индексы токенов; LoRA не писали) --
+        # проваливаемся в обычный путь ниже
     gs = getattr(cfg, "group_scale", {}).get(group)
     if gs and bits < 16:
         deq = _groupwise_fake_dequant(w, bits, gs)

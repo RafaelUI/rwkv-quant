@@ -18,7 +18,8 @@ GROUPS = ["proj", "w_lora", "a_lora", "v_lora", "g_lora", "small", "cmix", "emb_
 
 class QuantConfig:
     def __init__(self, clip_percentiles=None, outlier_fracs=None,
-                 bits_overrides=None, group_scale=None, **bits_per_group):
+                 bits_overrides=None, group_scale=None, act_stats_path=None,
+                 **bits_per_group):
         self.bits = {g: 16 for g in GROUPS}
         self.bits.update(bits_per_group)
         self.clip_percentiles = clip_percentiles or {}
@@ -34,6 +35,11 @@ class QuantConfig:
         # асимметрично по блокам gs колонок и хранится ДЕКВАНТОВАННЫМ dense
         # bf16. Только для замера ppl; SpQR на таких группах не применяется.
         self.group_scale = group_scale or {}
+        # act_stats_path: путь к {key: E[x^2] по входным каналам} (см.
+        # tests/collect_act_stats.py). Если задан, writer квантует тензоры
+        # с имеющейся статистикой activation-aware (взвешенный RTN +
+        # взвешенный отбор SpQR-выбросов); без статистики -- обычный путь.
+        self.act_stats_path = act_stats_path
 
     def __repr__(self):
         r = "QuantConfig(" + ", ".join(f"{g}={self.bits[g]}" for g in GROUPS)
