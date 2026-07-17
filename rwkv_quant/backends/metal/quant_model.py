@@ -385,6 +385,18 @@ class QuantRWKV7:
         H, S = self.n_head, self.head_size
         return [(mx.zeros((batch_size, H, S, S)), None, None) for _ in range(self.n_layer)]
 
+    @property
+    def step(self):
+        """Скомпилированный forward_stateful для decode-циклов: mx.compile
+        фьюзит elementwise-цепочки и кеширует граф по shapes (префилл и
+        T=1 живут отдельными кешами). На 1.5B REDUCTION: 22.3 -> 19.8 мс/ток
+        (+13%). Численно: rel ~3e-4 (порядок fp16-шума), greedy-траектория
+        64 токенов идентична eager (tests/verify_compile.py). Для
+        отладки/сверок использовать сырой forward_stateful."""
+        if not hasattr(self, "_step_compiled"):
+            self._step_compiled = mx.compile(self.forward_stateful)
+        return self._step_compiled
+
     def forward_stateful(self, idx: mx.array, states):
         """idx: [B, T] -- T=1 для single-token decode, T>1 для prefill
         произвольной длины (внутри чанкуется по 32 автоматически).

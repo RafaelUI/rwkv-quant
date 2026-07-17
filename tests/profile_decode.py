@@ -29,12 +29,12 @@ def bench_decode(model, n_warm=5, n_iter=40):
     idx = mx.array(np.array([[123]], dtype=np.int64))
     # прогрев + вывод state в устоявшийся вид
     for _ in range(n_warm):
-        logits, states = model.forward_stateful(idx, states)
+        logits, states = model.forward_stateful(idx, states)  # сырой путь: аблации (monkeypatch) невидимы скомпилированному графу
         mx.eval(logits, *[s for st in states for s in st if s is not None])
     mx.synchronize()
     t0 = time.perf_counter()
     for _ in range(n_iter):
-        logits, states = model.forward_stateful(idx, states)
+        logits, states = model.forward_stateful(idx, states)  # сырой путь: аблации (monkeypatch) невидимы скомпилированному графу
         mx.eval(logits, *[s for st in states for s in st if s is not None])
     mx.synchronize()
     return (time.perf_counter() - t0) / n_iter * 1e3

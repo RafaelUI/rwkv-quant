@@ -35,7 +35,7 @@ def spin(seconds):
     t_end = time.perf_counter() + seconds
     n = 0
     while time.perf_counter() < t_end:
-        logits, states = model.forward_stateful(idx, states)
+        logits, states = model.step(idx, states)
         mx.eval(logits)
         n += 1
     return n
