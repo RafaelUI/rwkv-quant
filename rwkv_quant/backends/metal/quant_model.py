@@ -38,12 +38,19 @@ import mlx.core as mx
 from ...formats.reader import _dequantize_one
 from .quant_linear import QuantLinear  # noqa: F401 (v1, референс)
 from .quant_linear_v2 import QuantLinearV2
-from .quant_linear_gw import GwQuantLinear
+from .quant_linear_gw import GwQuantLinear, GwQuantLinearFused
 
 # Реализация Linear-кернеля для всей модели. v2 (threadgroup-редукция,
 # char4-загрузки) численно эквивалентна v1 (tests/test_quant_linear_v2.py)
 # и быстрее на всех shapes 1.5B; v1 остаётся референсом.
 _QUANT_LINEAR_IMPL = QuantLinearV2
+
+# Decode-фьюз (стек token-shift лерпов + батч LoRA w/a/v). Веса общие с
+# нефьюзнутым путём, вычисления математически эквивалентны (pad нулями
+# точен). Переключение в рантайме: qm.FUSE = True/False; компилированный
+# step трассирует ветку на момент mx.compile -- после смены флага нужен
+# свежий mx.compile.
+FUSE = False
 
 _RWKV_METAL_PATH = os.environ.get("RWKV_METAL_PATH", os.path.expanduser("~/Develop/rwkv-metal"))
 if _RWKV_METAL_PATH not in sys.path:
@@ -177,6 +184,7 @@ class QuantTMix:
             self.r_proj = _linear(g(tp+"r_proj.weight")); self.k_proj = _linear(g(tp+"k_proj.weight"))
             self.v_proj = _linear(g(tp+"v_proj.weight")); self.o_proj = _linear(g(tp+"o_proj.weight"))
             self.ln_x_w, self.ln_x_b = _dense(g(tp+"ln_x.weight")), _dense(g(tp+"ln_x.bias"))
+            self._build_fused()
         else:
             ap = "att."
             self.x_r, self.x_w, self.x_k = _dense(g(ap+"x_r")), _dense(g(ap+"x_w")), _dense(g(ap+"x_k"))
@@ -197,6 +205,7 @@ class QuantTMix:
             self.r_proj = _linear(g(ap+"receptance.weight")); self.k_proj = _linear(g(ap+"key.weight"))
             self.v_proj = _linear(g(ap+"value.weight")); self.o_proj = _linear(g(ap+"output.weight"))
             self.ln_x_w, self.ln_x_b = _dense(g(ap+"ln_x.weight")), _dense(g(ap+"ln_x.bias"))
+            self._build_fused()
 
     def __call__(self, x, v_first):
         B, T, D = x.shape
@@ -242,6 +251,111 @@ class QuantTMix:
 
         return self.o_proj(out * g), v_first
 
+    def _build_fused(self):
+        """Буферы decode-фьюза: [6,1,1,D]-стек лерп-коэффициентов и
+        батченые LoRA-матрицы (w,a,v): pad v-ранга (64->96) нулями --
+        нулевые строки/столбцы дают точный ноль, эквивалентность полная.
+        g (ранг 256) не батчится -- остаётся парой отдельных матмулов.
+        Слой 0 без v-ветки: v-слот нулевой, его выход не используется."""
+        D = self.x_r.shape[-1]
+        self.xcoef = mx.stack([self.x_r, self.x_w, self.x_k,
+                               self.x_v, self.x_a, self.x_g])  # [6,1,1,D]
+        rs = [self.w_lora_A.shape[0], self.a_lora_A.shape[0]]
+        if self.v_lora_A is not None:
+            rs.append(self.v_lora_A.shape[0])
+        rmax = max(rs)
+
+        def padA(A):
+            if A is None:
+                return mx.zeros((rmax, D), dtype=self.w_lora_A.dtype)
+            if A.shape[0] == rmax:
+                return A
+            return mx.concatenate(
+                [A, mx.zeros((rmax - A.shape[0], D), dtype=A.dtype)], axis=0)
+
+        def padBt(Bw):  # Bw [D, r] -> Bt [rmax, D]
+            if Bw is None:
+                return mx.zeros((rmax, D), dtype=self.w_lora_B_w.dtype)
+            Bt = Bw.T
+            if Bt.shape[0] == rmax:
+                return Bt
+            return mx.concatenate(
+                [Bt, mx.zeros((rmax - Bt.shape[0], D), dtype=Bt.dtype)], axis=0)
+
+        self.wav_At = mx.stack([padA(self.w_lora_A), padA(self.a_lora_A),
+                                padA(self.v_lora_A)]).transpose(0, 2, 1)  # [3,D,rmax]
+        self.wav_Bt = mx.stack([padBt(self.w_lora_B_w), padBt(self.a_lora_B_w),
+                                padBt(self.v_lora_B_w)])                  # [3,rmax,D]
+        self._wav_idx = mx.array([1, 4, 3])          # (xw, xa, xv) из xs
+        self._tanh_mask = mx.array([True, False, False]).reshape(3, 1, 1)
+
+        # r/k/v одним launch'ем: конкатенация квантованных строк трёх
+        # GwQuantLinear (формат нетронут, математика строки бит-в-бит).
+        # Цена: копия буферов (~8.7MB/слой) поверх оригиналов -- оригиналы
+        # нужны GEMM-префиллу и нефьюзнутому пути.
+        self._rkv_fused = None
+        self._rkv_idx = mx.array([0, 2, 3])          # (xr, xk, xv) из xs
+        lins = [self.r_proj, self.k_proj, self.v_proj]
+        if (all(isinstance(l, GwQuantLinear) for l in lins)
+                and len({(l.in_features, l.out_features, l.has_qh)
+                         for l in lins}) == 1):
+            self._rkv_fused = GwQuantLinearFused(lins)
+
+    def _forward_stateful_fused(self, x, v_first, state):
+        """forward_stateful с decode-фьюзом: 6 лерпов -> 1 broadcast-оп;
+        LoRA (w,a,v) -> 2 batched-матмула вместо 6. Математика идентична
+        нефьюзнутому пути (см. _build_fused)."""
+        wkv_state, shift_state = state
+        B, T, D = x.shape
+        H, S = self.H, self.S
+
+        shifted, new_shift_state = _token_shift_stateful(x, shift_state)
+        xx = shifted - x
+        xs = x[None] + xx[None] * self.xcoef          # [6,B,T,D]
+        xg = xs[5]
+
+        if self._rkv_fused is not None and B * T == 1:
+            rkv = self._rkv_fused(mx.take(xs, self._rkv_idx, axis=0).reshape(3, D))
+            r = rkv[0].reshape(B, T, H, S)
+            k = rkv[1].reshape(B, T, H, S)
+            v = rkv[2].reshape(B, T, H, S)
+        else:
+            xr, xk, xv = xs[0], xs[2], xs[3]
+            r = self.r_proj(xr).reshape(B, T, H, S)
+            k = self.k_proj(xk).reshape(B, T, H, S)
+            v = self.v_proj(xv).reshape(B, T, H, S)
+
+        g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
+
+        z = mx.take(xs, self._wav_idx, axis=0).reshape(3, B * T, D)
+        h = (z.astype(self.wav_At.dtype) @ self.wav_At).astype(x.dtype)
+        h = mx.where(self._tanh_mask, mx.tanh(h), h)
+        y = (h.astype(self.wav_Bt.dtype) @ self.wav_Bt).astype(x.dtype)  # [3,BT,D]
+
+        w = y[0].reshape(B, T, D) + self.w_lora_B_b
+        w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
+        w = w.reshape(B, T, H, S)
+        a = mx.sigmoid(y[1].reshape(B, T, D) + self.a_lora_B_b).reshape(B, T, H, S)
+
+        kk = l2_norm(k * self.k_k)
+        k = k * (1.0 + (a - 1.0) * self.k_a)
+
+        if self.layer_id == 0:
+            v_first = v
+        else:
+            vv = mx.sigmoid(y[2].reshape(B, T, D) + self.v_lora_B_b).reshape(B, T, H, S)
+            v = v + (v_first - v) * vv
+
+        out, new_wkv_state = _wkv_stateful(r, w, k, v, -kk, kk * a, wkv_state)
+
+        out2d = out.reshape(B * T, D)
+        out2d = _group_norm(out2d, H, self.ln_x_w, self.ln_x_b)
+        out = out2d.reshape(B, T, H, S)
+        bonus = (r * k * self.r_k).sum(axis=-1, keepdims=True) * v
+        out = (out + bonus).reshape(B, T, D)
+
+        return self.o_proj(out * g), v_first, (new_wkv_state, new_shift_state)
+
     def forward_stateful(self, x, v_first, state):
         """То же самое, что __call__, но WKV-рекуррентность идёт через
         _wkv_stateful (chunked wkv7_infer + переносимый state) вместо
@@ -251,6 +365,8 @@ class QuantTMix:
         state рекуррентности; shift_state -- последний x предыдущего
         вызова (None на первом вызове), нужен для token-shift на границе
         отдельных single-token decode-вызовов."""
+        if FUSE:
+            return self._forward_stateful_fused(x, v_first, state)
         wkv_state, shift_state = state
         B, T, D = x.shape
         H, S = self.H, self.S

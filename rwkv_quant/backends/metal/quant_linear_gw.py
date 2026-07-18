@@ -29,11 +29,16 @@ R = 8
 GEMM_MIN_BATCH = 16
 
 
-def _get_kernel_gw(IN: int, OUT: int, has_qh: bool):
-    key = (IN, OUT, has_qh)
+def _get_kernel_gw(IN: int, OUT: int, has_qh: bool, out_per: int = 0):
+    # out_per > 0: мульти-вход (фьюз r/k/v) -- x это стек [OUT/out_per, IN],
+    # строка row берёт вход номер row/out_per; xbsum стекован так же.
+    # Математика каждой строки бит-в-бит с одиночным кернелем.
+    key = (IN, OUT, has_qh, out_per)
     if key in _gw_kernel_cache:
         return _gw_kernel_cache[key]
     assert IN % 256 == 0, "sb6-кернель: IN кратен суперблоку 256"
+    if out_per:
+        assert OUT % out_per == 0 and out_per % R == 0
     NB, NSB = IN // 32, IN // 256
 
     hdr = f"""
@@ -43,6 +48,7 @@ constant uint TG    = {TG};
 constant uint R     = {R};
 constant uint NB    = {NB};
 constant uint NSB   = {NSB};
+constant uint OUT_PER = {out_per if out_per else OUT};
 """
     guard_hot  = "" if OUT % R == 0 else "            if (row0 + j >= OUT_C) break;\n"
     guard_tail = "" if OUT % R == 0 else "        if (row >= OUT_C) break;\n"
@@ -65,14 +71,15 @@ constant uint NSB   = {NSB};
     uint lane = thread_position_in_threadgroup.x;
     uint row0 = g * R;
 
-    device const float4* x4 = (device const float4*)(x + n*IN_C);
+    uint xi = (n * (OUT_C / OUT_PER)) + row0 / OUT_PER;
+    device const float4* x4 = (device const float4*)(x + xi*IN_C);
     float acc[R];
     for (uint j = 0; j < R; j++) acc[j] = 0.0f;
 
     for (uint p = lane; p < NB; p += TG) {          // p -- блок из 32 колонок
         float4 xa0 = x4[p*8+0], xa1 = x4[p*8+1], xa2 = x4[p*8+2], xa3 = x4[p*8+3];
         float4 xb0 = x4[p*8+4], xb1 = x4[p*8+5], xb2 = x4[p*8+6], xb3 = x4[p*8+7];
-        float xbs = xbsum[n*NB + p];
+        float xbs = xbsum[xi*NB + p];
         for (uint j = 0; j < R; j++) {
 GUARD_HOT            uint4 qw = ((device const uint4*)(codes + (row0+j)*(IN_C/2)))[p];
             uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
@@ -172,3 +179,46 @@ class GwQuantLinear:
             output_dtypes=[mx.float32],
         )[0]
         return out.reshape(*lead_shape, self.out_features)
+
+
+class GwQuantLinearFused:
+    """Фьюз K однотипных GwQuantLinear (r/k/v proj) в один launch:
+    конкатенация квантованных строк (формат нетронут), кернель выбирает
+    вход по номеру строки. Только decode-путь (B*T=1 на вход), побитово
+    идентичен K отдельным вызовам (та же математика строки).
+    __call__(xstack [K, IN]) -> [K, out_per]."""
+
+    def __init__(self, lins):
+        l0 = lins[0]
+        assert all(isinstance(l, GwQuantLinear) for l in lins)
+        assert all(l.in_features == l0.in_features and
+                   l.out_features == l0.out_features and
+                   l.has_qh == l0.has_qh for l in lins)
+        self.K = len(lins)
+        self.out_per = l0.out_features
+        self.out_features = self.out_per * self.K
+        self.in_features = l0.in_features
+        self.NB, self.NSB = l0.NB, l0.NSB
+        self.has_qh = l0.has_qh
+        self.codes = mx.concatenate([l.codes for l in lins], axis=0)
+        self.qs = mx.concatenate([l.qs for l in lins], axis=0)
+        self.qm = mx.concatenate([l.qm for l in lins], axis=0)
+        self.d = mx.concatenate([l.d for l in lins], axis=0)
+        self.dm = mx.concatenate([l.dm for l in lins], axis=0)
+        self.qh = (mx.concatenate([l.qh for l in lins], axis=0) if self.has_qh
+                   else mx.zeros((1,), dtype=mx.uint8))
+
+    def __call__(self, xstack):
+        # xstack: [K, IN] fp32
+        kern = _get_kernel_gw(self.in_features, self.out_features,
+                              self.has_qh, out_per=self.out_per)
+        xbsum = mx.sum(xstack.reshape(self.K, self.NB, 32), axis=2)
+        n_groups = (self.out_features + R - 1) // R
+        out = kern(
+            inputs=[xstack, self.codes, self.qs, self.qm, self.d, self.dm,
+                    self.qh, xbsum],
+            grid=(n_groups * TG, 1, 1), threadgroup=(TG, 1, 1),
+            output_shapes=[(1, self.out_features)],
+            output_dtypes=[mx.float32],
+        )[0]
+        return out.reshape(self.K, self.out_per)
