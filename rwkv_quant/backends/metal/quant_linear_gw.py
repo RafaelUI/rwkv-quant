@@ -139,6 +139,254 @@ GUARD_TAIL        float a = simd_sum(acc[j]);
     return kern
 
 
+
+RB_NB = 4  # дефолт RB для N-батчевого кернеля
+NB_CHUNK = 4          # оптимум свипа 19.07: N=4 = 2.28 мс/кол (spill дальше)
+_RB_FOR_NN = {2: 4, 3: 2, 4: 2}  # bench_gw_nb_sweep.py
+GEMM_MIN_BATCH_NB = 128  # ниже -- чанки по NB_CHUNK, выше -- dequant-GEMM
+NB_V2 = False         # nb2: загрузки подняты (x один раз на (p,n)), декод дублируется по n
+
+
+def _get_kernel_gw_nb(IN: int, OUT: int, xbits: int, NN: int, rb: int = 0):
+    """N-батчевый GEMV (2 <= NN < GEMM_MIN_BATCH): веса блока декодируются
+    ОДИН раз и применяются ко всем NN колонкам x (x мал и кэшируется).
+    Математика на пару (строка, колонка) бит-в-бит с _get_kernel_gw:
+    тот же порядок dot'ов, тот же simd_sum. Устраняет N-кратное
+    перечитывание весов из DRAM (диагноз сессии 19.07-12: T=4 стоил
+    2.18x T=1, веса ехали на каждую колонку заново)."""
+    rb = rb or RB_NB
+    assert xbits in (0, 1, 2) and NN >= 2
+    key = ("nb", IN, OUT, xbits, NN, rb)
+    if key in _gw_kernel_cache:
+        return _gw_kernel_cache[key]
+    assert IN % 256 == 0
+    NB, NSB = IN // 32, IN // 256
+
+    hdr = f"""
+constant uint IN_C  = {IN};
+constant uint OUT_C = {OUT};
+constant uint TG    = {TG};
+constant uint RB    = {rb};
+constant uint NN    = {NN};
+constant uint NB    = {NB};
+constant uint NSB   = {NSB};
+"""
+    guard_hot  = "" if OUT % rb == 0 else "            if (row0 + j >= OUT_C) break;\n"
+    guard_tail = "" if OUT % rb == 0 else "        if (row0 + j >= OUT_C) break;\n"
+
+    qh_body = """
+            uint hb = ((device const uint*)(qh + (row0+j)*(IN_C/8)))[p];
+            l0 |= uchar4((uint4(hb) >> uint4( 0, 1, 2, 3)) & 1u) << 4;
+            l1 |= uchar4((uint4(hb) >> uint4( 4, 5, 6, 7)) & 1u) << 4;
+            l2 |= uchar4((uint4(hb) >> uint4( 8, 9,10,11)) & 1u) << 4;
+            l3 |= uchar4((uint4(hb) >> uint4(12,13,14,15)) & 1u) << 4;
+            h0 |= uchar4((uint4(hb) >> uint4(16,17,18,19)) & 1u) << 4;
+            h1 |= uchar4((uint4(hb) >> uint4(20,21,22,23)) & 1u) << 4;
+            h2 |= uchar4((uint4(hb) >> uint4(24,25,26,27)) & 1u) << 4;
+            h3 |= uchar4((uint4(hb) >> uint4(28,29,30,31)) & 1u) << 4;
+""" if xbits >= 1 else ""
+
+    qh2_body = """
+            uint hb2 = ((device const uint*)(qh2 + (row0+j)*(IN_C/8)))[p];
+            l0 |= uchar4((uint4(hb2) >> uint4( 0, 1, 2, 3)) & 1u) << 5;
+            l1 |= uchar4((uint4(hb2) >> uint4( 4, 5, 6, 7)) & 1u) << 5;
+            l2 |= uchar4((uint4(hb2) >> uint4( 8, 9,10,11)) & 1u) << 5;
+            l3 |= uchar4((uint4(hb2) >> uint4(12,13,14,15)) & 1u) << 5;
+            h0 |= uchar4((uint4(hb2) >> uint4(16,17,18,19)) & 1u) << 5;
+            h1 |= uchar4((uint4(hb2) >> uint4(20,21,22,23)) & 1u) << 5;
+            h2 |= uchar4((uint4(hb2) >> uint4(24,25,26,27)) & 1u) << 5;
+            h3 |= uchar4((uint4(hb2) >> uint4(28,29,30,31)) & 1u) << 5;
+""" if xbits >= 2 else ""
+
+    body = """
+    uint g    = threadgroup_position_in_grid.x;
+    uint lane = thread_position_in_threadgroup.x;
+    uint row0 = g * RB;
+
+    float acc[RB * NN];
+    for (uint j = 0; j < RB * NN; j++) acc[j] = 0.0f;
+
+    for (uint p = lane; p < NB; p += TG) {
+        for (uint j = 0; j < RB; j++) {
+GUARD_HOT            uint4 qw = ((device const uint4*)(codes + (row0+j)*(IN_C/2)))[p];
+            uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
+            uchar4 l1 = as_type<uchar4>(qw.y & 0x0F0F0F0Fu);
+            uchar4 l2 = as_type<uchar4>(qw.z & 0x0F0F0F0Fu);
+            uchar4 l3 = as_type<uchar4>(qw.w & 0x0F0F0F0Fu);
+            uchar4 h0 = as_type<uchar4>((qw.x >> 4) & 0x0F0F0F0Fu);
+            uchar4 h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
+            uchar4 h2 = as_type<uchar4>((qw.z >> 4) & 0x0F0F0F0Fu);
+            uchar4 h3 = as_type<uchar4>((qw.w >> 4) & 0x0F0F0F0Fu);
+""" + qh_body + qh2_body + """
+            float4 w0 = float4(l0.x, l0.y, l0.z, l0.w);
+            float4 w1 = float4(l1.x, l1.y, l1.z, l1.w);
+            float4 w2 = float4(l2.x, l2.y, l2.z, l2.w);
+            float4 w3 = float4(l3.x, l3.y, l3.z, l3.w);
+            float4 w4 = float4(h0.x, h0.y, h0.z, h0.w);
+            float4 w5 = float4(h1.x, h1.y, h1.z, h1.w);
+            float4 w6 = float4(h2.x, h2.y, h2.z, h2.w);
+            float4 w7 = float4(h3.x, h3.y, h3.z, h3.w);
+            uint sbi = (row0+j)*NSB + p/8;
+            half  s  = (half)((float)qs[(row0+j)*NB + p] * (float)d[sbi]);
+            half  mn = (half)((float)qm[(row0+j)*NB + p] * (float)dm[sbi]);
+            for (uint n = 0; n < NN; n++) {
+                device const float4* x4 = (device const float4*)(x + n*IN_C);
+                float dv = dot(x4[p*8+0], w0)
+                         + dot(x4[p*8+1], w1)
+                         + dot(x4[p*8+2], w2)
+                         + dot(x4[p*8+3], w3)
+                         + dot(x4[p*8+4], w4)
+                         + dot(x4[p*8+5], w5)
+                         + dot(x4[p*8+6], w6)
+                         + dot(x4[p*8+7], w7);
+                acc[j*NN + n] += (float)s * dv + (float)mn * xbsum[n*NB + p];
+            }
+        }
+    }
+    for (uint j = 0; j < RB; j++) {
+GUARD_TAIL        for (uint n = 0; n < NN; n++) {
+            float a = simd_sum(acc[j*NN + n]);
+            if (lane == 0)
+                out[n*OUT_C + row0 + j] = a;
+        }
+    }
+"""
+    body = body.replace("GUARD_HOT", guard_hot).replace("GUARD_TAIL", guard_tail)
+    kern = mx.fast.metal_kernel(
+        name=f"quant_linear_gw{4 + xbits}_nb{NN}r{rb}_{IN}_{OUT}",
+        input_names=["x", "codes", "qs", "qm", "d", "dm", "qh", "qh2", "xbsum"],
+        output_names=["out"],
+        header=hdr, source=body,
+    )
+    _gw_kernel_cache[key] = kern
+    return kern
+
+
+
+def _get_kernel_gw_nb2(IN: int, OUT: int, xbits: int, NN: int, rb: int = 2):
+    """nb-вариант 2: все ЗАГРУЗКИ подняты из внутренних циклов.
+    Полный проход блока p: qw/hb/hb2/s/mn для RB строк грузятся один раз,
+    x-блок (8 float4) грузится один раз на (p, n) и переиспользуется
+    всеми RB строками; декод весов повторяется по n (чистый ALU, есть
+    запас: ALU ~32% при memory-bound). x-трафик: NN вместо RB*NN
+    (диагноз bench_gw_nb_groups: cmix N=4 = 3.4x N=1 из-за x-reload).
+    Математика бит-в-бит: тот же порядок 8 dot'ов и acc."""
+    assert xbits in (0, 1, 2) and NN >= 2
+    key = ("nb2", IN, OUT, xbits, NN, rb)
+    if key in _gw_kernel_cache:
+        return _gw_kernel_cache[key]
+    assert IN % 256 == 0
+    NB, NSB = IN // 32, IN // 256
+
+    hdr = f"""
+constant uint IN_C  = {IN};
+constant uint OUT_C = {OUT};
+constant uint TG    = {TG};
+constant uint RB    = {rb};
+constant uint NN    = {NN};
+constant uint NB    = {NB};
+constant uint NSB   = {NSB};
+"""
+    guard_hot  = "" if OUT % rb == 0 else "            if (row0 + j >= OUT_C) break;\n"
+    guard_tail = "" if OUT % rb == 0 else "        if (row0 + j >= OUT_C) break;\n"
+
+    decl_h  = "        uint hbA[RB];\n"  if xbits >= 1 else ""
+    decl_h2 = "        uint hb2A[RB];\n" if xbits >= 2 else ""
+    load_h  = "            hbA[j] = ((device const uint*)(qh + (row0+j)*(IN_C/8)))[p];\n" if xbits >= 1 else ""
+    load_h2 = "            hb2A[j] = ((device const uint*)(qh2 + (row0+j)*(IN_C/8)))[p];\n" if xbits >= 2 else ""
+
+    dec_h = """
+                uint hb = hbA[j];
+                l0 |= uchar4((uint4(hb) >> uint4( 0, 1, 2, 3)) & 1u) << 4;
+                l1 |= uchar4((uint4(hb) >> uint4( 4, 5, 6, 7)) & 1u) << 4;
+                l2 |= uchar4((uint4(hb) >> uint4( 8, 9,10,11)) & 1u) << 4;
+                l3 |= uchar4((uint4(hb) >> uint4(12,13,14,15)) & 1u) << 4;
+                h0 |= uchar4((uint4(hb) >> uint4(16,17,18,19)) & 1u) << 4;
+                h1 |= uchar4((uint4(hb) >> uint4(20,21,22,23)) & 1u) << 4;
+                h2 |= uchar4((uint4(hb) >> uint4(24,25,26,27)) & 1u) << 4;
+                h3 |= uchar4((uint4(hb) >> uint4(28,29,30,31)) & 1u) << 4;
+""" if xbits >= 1 else ""
+    dec_h2 = """
+                uint hb2 = hb2A[j];
+                l0 |= uchar4((uint4(hb2) >> uint4( 0, 1, 2, 3)) & 1u) << 5;
+                l1 |= uchar4((uint4(hb2) >> uint4( 4, 5, 6, 7)) & 1u) << 5;
+                l2 |= uchar4((uint4(hb2) >> uint4( 8, 9,10,11)) & 1u) << 5;
+                l3 |= uchar4((uint4(hb2) >> uint4(12,13,14,15)) & 1u) << 5;
+                h0 |= uchar4((uint4(hb2) >> uint4(16,17,18,19)) & 1u) << 5;
+                h1 |= uchar4((uint4(hb2) >> uint4(20,21,22,23)) & 1u) << 5;
+                h2 |= uchar4((uint4(hb2) >> uint4(24,25,26,27)) & 1u) << 5;
+                h3 |= uchar4((uint4(hb2) >> uint4(28,29,30,31)) & 1u) << 5;
+""" if xbits >= 2 else ""
+
+    body = """
+    uint g    = threadgroup_position_in_grid.x;
+    uint lane = thread_position_in_threadgroup.x;
+    uint row0 = g * RB;
+
+    float acc[RB * NN];
+    for (uint j = 0; j < RB * NN; j++) acc[j] = 0.0f;
+
+    for (uint p = lane; p < NB; p += TG) {
+        uint4 qwA[RB];
+        half  sA[RB], mnA[RB];
+DECL_HDECL_H2        float xbsA[NN];
+        for (uint j = 0; j < RB; j++) {
+GUARD_HOT            qwA[j] = ((device const uint4*)(codes + (row0+j)*(IN_C/2)))[p];
+LOAD_HLOAD_H2            uint sbi = (row0+j)*NSB + p/8;
+            sA[j]  = (half)((float)qs[(row0+j)*NB + p] * (float)d[sbi]);
+            mnA[j] = (half)((float)qm[(row0+j)*NB + p] * (float)dm[sbi]);
+        }
+        for (uint n = 0; n < NN; n++) xbsA[n] = xbsum[n*NB + p];
+
+        for (uint n = 0; n < NN; n++) {
+            device const float4* x4 = (device const float4*)(x + n*IN_C);
+            float4 xa0 = x4[p*8+0], xa1 = x4[p*8+1], xa2 = x4[p*8+2], xa3 = x4[p*8+3];
+            float4 xb0 = x4[p*8+4], xb1 = x4[p*8+5], xb2 = x4[p*8+6], xb3 = x4[p*8+7];
+            for (uint j = 0; j < RB; j++) {
+GUARD_HOT2                uint4 qw = qwA[j];
+                uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
+                uchar4 l1 = as_type<uchar4>(qw.y & 0x0F0F0F0Fu);
+                uchar4 l2 = as_type<uchar4>(qw.z & 0x0F0F0F0Fu);
+                uchar4 l3 = as_type<uchar4>(qw.w & 0x0F0F0F0Fu);
+                uchar4 h0 = as_type<uchar4>((qw.x >> 4) & 0x0F0F0F0Fu);
+                uchar4 h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
+                uchar4 h2 = as_type<uchar4>((qw.z >> 4) & 0x0F0F0F0Fu);
+                uchar4 h3 = as_type<uchar4>((qw.w >> 4) & 0x0F0F0F0Fu);
+DEC_HDEC_H2                float dv = dot(xa0, float4(l0.x, l0.y, l0.z, l0.w))
+                         + dot(xa1, float4(l1.x, l1.y, l1.z, l1.w))
+                         + dot(xa2, float4(l2.x, l2.y, l2.z, l2.w))
+                         + dot(xa3, float4(l3.x, l3.y, l3.z, l3.w))
+                         + dot(xb0, float4(h0.x, h0.y, h0.z, h0.w))
+                         + dot(xb1, float4(h1.x, h1.y, h1.z, h1.w))
+                         + dot(xb2, float4(h2.x, h2.y, h2.z, h2.w))
+                         + dot(xb3, float4(h3.x, h3.y, h3.z, h3.w));
+                acc[j*NN + n] += (float)sA[j] * dv + (float)mnA[j] * xbsA[n];
+            }
+        }
+    }
+    for (uint j = 0; j < RB; j++) {
+GUARD_TAIL        for (uint n = 0; n < NN; n++) {
+            float a = simd_sum(acc[j*NN + n]);
+            if (lane == 0)
+                out[n*OUT_C + row0 + j] = a;
+        }
+    }
+"""
+    body = (body.replace("GUARD_HOT2", "" if OUT % rb == 0 else "                if (row0 + j >= OUT_C) break;\n")
+                .replace("GUARD_HOT", guard_hot).replace("GUARD_TAIL", guard_tail)
+                .replace("DECL_H2", decl_h2).replace("DECL_H", decl_h)
+                .replace("LOAD_H2", load_h2).replace("LOAD_H", load_h)
+                .replace("DEC_H2", dec_h2).replace("DEC_H", dec_h))
+    kern = mx.fast.metal_kernel(
+        name=f"quant_linear_gw{4 + xbits}_nb2_{NN}r{rb}_{IN}_{OUT}",
+        input_names=["x", "codes", "qs", "qm", "d", "dm", "qh", "qh2", "xbsum"],
+        output_names=["out"],
+        header=hdr, source=body,
+    )
+    _gw_kernel_cache[key] = kern
+    return kern
+
+
 class GwQuantLinear:
     """Linear по sb6-тензору формата v2 (bits 4/5/6). Интерфейс как у
     QuantLinearV2: __call__(x [..., IN]) -> [..., OUT] fp32."""
@@ -188,21 +436,71 @@ class GwQuantLinear:
         lead_shape = x.shape[:-1]
         x2d = x.reshape(-1, self.in_features).astype(mx.float32)
         N = x2d.shape[0]
-        if N >= GEMM_MIN_BATCH:
+        if N >= GEMM_MIN_BATCH_NB:
             w = self._dequant_w()
             out = mx.matmul(x2d.astype(mx.float16), w.T).astype(mx.float32)
             return out.reshape(*lead_shape, self.out_features)
-        kern = _get_kernel_gw(self.in_features, self.out_features, self.xbits)
-        xbsum = mx.sum(x2d.reshape(N, self.NB, 32), axis=2)
-        n_groups = (self.out_features + R - 1) // R
-        out = kern(
+        if N > 1:
+            outs = []
+            i = 0
+            while i < N:
+                c = min(NB_CHUNK, N - i)
+                if c == 1:
+                    outs.append(self._gemv1(x2d[i:i+1]))
+                else:
+                    outs.append(self._gemv_nb(x2d[i:i+c], c))
+                i += c
+            out = mx.concatenate(outs, axis=0)
+            return out.reshape(*lead_shape, self.out_features)
+        return self._gemv1(x2d).reshape(*lead_shape, self.out_features)
+
+    def _rb_nb(self, c):
+        # свип 19.07 (bench_cmix_split): value-формы (IN>=8192) хотят rb8,
+        # key-формы (OUT>=8192) rb4, остальное (tmix/head) rb2/таблица.
+        if self.in_features >= 8192:
+            return 8
+        if self.out_features >= 8192:
+            return 4
+        return _RB_FOR_NN.get(c, RB_NB)
+
+    def _gemv_nb(self, x2d, c):
+        if NB_V2:
+            rb = 2
+            xbsum = mx.sum(x2d.reshape(c, self.NB, 32), axis=2)
+            kern = _get_kernel_gw_nb2(self.in_features, self.out_features,
+                                      self.xbits, c, rb)
+            n_groups = (self.out_features + rb - 1) // rb
+            return kern(
+                inputs=[x2d, self.codes, self.qs, self.qm, self.d, self.dm,
+                        self.qh, self.qh2, xbsum],
+                grid=(n_groups * TG, 1, 1), threadgroup=(TG, 1, 1),
+                output_shapes=[(c, self.out_features)],
+                output_dtypes=[mx.float32],
+            )[0]
+        rb = self._rb_nb(c)
+        xbsum = mx.sum(x2d.reshape(c, self.NB, 32), axis=2)
+        kern = _get_kernel_gw_nb(self.in_features, self.out_features,
+                                 self.xbits, c, rb)
+        n_groups = (self.out_features + rb - 1) // rb
+        return kern(
             inputs=[x2d, self.codes, self.qs, self.qm, self.d, self.dm,
                     self.qh, self.qh2, xbsum],
-            grid=(n_groups * TG, N, 1), threadgroup=(TG, 1, 1),
-            output_shapes=[(N, self.out_features)],
+            grid=(n_groups * TG, 1, 1), threadgroup=(TG, 1, 1),
+            output_shapes=[(c, self.out_features)],
             output_dtypes=[mx.float32],
         )[0]
-        return out.reshape(*lead_shape, self.out_features)
+
+    def _gemv1(self, x2d):
+        xbsum = mx.sum(x2d.reshape(1, self.NB, 32), axis=2)
+        kern = _get_kernel_gw(self.in_features, self.out_features, self.xbits)
+        n_groups = (self.out_features + R - 1) // R
+        return kern(
+            inputs=[x2d, self.codes, self.qs, self.qm, self.d, self.dm,
+                    self.qh, self.qh2, xbsum],
+            grid=(n_groups * TG, 1, 1), threadgroup=(TG, 1, 1),
+            output_shapes=[(1, self.out_features)],
+            output_dtypes=[mx.float32],
+        )[0]
 
 
 class GwQuantLinearFused:

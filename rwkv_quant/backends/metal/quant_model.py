@@ -101,12 +101,38 @@ class _DenseLinear:
         return _mm(x, self.w)
 
 
+class MlxAffineQuantLinear:
+    """Нативное MLX affine-квантование (mx.nn.QuantizedLinear-совместимый
+    формат: uint32-packed codes + fp16 scales/biases per group), НЕ наш
+    gw sb6 формат. Добавлено 19.07-10 для сравнения с чужими чекпоинтами
+    (MollySophia rwkv7-*-mlx-*bit), квантованными штатным mlx.nn.quantize.
+    __call__ через mx.quantized_matmul -- тот же быстрый Metal-путь, что
+    использует её собственный рантайм при инференсе (не dense-деквант),
+    так что замер скорости честный."""
+    def __init__(self, qt):
+        self.w = qt.mlx_weight        # uint32 [out, ceil(in*bits/32)]
+        self.scales = qt.mlx_scales   # fp16 [out, n_groups]
+        self.biases = qt.mlx_biases   # fp16 [out, n_groups]
+        self.group_size = qt.mlx_group_size
+        self.bits = qt.mlx_bits
+        self.in_features = qt.shape[1]
+        self.out_features = qt.shape[0]
+
+    def __call__(self, x):
+        y = mx.quantized_matmul(x.astype(mx.float16), self.w, scales=self.scales,
+                                 biases=self.biases, transpose=True,
+                                 group_size=self.group_size, bits=self.bits)
+        return y.astype(x.dtype)
+
+
 def _linear(qt):
     """Linear-подобный тензор [out,in] (proj/cmix/head): QuantLinear если
     реально квантован (bits<16), иначе dense-обёртка с тем же интерфейсом."""
     if qt.bits < 16:
         if getattr(qt, "gw_mode", "") == "sb6":
             return GwQuantLinear(qt)          # формат v2 (gw32 + sb6)
+        if getattr(qt, "gw_mode", "") == "mlx_affine":
+            return MlxAffineQuantLinear(qt)   # чужой чекпоинт, нативный MLX affine
         if getattr(qt, "gw_mode", "") == "asym":
             # gw-asym (LoRA-класс) как linear не встречается: LoRA идут
             # dense-путём (_dense -> _dequantize_one). Если попали сюда --
