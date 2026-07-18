@@ -373,6 +373,201 @@ CASES = {
         outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
         clip_percentiles={"small": 99.9},
     ),
+    # ЛЕСТНИЦА БИТНОСТИ (открытый вопрос №1): разрыв 13.53 (4.5bpw,
+    # aw_v2_uniform) <-> 11.44 (6.5bpw, mlx_int6_emu). Ищем точку ~5-5.5bpw
+    # около +2-5%. База -- aw_v2_uniform (gw32sb6+AW, без SpQR).
+    # bpw больших групп: gw32sb6 = bits+0.5; gw64sb6 = bits+0.25.
+    # int5: тело на 5 битах, gw32sb6+AW -> 5.5 bpw больших групп.
+    "ladder_int5": QuantConfig(
+        proj=5, cmix=5, emb_head=5,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # int5 + gw64: гранулярность vs битность на 5 битах -> 5.25 bpw.
+    "ladder_int5_gw64": QuantConfig(
+        proj=5, cmix=5, emb_head=5,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 64, "cmix": 64, "emb_head": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Тело int4, чувствительные тензоры (№4d: cmix.value, head) на 6 бит
+    # тем же gw32sb6-путём -> ~4.7-4.8 bpw.
+    "ladder_int4_sens6": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        bits_overrides={"cmix.value.weight": 6, "ffn.value.weight": 6,
+                        "head.weight": 6},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Изоляция LoRA-вклада: тело как aw_v2_uniform (int4), но w/a/v_lora
+    # на 6 бит gw64 (как в lossless mlx_int6_emu) вместо per-row int4.
+    # Если разрыв 13.53<->11.44 сидит в LoRA -- увидим сильный сдвиг вниз
+    # при цене ~0 MB (LoRA крошечные).
+    "ladder_lora6": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),    # Потолок LoRA-гипотезы: LoRA полностью dense fp16, тело aw_v2_uniform.
+    # Разница с ladder_lora6 покажет, есть ли что добирать сверх 6 бит.
+    "ladder_lora16": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=16, a_lora=16, v_lora=16, g_lora=16, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Композит: int5-тело + LoRA gw64@6 (закон №5 -- только замером).
+    # int4-тело + lora6 + чувствительные (cmix.value, head) на 6 бит:
+    # дешёвое закрытие части остатка 12.03->11.44 без общего int5.
+    "ladder_int4_sens6_lora6": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        bits_overrides={"cmix.value.weight": 6, "ffn.value.weight": 6,
+                        "head.weight": 6},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # int5 gw64 + lora6: -0.25 bpw против ladder_int5_lora6 (11.676).
+    "ladder_int5_gw64_lora6": QuantConfig(
+        proj=5, cmix=5, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 64, "cmix": 64, "emb_head": 64,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    "ladder_int5_lora6": QuantConfig(
+        proj=5, cmix=5, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Атрибуция бит-бюджета (Δppl/MB): тело int4, LoRA gw64@6 (якорь
+    # ladder_lora6=12.030), ОДНА группа поднята до 5 бит.
+    # Цена бита: cmix 100.7MB, proj 50.3MB, emb_head 33.6MB.
+    "l6_proj5": QuantConfig(
+        proj=5, cmix=4, emb_head=4,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Атрибуция бит-бюджета (Δppl/MB): тело int4, LoRA gw64@6 (якорь
+    # ladder_lora6=12.030), ОДНА группа поднята до 5 бит.
+    # Цена бита: cmix 100.7MB, proj 50.3MB, emb_head 33.6MB.
+    "l6_cmix5": QuantConfig(
+        proj=4, cmix=5, emb_head=4,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Атрибуция бит-бюджета (Δppl/MB): тело int4, LoRA gw64@6 (якорь
+    # ladder_lora6=12.030), ОДНА группа поднята до 5 бит.
+    # Цена бита: cmix 100.7MB, proj 50.3MB, emb_head 33.6MB.
+    "l6_emb5": QuantConfig(
+        proj=4, cmix=4, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Проверка аддитивности: proj5+emb5, cmix4. Прогноз ~11.67 при -100MB vs int5_lora6.
+    "l6_proj5_emb5": QuantConfig(
+        proj=5, cmix=4, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # cmix вниз до int3 (gw32sb6+AW, 3.5bpw): экономия ~100MB, вопрос -- цена в ppl.
+    "l6_cmix3": QuantConfig(
+        proj=4, cmix=3, emb_head=4,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Чемпион (11.668, ~961MB) + cmix на gw64 (4.25bpw): -25MB, вопрос цены.
+    "champ_cmixgw64": QuantConfig(
+        proj=5, cmix=4, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 64, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Расщепление emb_head: группа на 4, только head.weight -> 5 через
+    # override (чувствителен head, не emb). -17MB против чемпиона.
+    "champ_headonly5": QuantConfig(
+        proj=5, cmix=4, emb_head=4,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        bits_overrides={"head.weight": 5},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Чемпион + cmix.key -> int3 (value остаётся 4): -50MB, чувствительным
+    # по №4d был value; проверяем, переживёт ли key.
+    "champ_cmixkey3": QuantConfig(
+        proj=5, cmix=4, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        bits_overrides={"cmix.key.weight": 3, "ffn.key.weight": 3},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
 }
 
 

@@ -37,6 +37,20 @@ class QuantizedTensor:
     dense: torch.Tensor = None    # исходный тензор as-is, только если bits >= 16
     outlier_indices: torch.Tensor = None  # int32 [n_outliers, 2] (row, col), опционально
     outlier_values: torch.Tensor = None   # bf16 [n_outliers], опционально
+    # --- формат v2 (groupwise), поля взаимоисключающие с per-row scale ---
+    # gw_mode: "" (не gw) | "sb6" (блок gs, суперблок sb, 6-бит qs/qm против
+    # d/dm fp16) | "asym" (блок gs, fp32 scale/min на блок, контейнер int8)
+    gw_mode: str = ""
+    gw_gs: int = 0                # ширина блока (32 для sb6, 64 для lora-asym)
+    gw_sb: int = 0                # блоков в суперблоке (8)
+    gw_d: torch.Tensor = None     # fp16 [OUT, NSB] -- супер-scale для qs
+    gw_dm: torch.Tensor = None    # fp16 [OUT, NSB] -- супер-scale для qm
+    gw_qsqm: torch.Tensor = None  # uint8 [OUT, NSB, 12] -- 8 qs + 8 qm по 6 бит
+                                  # (qm хранится со сдвигом +31: unsigned 0..62)
+    gw_qh: torch.Tensor = None    # uint8 [OUT, IN/8] -- битплоскость 5-го бита
+                                  # (bits=5), бит c строки = старший бит кода c
+    gw_scale: torch.Tensor = None # fp32 [OUT, NB] -- asym-режим (LoRA)
+    gw_min: torch.Tensor = None   # fp32 [OUT, NB] -- asym-режим (LoRA)
 
 
 @dataclass
@@ -80,3 +94,68 @@ def int8_codes(qt) -> torch.Tensor:
     if qt.codes is not None:
         return qt.codes
     return unpack_int4(qt.codes_packed, qt.shape[1])
+
+
+# ---------------- формат v2: упаковщики ----------------
+
+def pack6(v: torch.Tensor) -> torch.Tensor:
+    """uint8-значения 0..63, последняя размерность кратна 4 -> байты 3/4.
+    Чанк из 4 значений (24 бита) -> 3 байта little-endian bitstream."""
+    assert v.dtype == torch.uint8 and v.shape[-1] % 4 == 0
+    x = v.to(torch.int32).reshape(*v.shape[:-1], -1, 4)
+    b0 = (x[..., 0] | (x[..., 1] << 6)) & 0xFF
+    b1 = ((x[..., 1] >> 2) | (x[..., 2] << 4)) & 0xFF
+    b2 = ((x[..., 2] >> 4) | (x[..., 3] << 2)) & 0xFF
+    return torch.stack([b0, b1, b2], dim=-1).reshape(*v.shape[:-1], -1).to(torch.uint8)
+
+
+def unpack6(b: torch.Tensor, n: int) -> torch.Tensor:
+    """Обратно: байты 3/4 -> uint8 0..63, n значений в последней размерности."""
+    assert b.dtype == torch.uint8 and b.shape[-1] % 3 == 0
+    x = b.to(torch.int32).reshape(*b.shape[:-1], -1, 3)
+    v0 = x[..., 0] & 0x3F
+    v1 = ((x[..., 0] >> 6) | (x[..., 1] << 2)) & 0x3F
+    v2 = ((x[..., 1] >> 4) | (x[..., 2] << 4)) & 0x3F
+    v3 = (x[..., 2] >> 2) & 0x3F
+    out = torch.stack([v0, v1, v2, v3], dim=-1).reshape(*b.shape[:-1], -1)
+    return out[..., :n].to(torch.uint8)
+
+
+def pack_nib_block(q: torch.Tensor, gs: int = 32) -> torch.Tensor:
+    """БЛОК-ЛОКАЛЬНЫЙ split для gw-кодов (unsigned 0..15, БЕЗ bias):
+    внутри блока из gs колонок байт j = q[j] | (q[j + gs/2] << 4),
+    j = 0..gs/2-1. Один блок-32 = 16 байт = один uint4-лоад в кернеле.
+    [OUT, IN] (IN % gs == 0) -> uint8 [OUT, IN/2]."""
+    assert q.dtype == torch.uint8 and int(q.max()) <= 15
+    OUT, IN = q.shape
+    assert IN % gs == 0
+    h = gs // 2
+    qb = q.view(OUT, IN // gs, gs)
+    return (qb[:, :, :h] | (qb[:, :, h:] << 4)).reshape(OUT, IN // 2).contiguous()
+
+
+def unpack_nib_block(p: torch.Tensor, gs: int = 32) -> torch.Tensor:
+    """Обратно к uint8-кодам 0..15, [OUT, IN]."""
+    assert p.dtype == torch.uint8
+    OUT, HB = p.shape
+    h = gs // 2
+    pb = p.view(OUT, HB // h, h)
+    lo, hi = pb & 0xF, pb >> 4
+    return torch.cat([lo, hi], dim=2).reshape(OUT, HB * 2).contiguous()
+
+
+def pack_bitplane(bit: torch.Tensor) -> torch.Tensor:
+    """Старшие биты int5-кодов (0/1, [OUT, IN], IN % 8 == 0) -> uint8
+    [OUT, IN/8], бит (c % 8) байта (c // 8) = колонка c (little-endian)."""
+    OUT, IN = bit.shape
+    assert IN % 8 == 0
+    b = bit.to(torch.uint8).view(OUT, IN // 8, 8)
+    sh = torch.arange(8, dtype=torch.uint8)
+    return (b << sh).sum(dim=2, dtype=torch.int32).to(torch.uint8)
+
+
+def unpack_bitplane(p: torch.Tensor, n_cols: int) -> torch.Tensor:
+    OUT = p.shape[0]
+    sh = torch.arange(8, dtype=torch.uint8)
+    bits = (p.unsqueeze(-1) >> sh) & 1
+    return bits.reshape(OUT, -1)[:, :n_cols].contiguous()

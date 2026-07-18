@@ -9,7 +9,8 @@ import torch
 
 from ..calibration.group_config import QuantConfig
 from ..calibration.outlier_scan import GROUP_KEY_PATTERNS
-from .schema import QuantizedTensor, QuantizedCheckpoint, pack_int4
+from .schema import (QuantizedTensor, QuantizedCheckpoint, pack_int4,
+                     pack6, pack_nib_block, pack_bitplane)
 
 
 def _real_quantize(w: torch.Tensor, bits: int):
@@ -113,7 +114,8 @@ def _weighted_quantize(w, bits, ex2, outlier_frac=0.0):
 
 
 def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int,
-                            sb: int = 0, sb_bits: int = 6, ex2=None) -> torch.Tensor:
+                            sb: int = 0, sb_bits: int = 6, ex2=None,
+                            return_parts: bool = False):
     """ПРОТОТИП group-wise scale (ядро K-квантов): асимметричный RTN на блок
     из gs колонок (scale + min на блок), сразу деквантованный обратно.
     Хранится как dense bf16 -> реальный пайплайн меряет ppl именно этой
@@ -183,11 +185,14 @@ def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int,
             mn = torch.nn.functional.pad(mn, (0, 0, 0, pad_b))
         ssb = scale.view(OUT, -1, sb, 1); msb = mn.view(OUT, -1, sb, 1)
         smax = 2 ** sb_bits - 1                      # unsigned для scale>0
-        d = (ssb.amax(dim=2, keepdim=True) / smax).clamp_min(1e-12)
+        # ВАЖНО (формат v2): d/dm проходят half-роундтрип ДО выбора qs/qm --
+        # ровно эти half-значения лягут в файл, кернель восстановит
+        # s = half(qs * float(d_half)) бит-в-бит с этим путём.
+        d = (ssb.amax(dim=2, keepdim=True) / smax).clamp_min(1e-12).half().float()
         qs = torch.clamp(torch.round(ssb / d), 1, smax)
         scale_q = (qs * d).view(OUT, -1, 1)[:, :nb + pad_b][:, :nb]
         mmax = 2 ** (sb_bits - 1) - 1                # signed для min
-        dm = (msb.abs().amax(dim=2, keepdim=True) / mmax).clamp_min(1e-12)
+        dm = (msb.abs().amax(dim=2, keepdim=True) / mmax).clamp_min(1e-12).half().float()
         qm = torch.clamp(torch.round(msb / dm), -mmax, mmax)
         mn_q = (qm * dm).view(OUT, -1, 1)[:, :nb + pad_b][:, :nb]
         # fp16-раунд-трип может занулить scale у (почти) константных
@@ -195,9 +200,57 @@ def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int,
         scale = scale_q.half().float().clamp_min(1e-8); mn = mn_q.half().float()
     q = torch.clamp(torch.round((wg - mn) / scale), 0, qmax)
     deq = (q * scale + mn).view(OUT, -1)[:, :IN]
-    return deq
+    if not return_parts:
+        return deq
+    parts = {"q": q.view(OUT, -1)[:, :IN].to(torch.uint8), "deq": deq,
+             "scale": scale, "mn": mn}
+    if sb:
+        parts.update(qs=qs.view(OUT, -1, 1)[:, :nb].squeeze(-1).to(torch.uint8),
+                     qm=qm.view(OUT, -1, 1)[:, :nb].squeeze(-1).to(torch.int8),
+                     d=d.view(OUT, -1).half(), dm=dm.view(OUT, -1).half())
+    return parts
 
 
+
+
+def _make_qt_gw_sb6(key, group, bits, w, gs, ex2):
+    """Реальный формат v2 (sb6): нибблы блок-локального split + qh-битплоскость
+    (bits=5) + d/dm fp16 + qs/qm по 6 бит (qm со сдвигом +31). Дискретизация
+    идентична fake-пути (return_parts) -- бит-точность проверяется тестом."""
+    assert bits in (4, 5)
+    OUT, IN = w.shape
+    assert IN % gs == 0, f"{key}: IN={IN} не кратно gs={gs}"
+    assert (IN // gs) % 8 == 0, f"{key}: NB={IN//gs} не кратно sb=8"
+    parts = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=-6, ex2=ex2,
+                                    return_parts=True)
+    q = parts["q"]                                   # uint8 0..2^bits-1
+    qs, qm = parts["qs"], parts["qm"]                # [OUT, NB]
+    qsqm = torch.cat([pack6(qs.view(OUT, -1, 8)),
+                      pack6((qm.to(torch.int16) + 31).to(torch.uint8).view(OUT, -1, 8))],
+                     dim=-1)                          # [OUT, NSB, 12]
+    qh = None
+    if bits == 5:
+        qh = pack_bitplane((q >> 4).contiguous())
+        q = q & 0xF
+    return QuantizedTensor(
+        key=key, group=group, bits=bits, shape=(OUT, IN),
+        codes_packed=pack_nib_block(q, gs),
+        gw_mode="sb6", gw_gs=gs, gw_sb=8,
+        gw_d=parts["d"], gw_dm=parts["dm"], gw_qsqm=qsqm, gw_qh=qh)
+
+
+def _make_qt_gw_asym(key, group, bits, w, gs):
+    """Реальный gw-asym (LoRA @6, gw64): int8-контейнер кодов (unsigned
+    0..2^bits-1) + fp32 scale/min на блок -- бит-в-бит с fake-путём asym
+    (там roundtrip'ов нет). Размер не жмём: группа крошечная (~25M парам)."""
+    OUT, IN = w.shape
+    parts = _groupwise_fake_dequant(w, bits, gs, return_parts=True)
+    return QuantizedTensor(
+        key=key, group=group, bits=bits, shape=(OUT, IN),
+        codes=parts["q"],                             # uint8 as-is
+        gw_mode="asym", gw_gs=gs,
+        gw_scale=parts["scale"].squeeze(-1).float(),  # [OUT, NBpad]
+        gw_min=parts["mn"].squeeze(-1).float())
 
 
 _E2M1_GRID = None
@@ -283,11 +336,12 @@ def _make_qt(key, group, bits, shape, codes, scale, oi=None, ov=None):
                            outlier_indices=oi, outlier_values=ov)
 
 
-def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTensor:
+def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
+                    real_gw: bool = False) -> QuantizedTensor:
     group = _match_group(key)
     if group is None or w.dim() < 2 or key.endswith(_LORA_BIAS_SUFFIXES):
         return QuantizedTensor(key=key, group=group or "other", bits=16, shape=tuple(w.shape),
-                                dense=w.to(torch.bfloat16))
+                                dense=w.to(torch.bfloat16).clone().contiguous())
 
     bits = cfg.bits[group]
     for pat, b in getattr(cfg, "bits_overrides", {}).items():
@@ -301,6 +355,14 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTen
     gs = getattr(cfg, "group_scale", {}).get(group)
     if gs and bits < 16:
         mode = getattr(cfg, "group_scale_mode", {}).get(group, "asym")
+        if real_gw:
+            # реальная упаковка формата v2 вместо dense fake-dequant
+            if mode == "asym_sb6_aw" and bits in (4, 5):
+                ex2 = _load_act_stats(sp).get(key) if sp else None
+                return _make_qt_gw_sb6(key, group, bits, w, gs, ex2)
+            if mode == "asym" and 5 <= bits <= 8:
+                return _make_qt_gw_asym(key, group, bits, w, gs)
+            raise NotImplementedError(f"real_gw: mode={mode} bits={bits} ({key})")
         if mode == "mxfp4":
             deq = _mxfp4_fake_dequant(w, gs, cfg.outlier_fracs.get(group, 0.0))
         elif mode == "asym_sb6":
@@ -324,7 +386,7 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig) -> QuantizedTen
         # проваливаемся в обычный путь ниже
     if bits >= 16:
         return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
-                                dense=w.to(torch.bfloat16))
+                                dense=w.to(torch.bfloat16).clone().contiguous())
 
     if group in cfg.outlier_fracs:
         codes, scale, oi, ov = _real_quantize_sparse_outlier(w, bits, cfg.outlier_fracs[group])

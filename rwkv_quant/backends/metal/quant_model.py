@@ -38,6 +38,7 @@ import mlx.core as mx
 from ...formats.reader import _dequantize_one
 from .quant_linear import QuantLinear  # noqa: F401 (v1, референс)
 from .quant_linear_v2 import QuantLinearV2
+from .quant_linear_gw import GwQuantLinear
 
 # Реализация Linear-кернеля для всей модели. v2 (threadgroup-редукция,
 # char4-загрузки) численно эквивалентна v1 (tests/test_quant_linear_v2.py)
@@ -97,6 +98,14 @@ def _linear(qt):
     """Linear-подобный тензор [out,in] (proj/cmix/head): QuantLinear если
     реально квантован (bits<16), иначе dense-обёртка с тем же интерфейсом."""
     if qt.bits < 16:
+        if getattr(qt, "gw_mode", "") == "sb6":
+            return GwQuantLinear(qt)          # формат v2 (gw32 + sb6)
+        if getattr(qt, "gw_mode", "") == "asym":
+            # gw-asym (LoRA-класс) как linear не встречается: LoRA идут
+            # dense-путём (_dense -> _dequantize_one). Если попали сюда --
+            # деквант в fp16-dense, чтобы не падать.
+            from ...formats.reader import _dequantize_one
+            return _DenseLinear(mx.array(_dequantize_one(qt).float().numpy()).astype(mx.float16))
         return _QUANT_LINEAR_IMPL(qt)
     return _DenseLinear(mx.array(qt.dense.float().numpy()).astype(mx.float16))
 
