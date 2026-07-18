@@ -213,30 +213,40 @@ def _groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int,
 
 
 
-def _make_qt_gw_sb6(key, group, bits, w, gs, ex2):
-    """Реальный формат v2 (sb6): нибблы блок-локального split + qh-битплоскость
-    (bits=5) + d/dm fp16 + qs/qm по 6 бит (qm со сдвигом +31). Дискретизация
-    идентична fake-пути (return_parts) -- бит-точность проверяется тестом."""
-    assert bits in (4, 5)
+def _make_qt_gw_sb6(key, group, bits, w, gs, ex2, search=True):
+    """Реальный формат v2 (sb6): нибблы блок-локального split + qh/qh2-
+    битплоскости (bits=5: qh -- бит4; bits=6: qh + qh2 -- биты 4 и 5) +
+    d/dm fp16 + qs/qm по 6 бит (qm со сдвигом +31). Дискретизация идентична
+    fake-пути (return_parts) -- бит-точность проверяется тестом.
+    search=False воспроизводит fake-режим "asym_sb6" (sb_bits=6, БЕЗ
+    грид-поиска) -- нужен, т.к. на bits=6 AW/поиск не universally помогают
+    (сессия 19.07-5: AW вредит для proj на 6 битах), а REDUCTION v2 держит
+    proj именно на "asym_sb6" (search=False, ex2=None)."""
+    assert bits in (4, 5, 6)
     OUT, IN = w.shape
     assert IN % gs == 0, f"{key}: IN={IN} не кратно gs={gs}"
     assert (IN // gs) % 8 == 0, f"{key}: NB={IN//gs} не кратно sb=8"
-    parts = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=-6, ex2=ex2,
-                                    return_parts=True)
+    parts = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=(-6 if search else 6),
+                                    ex2=ex2, return_parts=True)
     q = parts["q"]                                   # uint8 0..2^bits-1
     qs, qm = parts["qs"], parts["qm"]                # [OUT, NB]
     qsqm = torch.cat([pack6(qs.view(OUT, -1, 8)),
                       pack6((qm.to(torch.int16) + 31).to(torch.uint8).view(OUT, -1, 8))],
                      dim=-1)                          # [OUT, NSB, 12]
-    qh = None
-    if bits == 5:
-        qh = pack_bitplane((q >> 4).contiguous())
-        q = q & 0xF
+    # bits=4: q уже 0..15, обе плоскости None. bits=5: +qh (бит4). bits=6:
+    # +qh И qh2 (биты 4 и 5) -- каждый бит своей независимой плоскостью,
+    # pack_bitplane переиспользуется без изменений (см. int5-прецедент).
+    qh = qh2 = None
+    if bits >= 5:
+        qh = pack_bitplane(((q >> 4) & 1).to(torch.uint8).contiguous())
+    if bits >= 6:
+        qh2 = pack_bitplane(((q >> 5) & 1).to(torch.uint8).contiguous())
+    q = q & 0xF
     return QuantizedTensor(
         key=key, group=group, bits=bits, shape=(OUT, IN),
         codes_packed=pack_nib_block(q, gs),
         gw_mode="sb6", gw_gs=gs, gw_sb=8,
-        gw_d=parts["d"], gw_dm=parts["dm"], gw_qsqm=qsqm, gw_qh=qh)
+        gw_d=parts["d"], gw_dm=parts["dm"], gw_qsqm=qsqm, gw_qh=qh, gw_qh2=qh2)
 
 
 def _make_qt_gw_asym(key, group, bits, w, gs):
@@ -357,9 +367,11 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
         mode = getattr(cfg, "group_scale_mode", {}).get(group, "asym")
         if real_gw:
             # реальная упаковка формата v2 вместо dense fake-dequant
-            if mode == "asym_sb6_aw" and bits in (4, 5):
-                ex2 = _load_act_stats(sp).get(key) if sp else None
-                return _make_qt_gw_sb6(key, group, bits, w, gs, ex2)
+            if mode in ("asym_sb6", "asym_sb6_search", "asym_sb6_aw") and bits in (4, 5, 6):
+                ex2 = (_load_act_stats(sp).get(key)
+                       if (sp and mode == "asym_sb6_aw") else None)
+                return _make_qt_gw_sb6(key, group, bits, w, gs, ex2,
+                                       search=(mode != "asym_sb6"))
             if mode == "asym" and 5 <= bits <= 8:
                 return _make_qt_gw_asym(key, group, bits, w, gs)
             raise NotImplementedError(f"real_gw: mode={mode} bits={bits} ({key})")

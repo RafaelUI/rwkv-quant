@@ -45,6 +45,8 @@ def _dequantize_gw_sb6(qt) -> torch.Tensor:
     q = unpack_nib_block(qt.codes_packed, gs).to(torch.float32)
     if qt.gw_qh is not None:
         q = q + unpack_bitplane(qt.gw_qh, IN).to(torch.float32) * 16.0
+    if qt.gw_qh2 is not None:
+        q = q + unpack_bitplane(qt.gw_qh2, IN).to(torch.float32) * 32.0
     qs = unpack6(qt.gw_qsqm[..., :6], 8).reshape(OUT, NB).to(torch.float32)
     qm = (unpack6(qt.gw_qsqm[..., 6:], 8).reshape(OUT, NB).to(torch.int16)
           - 31).to(torch.float32)

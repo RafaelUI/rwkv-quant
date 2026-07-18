@@ -4,7 +4,8 @@ scale/min блока = 6-битные qs/qm против fp16-пары d/dm су
 Раскладка кодов -- блок-локальный split (schema.pack_nib_block): блок из 32
 колонок = 16 байт = ОДИН uint4-лоад; lo-нибблы = колонки 0..15 блока,
 hi = 16..31. Для bits=5 -- битплоскость qh (schema.pack_bitplane): бит c
-строки = старший бит кода колонки c, блок = один uint32-лоад.
+строки = 5-й бит кода колонки c, блок = один uint32-лоад. Для bits=6 --
+ВТОРАЯ битплоскость qh2 тем же механизмом (6-й бит), независимая от qh.
 
 Математика на блок b (числа как в кернеле):
     s = (half)(qs[b] * (float)d[b/8])      -- бит-в-бит с writer/reader
@@ -29,11 +30,14 @@ R = 8
 GEMM_MIN_BATCH = 16
 
 
-def _get_kernel_gw(IN: int, OUT: int, has_qh: bool, out_per: int = 0):
+def _get_kernel_gw(IN: int, OUT: int, xbits: int, out_per: int = 0):
     # out_per > 0: мульти-вход (фьюз r/k/v) -- x это стек [OUT/out_per, IN],
     # строка row берёт вход номер row/out_per; xbsum стекован так же.
     # Математика каждой строки бит-в-бит с одиночным кернелем.
-    key = (IN, OUT, has_qh, out_per)
+    # xbits: 0 = int4 (только нибблы), 1 = int5 (+qh, бит4), 2 = int6
+    # (+qh +qh2, биты 4 и 5).
+    assert xbits in (0, 1, 2)
+    key = (IN, OUT, xbits, out_per)
     if key in _gw_kernel_cache:
         return _gw_kernel_cache[key]
     assert IN % 256 == 0, "sb6-кернель: IN кратен суперблоку 256"
@@ -63,7 +67,19 @@ constant uint OUT_PER = {out_per if out_per else OUT};
             h1 |= uchar4((uint4(hb) >> uint4(20,21,22,23)) & 1u) << 4;
             h2 |= uchar4((uint4(hb) >> uint4(24,25,26,27)) & 1u) << 4;
             h3 |= uchar4((uint4(hb) >> uint4(28,29,30,31)) & 1u) << 4;
-""" if has_qh else ""
+""" if xbits >= 1 else ""
+
+    qh2_body = """
+            uint hb2 = ((device const uint*)(qh2 + (row0+j)*(IN_C/8)))[p];
+            l0 |= uchar4((uint4(hb2) >> uint4( 0, 1, 2, 3)) & 1u) << 5;
+            l1 |= uchar4((uint4(hb2) >> uint4( 4, 5, 6, 7)) & 1u) << 5;
+            l2 |= uchar4((uint4(hb2) >> uint4( 8, 9,10,11)) & 1u) << 5;
+            l3 |= uchar4((uint4(hb2) >> uint4(12,13,14,15)) & 1u) << 5;
+            h0 |= uchar4((uint4(hb2) >> uint4(16,17,18,19)) & 1u) << 5;
+            h1 |= uchar4((uint4(hb2) >> uint4(20,21,22,23)) & 1u) << 5;
+            h2 |= uchar4((uint4(hb2) >> uint4(24,25,26,27)) & 1u) << 5;
+            h3 |= uchar4((uint4(hb2) >> uint4(28,29,30,31)) & 1u) << 5;
+""" if xbits >= 2 else ""
 
     body = """
     uint g    = threadgroup_position_in_grid.x;
@@ -90,7 +106,7 @@ GUARD_HOT            uint4 qw = ((device const uint4*)(codes + (row0+j)*(IN_C/2)
             uchar4 h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
             uchar4 h2 = as_type<uchar4>((qw.z >> 4) & 0x0F0F0F0Fu);
             uchar4 h3 = as_type<uchar4>((qw.w >> 4) & 0x0F0F0F0Fu);
-""" + qh_body + """
+""" + qh_body + qh2_body + """
             float dv = dot(xa0, float4(l0.x, l0.y, l0.z, l0.w))
                      + dot(xa1, float4(l1.x, l1.y, l1.z, l1.w))
                      + dot(xa2, float4(l2.x, l2.y, l2.z, l2.w))
@@ -114,8 +130,8 @@ GUARD_TAIL        float a = simd_sum(acc[j]);
 """
     body = body.replace("GUARD_HOT", guard_hot).replace("GUARD_TAIL", guard_tail)
     kern = mx.fast.metal_kernel(
-        name=f"quant_linear_gw{'5' if has_qh else '4'}_{IN}_{OUT}",
-        input_names=["x", "codes", "qs", "qm", "d", "dm", "qh", "xbsum"],
+        name=f"quant_linear_gw{4 + xbits}_{IN}_{OUT}",
+        input_names=["x", "codes", "qs", "qm", "d", "dm", "qh", "qh2", "xbsum"],
         output_names=["out"],
         header=hdr, source=body,
     )
@@ -124,7 +140,7 @@ GUARD_TAIL        float a = simd_sum(acc[j]);
 
 
 class GwQuantLinear:
-    """Linear по sb6-тензору формата v2 (bits 4/5). Интерфейс как у
+    """Linear по sb6-тензору формата v2 (bits 4/5/6). Интерфейс как у
     QuantLinearV2: __call__(x [..., IN]) -> [..., OUT] fp32."""
 
     def __init__(self, qt):
@@ -139,9 +155,13 @@ class GwQuantLinear:
         self.qm = mx.array(qm.to(torch.int8).numpy())             # int8 -31..31
         self.d = mx.array(qt.gw_d.numpy())                        # fp16 [OUT, NSB]
         self.dm = mx.array(qt.gw_dm.numpy())
-        self.has_qh = qt.gw_qh is not None
-        self.qh = (mx.array(qt.gw_qh.numpy()) if self.has_qh
+        self.xbits = (2 if qt.gw_qh2 is not None
+                      else (1 if qt.gw_qh is not None else 0))
+        self.has_qh = self.xbits >= 1  # обратная совместимость (Fused-ассерт)
+        self.qh = (mx.array(qt.gw_qh.numpy()) if self.xbits >= 1
                    else mx.zeros((1,), dtype=mx.uint8))
+        self.qh2 = (mx.array(qt.gw_qh2.numpy()) if self.xbits >= 2
+                    else mx.zeros((1,), dtype=mx.uint8))
 
     def _dequant_w(self):
         """sb6 -> fp16 [OUT, IN] на GPU для GEMM-префилла (транзиент на
@@ -149,10 +169,14 @@ class GwQuantLinear:
         OUT, IN = self.out_features, self.in_features
         cb = self.codes.reshape(OUT, self.NB, 16)
         q = mx.concatenate([cb & 0xF, cb >> 4], axis=2).astype(mx.float16)
-        if self.has_qh:
+        if self.xbits >= 1:
             bits = (self.qh[..., None] >> mx.arange(8, dtype=mx.uint8)) & 1
             bits = bits.reshape(OUT, IN).reshape(OUT, self.NB, 32)
             q = q + bits.astype(mx.float16) * 16.0
+        if self.xbits >= 2:
+            bits2 = (self.qh2[..., None] >> mx.arange(8, dtype=mx.uint8)) & 1
+            bits2 = bits2.reshape(OUT, IN).reshape(OUT, self.NB, 32)
+            q = q + bits2.astype(mx.float16) * 32.0
         s = (self.qs.astype(mx.float32).reshape(OUT, self.NSB, 8)
              * self.d.astype(mx.float32)[..., None]).astype(mx.float16)
         m = (self.qm.astype(mx.float32).reshape(OUT, self.NSB, 8)
@@ -168,12 +192,12 @@ class GwQuantLinear:
             w = self._dequant_w()
             out = mx.matmul(x2d.astype(mx.float16), w.T).astype(mx.float32)
             return out.reshape(*lead_shape, self.out_features)
-        kern = _get_kernel_gw(self.in_features, self.out_features, self.has_qh)
+        kern = _get_kernel_gw(self.in_features, self.out_features, self.xbits)
         xbsum = mx.sum(x2d.reshape(N, self.NB, 32), axis=2)
         n_groups = (self.out_features + R - 1) // R
         out = kern(
             inputs=[x2d, self.codes, self.qs, self.qm, self.d, self.dm,
-                    self.qh, xbsum],
+                    self.qh, self.qh2, xbsum],
             grid=(n_groups * TG, N, 1), threadgroup=(TG, 1, 1),
             output_shapes=[(N, self.out_features)],
             output_dtypes=[mx.float32],
@@ -193,30 +217,33 @@ class GwQuantLinearFused:
         assert all(isinstance(l, GwQuantLinear) for l in lins)
         assert all(l.in_features == l0.in_features and
                    l.out_features == l0.out_features and
-                   l.has_qh == l0.has_qh for l in lins)
+                   l.xbits == l0.xbits for l in lins)
         self.K = len(lins)
         self.out_per = l0.out_features
         self.out_features = self.out_per * self.K
         self.in_features = l0.in_features
         self.NB, self.NSB = l0.NB, l0.NSB
+        self.xbits = l0.xbits
         self.has_qh = l0.has_qh
         self.codes = mx.concatenate([l.codes for l in lins], axis=0)
         self.qs = mx.concatenate([l.qs for l in lins], axis=0)
         self.qm = mx.concatenate([l.qm for l in lins], axis=0)
         self.d = mx.concatenate([l.d for l in lins], axis=0)
         self.dm = mx.concatenate([l.dm for l in lins], axis=0)
-        self.qh = (mx.concatenate([l.qh for l in lins], axis=0) if self.has_qh
+        self.qh = (mx.concatenate([l.qh for l in lins], axis=0) if self.xbits >= 1
                    else mx.zeros((1,), dtype=mx.uint8))
+        self.qh2 = (mx.concatenate([l.qh2 for l in lins], axis=0) if self.xbits >= 2
+                    else mx.zeros((1,), dtype=mx.uint8))
 
     def __call__(self, xstack):
         # xstack: [K, IN] fp32
         kern = _get_kernel_gw(self.in_features, self.out_features,
-                              self.has_qh, out_per=self.out_per)
+                              self.xbits, out_per=self.out_per)
         xbsum = mx.sum(xstack.reshape(self.K, self.NB, 32), axis=2)
         n_groups = (self.out_features + R - 1) // R
         out = kern(
             inputs=[xstack, self.codes, self.qs, self.qm, self.d, self.dm,
-                    self.qh, xbsum],
+                    self.qh, self.qh2, xbsum],
             grid=(n_groups * TG, 1, 1), threadgroup=(TG, 1, 1),
             output_shapes=[(1, self.out_features)],
             output_dtypes=[mx.float32],

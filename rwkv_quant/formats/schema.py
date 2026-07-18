@@ -47,8 +47,10 @@ class QuantizedTensor:
     gw_dm: torch.Tensor = None    # fp16 [OUT, NSB] -- супер-scale для qm
     gw_qsqm: torch.Tensor = None  # uint8 [OUT, NSB, 12] -- 8 qs + 8 qm по 6 бит
                                   # (qm хранится со сдвигом +31: unsigned 0..62)
-    gw_qh: torch.Tensor = None    # uint8 [OUT, IN/8] -- битплоскость 5-го бита
-                                  # (bits=5), бит c строки = старший бит кода c
+    gw_qh: torch.Tensor = None    # uint8 [OUT, IN/8] -- битплоскость бита 4
+                                  # (bits>=5), бит c строки = 5-й бит кода c
+    gw_qh2: torch.Tensor = None   # uint8 [OUT, IN/8] -- битплоскость бита 5
+                                  # (bits=6), бит c строки = 6-й бит кода c
     gw_scale: torch.Tensor = None # fp32 [OUT, NB] -- asym-режим (LoRA)
     gw_min: torch.Tensor = None   # fp32 [OUT, NB] -- asym-режим (LoRA)
 
