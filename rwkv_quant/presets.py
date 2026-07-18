@@ -6,36 +6,72 @@
 (например, group 'small' безобидна на 61M, но катастрофична на 1.5B без
 outlier-обработки) -- см. README. Для продакшена рекомендуется
 scripts/calibrate.py на целевом чекпоинте перед выбором пресета.
+
+Оба пресета ниже зафиксированы по итогам сессий 19.07-5/6/7 (см.
+NEXT_SESSION.md) -- это не первая калибровка "на глаз", а Парето-точки,
+подтверждённые прямым замером ppl на eval_corpus_world.pt[:8], одна и та
+же схема квантования (asym_sb6[_aw], блок 32/суперблок 8), REDUCTION --
+буквально "COMPRESSION с большей битностью кода" (аналогия MXFP4/MXFP8:
+один и тот же блочный scale-механизм, разная точность мантиссы), а не
+другая техника ради лучшего числа.
+
+ОБЕ схемы требуют activation-статистику (act_stats_path) для AW-критерия
+поиска -- см. tests/collect_act_stats.py (~28с сборки, /tmp/act_stats_1p5b.pt
+не переживает перезагрузку -- пересобрать перед использованием, если файла
+нет).
 """
 from .calibration.group_config import QuantConfig
 
-# REDUCTION: near-lossless, ~2x compression. Безопасно почти всегда.
+# REDUCTION v2: цель -- деградация около нуля (для QAT/QLoRA-базы, где
+# training чувствителен даже к небольшим потерям -- см. сессию 19.07-5).
+# proj=6 БЕЗ AW (asym_sb6 plain): на 6 битах AW-взвешивание для proj
+# ПЕРЕВОРАЧИВАЕТ знак выигрыша (сессия 19.07-5, изоляция по стадиям
+# конвейера) -- контринтуитивно, но подтверждено замером, не теорией.
+# emb_head=6 И cmix=6 -- С AW (там оно по-прежнему помогает на этой
+# битности). Итог измерен (reduction_v2_p6e6c6_mixed, сессия 19.07-6):
+# ppl 11.4426 vs bf16 11.430 (+0.11%, практически lossless), ~1257MB
+# (2.35x меньше bf16). ПРОВЕРЕНО НА FAKE-ПУТИ (real_gw=False) --
+# quantize(..., real_gw=True) для bits=6 ПОКА УПАДЁТ: реальный packer
+# _make_qt_gw_sb6 (writer.py) держит assert bits in (4, 5); кернель
+# (quant_linear_gw.py) поддерживает только int4-нибблы и int5 (+1-битная
+# qh-плоскость). Для int6 нужна 2-битная плоскость поверх нибблов --
+# см. "Открытые вопросы" в NEXT_SESSION.md. До этой реализации REDUCTION
+# пригоден только для ppl-оценки (real_gw=False), не для реального
+# .rwkvq/инференса.
 REDUCTION = QuantConfig(
-    proj=8, cmix=8, emb_head=8,
-    w_lora=4, a_lora=4, v_lora=4, g_lora=8,
-    small=8,
+    proj=6, cmix=6, emb_head=6,
+    w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+    outlier_fracs={},
+    group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                 "w_lora": 64, "a_lora": 64, "v_lora": 64},
+    group_scale_mode={"proj": "asym_sb6", "cmix": "asym_sb6_aw",
+                      "emb_head": "asym_sb6_aw"},
+    act_stats_path="/tmp/act_stats_1p5b.pt",
 )
 
-# COMPRESSION: ~3.5x compression ценой заметной (но не катастрофической)
-# потери качества. Использует SpQR-style sparse outlier extraction на
-# dense-группах (proj/cmix/emb_head) -- percentile clipping там НЕ работает
-# (см. README).
-#
-# g_lora=8, НЕ 4: если все четыре LoRA-ветки (w/a/v/g) квантовать в INT4
-# ОДНОВРЕМЕННО, ppl взрывается в ~150x (11.4 -> 1708 на rwkv7-g1h-1.5b,
-# полный прогон через реальный quant+backends/metal/quant_model, не
-# fake_quant). Каждая ветка ПО ОТДЕЛЬНОСТИ безобидна на INT4 (см. README
-# ablation) -- эффект чисто комбинаторный, single-group ablation его не
-# ловит по построению. g_lora=8 полностью убирает взрыв (ppl 18.15,
-# Δ+59% -- ожидаемая цена INT4 на dense-группах, не катастрофа).
-# Если меняете эту группу битностей -- обязательно валидируйте КОМБИНАЦИЮ
-# через реальный backend, не только single-group ablation.
+# COMPRESSION: "чемпион" из сессий 17.07-18.07, ppl 11.710 vs bf16 11.430
+# (+2.4%), ~970.7MB (3.04x меньше bf16 2953MB). group-wise asym_sb6_aw
+# (блок 32, суперблок 8, 6-бит qs/qm scale/min, AW-взвешенный поиск) --
+# ПОЛНОСТЬЮ деплоится (bits 4/5, реальный кернель есть, real_gw=True
+# работает, backends/metal/quant_linear_gw.py). Заменяет старый
+# per-row+SpQR COMPRESSION (ppl 18.15/+59%, ~1181MB) -- при похожем
+# размере вдвое меньшая деградация за счёт groupwise-квантования вместо
+# per-row (см. README/NEXT_SESSION: "ГРАНУЛЯРНОСТЬ ВАЖНЕЕ БИТНОСТИ").
+# Проверено сессией 19.07-7: дальнейшее ужатие (напр. до 4x от bf16)
+# НЕДОСТИЖИМО в текущем нибл-формате даже ценой ухода за 5% ppl --
+# cmix (47% размера) уже на полу int4 (INT3 в нибл-контейнере не
+# экономит байт). Эта точка близка к границе Парето-фронта формата, не
+# под-оптимизирована -- дальше только принципиально новая упаковка
+# (суб-ниббл/sparsity), не тюнинг битности.
 COMPRESSION = QuantConfig(
-    proj=4, cmix=4, emb_head=4,
-    w_lora=4, a_lora=4, v_lora=4, g_lora=8,
-    small=6,
-    outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
-    clip_percentiles={"small": 99.9},
+    proj=5, cmix=4, emb_head=5,
+    w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+    outlier_fracs={},
+    group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                 "w_lora": 64, "a_lora": 64, "v_lora": 64},
+    group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                      "emb_head": "asym_sb6_aw"},
+    act_stats_path="/tmp/act_stats_1p5b.pt",
 )
 
 PRESETS = {"reduction": REDUCTION, "compression": COMPRESSION}

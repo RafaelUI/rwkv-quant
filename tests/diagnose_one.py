@@ -568,6 +568,183 @@ CASES = {
                           "emb_head": "asym_sb6_aw"},
         act_stats_path="/tmp/act_stats_1p5b.pt",
     ),
+    # --- REDUCTION v2 (сессия 19.07-5): почти-lossless кандидат для
+    # QAT/QLoRA-базы. Гипотеза из "Открытых вопросов" №2: proj6/emb_head6,
+    # cmix держим на 4 (насыщен по №"Ключевые выводы 18.07-вечер":
+    # cmix+1бит = -0.003 ppl при int4 gw32sb6+AW, то есть почти бесплатно
+    # остаться на 4). Референсные точки уже известны: чемпион (proj5/
+    # cmix4/emb5) = 11.710 (+2.4%); uniform 6-бит ВСЕ группы (plain asym
+    # gw64, НЕ asym_sb6_aw) = 11.439 (+0.07%, ~1190MB) -- уже почти
+    # lossless, но крупнее. Проверяем: держит ли AW-схема (asym_sb6_aw,
+    # та же, что дала чемпиону эффективность) 6-бит proj/emb_head при
+    # cmix=4 -- и близко ли это к uniform-6bit по качеству при меньшем
+    # размере. Изолированные бампы (p6e5/p5e6) -- проверка аддитивности
+    # (закон №5, "предполагать нельзя -- только замер"), по аналогии с
+    # тем, как была подтверждена аддитивность proj5+emb5 для чемпиона.
+    "reduction_v2_p6e5c4": QuantConfig(
+        proj=6, cmix=4, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    "reduction_v2_p5e6c4": QuantConfig(
+        proj=5, cmix=4, emb_head=6,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    "reduction_v2_p6e6c4": QuantConfig(
+        proj=6, cmix=4, emb_head=6,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+
+    # --- Изоляция proj@6 по стадиям конвейера (аналог "Изоляция cmix"
+    # 18.07): почему proj 5->6 внутри asym_sb6_aw не даёт ожидаемого
+    # улучшения (даже небольшой регресс, p6e5c4=11.7298 > чемпион 11.710).
+    # Держим cmix/emb_head/LoRA на уровне чемпиона, варьируем ТОЛЬКО
+    # схему proj: plain sb6 (без поиска) / +грид-поиск (без AW) /
+    # +AW (= p6e5c4, уже есть) / плоская "asym" gs=64 (референсная схема
+    # без суперблочного 6-бит scale вообще -- контроль).
+    "diag6_proj_sb6plain": QuantConfig(
+        proj=6, cmix=4, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    "diag6_proj_sb6search": QuantConfig(
+        proj=6, cmix=4, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_search", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+
+
+    # --- REDUCTION v2, честная сборка ВНУТРИ деплоящейся sb6-схемы (AW
+    # выключен на 6-битных группах -- см. диагностику proj выше). "asym"
+    # gs=64 отброшен: у него нет реального кернеля (падает в dense fp16
+    # при загрузке -- см. quant_model._linear), число 11.439 нерелевантно
+    # для деплоя. Изоляция emb_head@6 и cmix@5, оба БЕЗ AW (plain sb6),
+    # остальное на уровне чемпиона -- по аналогии с proj.
+    "diag6_emb_sb6plain": QuantConfig(
+        proj=5, cmix=4, emb_head=6,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    "diag5_cmix_sb6plain": QuantConfig(
+        proj=5, cmix=5, emb_head=5,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Полная сборка: proj6/emb6 БЕЗ AW (plain sb6), cmix4 остаётся с AW
+    # (там AW доказанно помогает на 4 битах -- закон отдельный для
+    # низких/высоких битов, не выключаем без причины).
+    # ИСПРАВЛЕНО по факту замеров: AW group-specific, не bit-depth-specific
+    # (emb_head: AW ПОМОГАЕТ на 6 битах -- p5e6c4 11.661 с AW vs
+    # diag6_emb_sb6plain 11.775 без AW; proj: AW ВРЕДИТ на 6 битах --
+    # p6e5c4 11.730 с AW vs diag6_proj_sb6plain 11.691 без AW). Поэтому
+    # proj БЕЗ AW, emb_head С AW (как раньше), cmix С AW (как чемпион,
+    # там 4-битный код и AW доказанно помогает).
+    "reduction_v2_noaw_p6e6c4": QuantConfig(
+        proj=6, cmix=4, emb_head=6,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+
+    # --- Рост размера REDUCTION v2 к около-нулевой деградации (19.07-6):
+    # 84MB зазор между COMPRESSION и reduction_v2_noaw_p6e6c4 за 0.5pp --
+    # плохая точка на кривой. Растим cmix (самая тяжёлая группа, 805M
+    # элементов) поверх proj6-noAW/emb6-AW.
+    "reduction_v2_p6e6c5_mixed": QuantConfig(
+        proj=6, cmix=5, emb_head=6,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    "reduction_v2_p6e6c6_mixed": QuantConfig(
+        proj=6, cmix=6, emb_head=6,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+
+    # --- Пол размера внутри текущего нибл-формата (19.07-7): можно ли
+    # ужать COMPRESSION до 4x от bf16 (~738MB) в бюджет 5% ppl?
+    # Всё на int4 (proj/emb тоже) -- минимальный размер без нового
+    # суб-ниббл формата.
+    "compression_floor_p4c4e4": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Тот же пол, но gs=64 для cmix (шире блок -> меньше служебных байт
+    # на scale/min ценой грубее scale) -- проверка второго рычага сжатия,
+    # не битности кода.
+    "compression_floor_gs64cmix": QuantConfig(
+        proj=4, cmix=4, emb_head=4,
+        w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+        outlier_fracs={},
+        group_scale={"proj": 32, "cmix": 64, "emb_head": 32,
+                     "w_lora": 64, "a_lora": 64, "v_lora": 64},
+        group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
+                          "emb_head": "asym_sb6_aw"},
+        act_stats_path="/tmp/act_stats_1p5b.pt",
+    ),
+    # Текущий шипованный REDUCTION (presets.py) как есть -- перепроверка
+    # старого замечания "ppl 13.15" (реестр 19.07-5/6).
+    "reduction_current_preset": QuantConfig(
+        proj=8, cmix=8, emb_head=8,
+        w_lora=4, a_lora=4, v_lora=4, g_lora=8, small=8,
+    ),
 }
 
 
