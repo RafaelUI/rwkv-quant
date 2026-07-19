@@ -574,7 +574,8 @@ class QuantRWKV7:
             self._step_compiled = mx.compile(self.forward_stateful)
         return self._step_compiled
 
-    def forward_stateful(self, idx: mx.array, states, last_only: bool = False):
+    def forward_stateful(self, idx: mx.array, states, last_only: bool = False,
+                         tail_only: int = 0):
         """idx: [B, T] -- T=1 для single-token decode, T>1 для prefill
         произвольной длины (внутри чанкуется по 32 автоматически).
         states: список per-layer state из init_state() или предыдущего
@@ -594,4 +595,9 @@ class QuantRWKV7:
         x = _layer_norm(x, self.ln_out_w, self.ln_out_b)
         if last_only and x.shape[1] > 1:
             x = x[:, -1:]
+        elif tail_only and x.shape[1] > tail_only:
+            # спекулятивная верификация: логиты нужны только на tail_only
+            # хвостовых позициях (k драфт + 1 бонус); pending-префикс
+            # двигает state, но head по нему не считается (19.07-15, п.1)
+            x = x[:, -tail_only:]
         return self.head(x), new_states

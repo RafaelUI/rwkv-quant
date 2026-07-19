@@ -102,7 +102,8 @@ st, cur = prefill(prompt)
 _warm_st = model.init_state(1)
 _, _warm_st = model.forward_stateful(mx.array([prompt[:64]]), _warm_st, last_only=True)
 for _T in range(1, FLUSH + K + 2):
-    _lg, _ = model.step(mx.array([[100] * _T]), _warm_st)
+    _lg, _ = model.step(mx.array([[100] * _T]), _warm_st,
+                        tail_only=min(_T, K + 1))
     mx.eval(_lg)
 mx.synchronize()
 hist = list(prompt) + [cur]
@@ -112,7 +113,7 @@ rounds = accepted_total = drafted_total = flushes = 0
 mx.synchronize(); t0 = time.perf_counter()
 while len(out_spec) < N_GEN:
     if len(pending) > FLUSH:
-        lg, st = model.step(mx.array([pending]), st)
+        lg, st = model.step(mx.array([pending]), st, tail_only=1)
         nxt = int(argmax_np(lg)[-1])
         pending = [nxt]; hist.append(nxt); out_spec.append(nxt)
         flushes += 1
@@ -120,12 +121,12 @@ while len(out_spec) < N_GEN:
     draft = ngram_draft(hist, K)
     p = len(pending)
     x = pending + draft
-    lg, st_new = model.step(mx.array([x]), st)
-    pred = argmax_np(lg)          # pred[i] = argmax после x[i]
+    lg, st_new = model.step(mx.array([x]), st, tail_only=len(draft)+1)
+    pred = argmax_np(lg)          # pred[i] = argmax на позиции p-1+i (хвост)
     m = 0
-    while m < len(draft) and draft[m] == int(pred[p-1+m]):
+    while m < len(draft) and draft[m] == int(pred[m]):
         m += 1
-    bonus = int(pred[p-1+m])
+    bonus = int(pred[m])
     good = draft[:m] + [bonus]
     out_spec.extend(good); hist.extend(good)
     rounds += 1; accepted_total += m; drafted_total += len(draft)
