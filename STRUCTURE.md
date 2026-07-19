@@ -37,18 +37,25 @@ rwkv-quant/
 │   └── backends/                   # platform-specific inference. consumes
 │       ├── __init__.py             #   the .rwkvq format from formats/, produced
 │       ├── metal/                  #   by calibration/. this is the ONLY layer
-│       │   └── __init__.py         #   that's platform-specific.
-│       └── cuda/
+│       │   ├── __init__.py         #   that's platform-specific.
+│       │   ├── quant_model.py      # QuantRWKV7: stateful decode/prefill, fused paths
+│       │   ├── quant_linear_gw.py  # sb6 GEMV/GEMM kernels (кернель-3), N-batch verify
+│       │   ├── quant_linear_v2.py  # per-row packed linears (loras/small)
+│       │   └── quant_linear.py     # legacy
+│       └── cuda/                   # empty stub for now
 │           └── __init__.py
 │
-├── scripts/                        # thin CLI wrappers around rwkv_quant/
-│   ├── calibrate.py                #   checkpoint -> outlier scan -> QuantConfig
-│   ├── quantize.py                 #   apply config -> save .rwkvq
-│   └── benchmark.py                #   ppl + size + speed, before/after
+├── scripts/                        # CLI wrappers -- EMPTY STUBS for now,
+│   ├── calibrate.py                #   use rwkv_quant.api directly
+│   ├── quantize.py
+│   └── benchmark.py
 │
-├── tests/
-│   ├── test_fake_quant.py
-│   ├── test_naming_detection.py
+├── tests/                          # gates (test_*), benches (bench_*),
+│   ├── test_gw_kernel*.py          #   profilers, spec-decode demos, eval
+│   ├── test_gw_nb_parity.py        #   harnesses; venv/ lives here.
+│   ├── test_fuse_parity.py         #   Naming: гейты бит-в-бит и численные,
+│   ├── bench_*.py, profile_*.py    #   бенчи только A/B в одном процессе
+│   ├── spec_decode_*.py            #   (см. законы в NEXT_SESSION.md)
 │   └── fixtures/                   # small synthetic checkpoints, NOT the real
 │                                    #   61M/1.5B models (too large for the repo)
 │

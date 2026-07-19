@@ -28,16 +28,12 @@ from .calibration.group_config import QuantConfig
 # ПЕРЕВОРАЧИВАЕТ знак выигрыша (сессия 19.07-5, изоляция по стадиям
 # конвейера) -- контринтуитивно, но подтверждено замером, не теорией.
 # emb_head=6 И cmix=6 -- С AW (там оно по-прежнему помогает на этой
-# битности). Итог измерен (reduction_v2_p6e6c6_mixed, сессия 19.07-6):
-# ppl 11.4426 vs bf16 11.430 (+0.11%, практически lossless), ~1257MB
-# (2.35x меньше bf16). ПРОВЕРЕНО НА FAKE-ПУТИ (real_gw=False) --
-# quantize(..., real_gw=True) для bits=6 ПОКА УПАДЁТ: реальный packer
-# _make_qt_gw_sb6 (writer.py) держит assert bits in (4, 5); кернель
-# (quant_linear_gw.py) поддерживает только int4-нибблы и int5 (+1-битная
-# qh-плоскость). Для int6 нужна 2-битная плоскость поверх нибблов --
-# см. "Открытые вопросы" в NEXT_SESSION.md. До этой реализации REDUCTION
-# пригоден только для ppl-оценки (real_gw=False), не для реального
-# .rwkvq/инференса.
+# битности), proj=6 -- БЕЗ AW (asym_sb6). Это REDUCTION v2 (сессия
+# 19.07): ppl 11.4438 vs bf16 11.430 (+0.12%, перевалидировано на
+# РЕАЛЬНОМ пути real_gw=True), 1255.9MB (2.35x меньше bf16).
+# int6 полностью деплоится: writer пакует 2-ю битплоскость qh2,
+# кернель (quant_linear_gw.py, кернель-3) декодит int4/5/6 бит-в-бит
+# с writer'ом; decode ~17.7 мс/ток на M4 base (A/B 19.07).
 REDUCTION = QuantConfig(
     proj=6, cmix=6, emb_head=6,
     w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,

@@ -1,48 +1,91 @@
 # rwkv-quant
 
-Quantization toolkit for RWKV-7, built around a finding that surprised us:
-**quantization sensitivity does not transfer across model scale**, and the reason
-is per-channel outlier values in specific RWKV-7 components (`r_k`, `k_k`, `k_a`,
-the LoRA-style decay/gate projections). This repo packages the calibration,
-outlier handling, and portable quantized format needed to compress RWKV-7
-checkpoints without hand-tuning per model.
+Quantization toolkit **and Metal inference backend** for RWKV-7 on Apple
+Silicon. Portable `.rwkvq` checkpoint format, outlier-aware calibration, and
+custom Metal GEMV kernels that decode the quantized format directly — no
+dequantized weight copy in memory.
+
+Reference model: `rwkv7-g1h-1.5b` (BlinkDL G1H 1.5B, bf16 2953 MB).
+Reference machine: M4 MacBook Air 16 GB (base chip, fanless).
+
+| preset | size | Δppl vs bf16 | decode | prefill T=1024 |
+|---|---|---|---|---|
+| bf16 reference | 2953 MB | — | — | — |
+| `reduction` (all-INT6 group-wise) | 1256 MB (2.35x) | **+0.12 %** | 17.7 ms/tok | 437 t/s |
+| `compression` (INT4/INT5 mixed) | 971 MB (3.04x) | +2.47 % | **14.8 ms/tok** (14.0 with n-gram speculation) | 545 t/s |
+
+For scale: the community MLX affine-INT6 build of the same model is the same
+size as `reduction` (1272 MB) and runs 15.1 ms/tok, but costs +1.06 % ppl —
+roughly 9x the quality loss of `reduction`. Our `compression` preset is both
+faster than it and 300 MB smaller. Speed was closed by kernel work while
+keeping the native format (see [Kernels](#kernels)).
 
 ## Quick start
 
 ```python
 from rwkv_quant import quantize
 
-# ~2x compression, near-lossless (+1.6% ppl on our 1.5B reference run)
+# near-lossless, 2.35x smaller than bf16 (+0.12% ppl on the 1.5B reference)
 quantize("model.pth", "model.rwkvq", preset="reduction")
 
-# ~3.5x compression, moderate quality cost (+37.6% ppl on our reference run)
+# 3.04x smaller, moderate cost (+2.47% ppl), fastest decode
 quantize("model.pth", "model.rwkvq", preset="compression")
 ```
 
-Presets are a starting point, calibrated on `rwkv7-g1h-1.5b-ctx10240` — see
-[Why presets aren't universal](#why-quantization-sensitivity-doesnt-transfer-across-scale)
-below. For a checkpoint-specific config:
+Both presets use activation-weighted (AW) scale search and expect activation
+statistics at the path set in `QuantConfig.act_stats_path`
+(`tests/collect_act_stats.py` produces them in ~30 s).
+
+Inference (Metal / MLX):
 
 ```python
-from rwkv_quant import quantize, calibrate
+from rwkv_quant.formats.reader import load_raw
+from rwkv_quant.backends.metal.quant_model import QuantRWKV7
 
-config = calibrate("model.pth", "eval_corpus.pt")   # runs outlier scan + ablation
-quantize("model.pth", "model.rwkvq", config=config)
+model = QuantRWKV7(load_raw("model.rwkvq"))
+state = model.init_state(1)
+logits, state = model.forward_stateful(token_ids, state)   # prefill / decode
 ```
 
-Or build a config by hand for full control over every group:
+Presets are calibrated on `rwkv7-g1h-1.5b` — see
+[Why presets aren't universal](#why-quantization-sensitivity-doesnt-transfer-across-scale).
+For a checkpoint-specific config run `calibrate()` or build a `QuantConfig`
+by hand (per-group bits, group scale sizes, scale modes, clipping).
 
-```python
-from rwkv_quant.calibration import QuantConfig
+## Format
 
-config = QuantConfig(
-    proj=4, cmix=4, emb_head=4,           # dense matrices
-    w_lora=4, a_lora=4, v_lora=4, g_lora=4,  # LoRA decay/ICL-rate/value/gate
-    small=6,                               # k_k, k_a, r_k
-    outlier_fracs={"proj": 0.02, "cmix": 0.02, "emb_head": 0.02},
-    clip_percentiles={"small": 99.9},
-)
-```
+`.rwkvq` stores group-wise asymmetric quantization ("sb6"): blocks of 32
+weights share a 6-bit scale/min pair (`qs`/`qm`), superblocks of 256 share an
+fp16 pair (`d`/`dm`) that the 6-bit pairs multiply. Codes are packed as
+nibbles; INT5/INT6 add one/two bit-planes on top. Scale search is
+activation-weighted where it helps (per-group setting). The format is
+backend-independent; per-tensor bits and modes live in the file, not in code.
+
+A finding that shaped the presets: **granularity beats bits.** Group-wise
+sb6 at INT4/5 replaced an earlier per-row + SpQR-outlier scheme of the same
+size with roughly half the quality loss. Sub-nibble packing (sub-887 MB at
+sane ppl) does not fit the nibble container — that's a future format, not a
+tuning exercise.
+
+## Kernels
+
+`backends/metal/` decodes sb6 on the fly inside GEMV — weights never exist
+dequantized in memory. Highlights (all validated bit-exact against the
+reference implementation, so quality numbers carry over without re-eval):
+
+- **Layout borrowed from MLX `qmv`** (PR #1503): N simdgroups x R rows per
+  threadgroup, dispatch table per matrix shape.
+- **Interleaved load-time repack**: codes + bit-planes contiguous per block,
+  quality scalars as `uchar2`/`half2` — 4-5 memory transactions per
+  (row, block) instead of 7. On-disk format untouched; memory stays 1x.
+- **Bit-plane decode via multiply trick** (`(nib * 0x00204081) & 0x01010101`)
+  — ~3x less ALU per plane; this is what unlocked INT6 decode speed
+  (head INT6: 88 → 103 GB/s, ~85 % of the M4's DRAM bandwidth).
+- **Batched verify kernels** (weights decoded once per N columns) for
+  speculative decoding; n-gram prompt-lookup speculation ships in the demo
+  scripts (1.08-1.25x on repetitive text, never slower).
+- Fused r/k/v projection launch and fused lerp/LoRA batching in the decode
+  path.
 
 ## Why quantization sensitivity doesn't transfer across scale
 
@@ -79,61 +122,28 @@ Per-row max/mean ratios of 40–96x show up in `r_k`, `k_k`, `k_a`, and even in
 single 96x outlier in an otherwise tight channel forces the other ~63 "normal"
 values into 1–2 quantization codes, destroying the channel. Same mechanism as
 `LLM.int8()`'s outlier features in transformers, showing up in RWKV-7's
-LoRA-style decay/gate projections instead of attention. Confirmed the failure
-is systemic, not corpus noise: at INT4, all held-out eval chunks blew up
-simultaneously, not a localized artifact.
+LoRA-style decay/gate projections instead of attention.
 
-### Two mitigations, and they are not interchangeable
-
-**Percentile clipping** (scale from the 99th percentile instead of abs-max)
-fully rescued `small`:
-
-```
-small @ INT6, no clip:        +11.55% ppl
-small @ INT6, clip p99.9:      +1.60% ppl
-small @ INT5, clip p99.0:      +3.94% ppl  (better than unclipped INT6!)
-```
-
-But it **hurt** `proj`/`cmix` — made INT4 slightly worse. The dense matrices'
-outlier tail is trained signal, not noise; clipping throws away information.
-
-**SpQR-style sparse outlier extraction** (keep the top-k% largest-magnitude
-values per row exact in bf16, quantize the rest with a clean scale) worked
-much better for `proj`/`cmix`/`emb_head`:
-
-```
-group      INT4 no fix   INT4 + clip     INT4 + SpQR(1%)
-proj         +19.97%      +22.64% (worse)   +5.62%
-cmix         +48.09%      +51.63% (worse)  +13.00%
-emb_head     +97.17%      +14.22%            +6.87%
-```
-
-Sweeping outlier fraction shows diminishing returns past ~2%:
-
-```
-outlier%   Δppl      compression
-1%        +54.86%       3.74x
-2%        +37.61%       3.52x
-3%        +32.68%       3.32x
-4%        +31.51%       3.14x
-```
+Mitigations differ per group and are not interchangeable: percentile clipping
+rescues `small` (INT6 +11.55 % → +1.60 %) but *hurts* the dense matrices,
+whose outlier tail is trained signal. For dense groups the current presets
+use group-wise asymmetric scales (see [Format](#format)); the earlier
+SpQR-style sparse-outlier path is retained in `calibration/` for study.
 
 ## Caveats
 
-Evaluated on a small held-out text corpus and fake quantization only (no
-packed kernels / measured speedup yet — that's what `backends/` is for).
-Presets above are calibrated on one 1.5B checkpoint; recalibrate for other
-sizes. `g_lora`'s catastrophic INT2 failure hasn't been tested with SpQR yet.
+- Presets are calibrated on one 1.5B checkpoint; recalibrate for other sizes
+  (`small`/`g_lora` stay INT8 in both presets for a reason).
+- Kernel dispatch tables are tuned on an M4 base chip; other Apple Silicon
+  will work but may prefer different (simdgroups x rows) configs.
+- ppl deltas are measured on a small held-out corpus; treat them as relative
+  quality signals, not benchmarks.
+- `scripts/` and `examples/` are placeholders for now — the maintained entry
+  points are `rwkv_quant.api` and the benches/gates under `tests/`.
+- CUDA backend is an empty stub; Metal is the only real inference path today.
 
 ## Repo layout
 
-See [STRUCTURE.md](./STRUCTURE.md).
-
-## Backends
-
-Calibration (`rwkv_quant.calibration`) is pure PyTorch and platform-agnostic.
-Actual quantized inference is platform-specific:
-- `backends/metal/` — built on top of [rwkv-metal](https://github.com/) kernels
-- `backends/cuda/` — CUDA path
-
-Both consume the same portable `.rwkvq` format from `rwkv_quant.formats`.
+See [STRUCTURE.md](./STRUCTURE.md). Session-to-session engineering log with
+measurement methodology (fanless-Mac A/B discipline, bit-exactness gates)
+lives in [NEXT_SESSION.md](./NEXT_SESSION.md) and git history.
