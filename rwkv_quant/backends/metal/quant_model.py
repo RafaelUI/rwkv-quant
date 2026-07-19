@@ -51,6 +51,7 @@ _QUANT_LINEAR_IMPL = QuantLinearV2
 # step трассирует ветку на момент mx.compile -- после смены флага нужен
 # свежий mx.compile.
 FUSE = False
+LORA_Q8 = False  # int8-лоры в decode-фьюзе: НЕ бит-в-бит, включать после ppl-гейта
 
 _RWKV_METAL_PATH = os.environ.get("RWKV_METAL_PATH", os.path.expanduser("~/Develop/rwkv-metal"))
 if _RWKV_METAL_PATH not in sys.path:
@@ -313,6 +314,22 @@ class QuantTMix:
         self.wav_Bt = mx.stack([padBt(self.w_lora_B_w), padBt(self.a_lora_B_w),
                                 padBt(self.v_lora_B_w)])                  # [3,rmax,D]
         self._wav_idx = mx.array([1, 4, 3])          # (xw, xa, xv) из xs
+        # int8-копии для LORA_Q8 (трафик лор пополам; значения --
+        # mx.quantize(gs=64, bits=8) поверх fp16-стеков). Итог 19.07:
+        # decode x1.004 (лора-блок латентно-, а не трафик-bound) --
+        # отрицательный результат, флаг выключен. Строим только когда
+        # размерности кратны 64 (toy-модели -- нет).
+        self._wav_At_q = self._wav_Bt_q = None
+        self._g_A_q = self._g_B_q = None
+        if (D % 64 == 0 and rmax % 64 == 0
+                and self.g_lora_A.shape[-1] % 64 == 0
+                and self.g_lora_B_w.shape[-1] % 64 == 0):
+            self._wav_At_q = mx.quantize(
+                mx.contiguous(self.wav_At.transpose(0, 2, 1)),
+                group_size=64, bits=8)                               # [3,rmax,D]
+            self._wav_Bt_q = mx.quantize(self.wav_Bt, group_size=64, bits=8)
+            self._g_A_q = mx.quantize(self.g_lora_A, group_size=64, bits=8)
+            self._g_B_q = mx.quantize(self.g_lora_B_w, group_size=64, bits=8)
         self._tanh_mask = mx.array([True, False, False]).reshape(3, 1, 1)
 
         # r/k/v одним launch'ем: конкатенация квантованных строк трёх
@@ -351,12 +368,29 @@ class QuantTMix:
             k = self.k_proj(xk).reshape(B, T, H, S)
             v = self.v_proj(xv).reshape(B, T, H, S)
 
-        g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
+        if LORA_Q8 and self._g_A_q is not None:
+            gq = mx.quantized_matmul(
+                xg.astype(mx.float16), *self._g_A_q, transpose=True,
+                group_size=64, bits=8)
+            g = mx.quantized_matmul(
+                mx.sigmoid(gq), *self._g_B_q, transpose=True,
+                group_size=64, bits=8).astype(x.dtype)
+        else:
+            g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
 
         z = mx.take(xs, self._wav_idx, axis=0).reshape(3, B * T, D)
-        h = (z.astype(self.wav_At.dtype) @ self.wav_At).astype(x.dtype)
-        h = mx.where(self._tanh_mask, mx.tanh(h), h)
-        y = (h.astype(self.wav_Bt.dtype) @ self.wav_Bt).astype(x.dtype)  # [3,BT,D]
+        if LORA_Q8 and self._wav_At_q is not None:
+            h = mx.quantized_matmul(
+                z.astype(mx.float16), *self._wav_At_q, transpose=True,
+                group_size=64, bits=8).astype(x.dtype)
+            h = mx.where(self._tanh_mask, mx.tanh(h), h)
+            y = mx.quantized_matmul(
+                h.astype(mx.float16), *self._wav_Bt_q, transpose=False,
+                group_size=64, bits=8).astype(x.dtype)  # [3,BT,D]
+        else:
+            h = (z.astype(self.wav_At.dtype) @ self.wav_At).astype(x.dtype)
+            h = mx.where(self._tanh_mask, mx.tanh(h), h)
+            y = (h.astype(self.wav_Bt.dtype) @ self.wav_Bt).astype(x.dtype)  # [3,BT,D]
 
         w = y[0].reshape(B, T, D) + self.w_lora_B_b
         w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
