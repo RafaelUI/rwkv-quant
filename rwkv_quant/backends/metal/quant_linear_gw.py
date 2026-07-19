@@ -414,6 +414,7 @@ GUARD_TAIL        for (uint n = 0; n < NN; n++) {
 # через __getattr__ для _dequant_w/бенчей).
 
 K3 = True
+K3_HALF = False  # полублок: НЕ бит-в-бит (порядок simd_sum), включать после ppl-гейта
 _XB_DUMMY = None
 K3_XSUM = False   # xbsum в кернеле: НЕ бит-в-бит (порядок сумм), включать после ppl-гейта
 
@@ -548,6 +549,104 @@ def _get_kernel_k3(IN, OUT, xbits, NSG, RS, out_per=0, xin=False):
 """
     kern = mx.fast.metal_kernel(
         name=f"k3_gw{4 + xbits}_s{NSG}r{RS}_{IN}_{OUT}_{op}{'x' if xin else ''}",
+        input_names=["x", "qblk", "qsqm", "ddm", "xbsum"],
+        output_names=["out"],
+        header=hdr, source=body,
+    )
+    _gw_kernel_cache[key] = kern
+    return kern
+
+
+def _k3h_cfg(IN, OUT, xbits):
+    """(NSG, RS) полублока -- свипы protoF/F3."""
+    if OUT >= 8192 or IN >= 8192:
+        return (2, 4)
+    return (4, 4) if xbits >= 2 else (4, 8)
+
+
+def _k3h_use(IN, OUT, xbits):
+    """head6 полублоку не даётся (x0.98) -- остальным можно."""
+    return not (OUT >= 32768 and xbits >= 2)
+
+
+def _k3h_plane(idx, shift):
+    M = "0x00204081u & 0x01010101u"
+    return f"""
+            uint hb{idx} = qb[{idx}];
+            uint s{idx} = half_i * 8;
+            l0 |= as_type<uchar4>((((hb{idx} >> (s{idx}+ 0)) & 0xFu) * {M}) << {shift});
+            l1 |= as_type<uchar4>((((hb{idx} >> (s{idx}+ 4)) & 0xFu) * {M}) << {shift});
+            h0 |= as_type<uchar4>((((hb{idx} >> (s{idx}+16)) & 0xFu) * {M}) << {shift});
+            h1 |= as_type<uchar4>((((hb{idx} >> (s{idx}+20)) & 0xFu) * {M}) << {shift});
+"""
+
+
+def _get_kernel_k3h(IN, OUT, xbits, NSG, RS, out_per=0):
+    """Полублок: пара lane'ов на блок 32 (чётный -- байты 0..7 = колонки
+    0..7 lo и 16..23 hi, нечётный -- байты 8..15). Вдвое больше
+    k-параллелизма на строку, вдвое меньше регистров. Лейаут qblk тот же,
+    плоскости читаются полным uint (пара в одной кэш-линии, дубль
+    бесплатен). mn*xbs добавляет только чётный lane. НЕ бит-в-бит с к3."""
+    assert xbits in (0, 1, 2)
+    key = ("k3h", IN, OUT, xbits, NSG, RS, out_per)
+    if key in _gw_kernel_cache:
+        return _gw_kernel_cache[key]
+    assert IN % 512 == 0 and OUT % (NSG * RS) == 0
+    op = out_per if out_per else OUT
+    assert op % (NSG * RS) == 0
+    hdr = _k3_hdr(IN, OUT, xbits, NSG, RS, f"constant uint OUT_PER = {op};")
+    dec = ""
+    if xbits >= 1:
+        dec += _k3h_plane(4, 4)
+    if xbits >= 2:
+        dec += _k3h_plane(5, 5)
+    body = """
+    uint tgid = threadgroup_position_in_grid.x;
+    uint tix  = thread_position_in_threadgroup.x;
+    uint sg   = tix / 32;
+    uint lane = tix % 32;
+    uint half_i = lane & 1;
+    uint row0 = tgid * (NSG * RS) + sg * RS;
+    uint xi   = row0 / OUT_PER;
+
+    device const float4* x4  = (device const float4*)(x + xi*IN_C);
+    device const uint*   qu  = (device const uint*)qblk;
+    device const uchar2* sm2 = (device const uchar2*)qsqm;
+    device const half2*  dd2 = (device const half2*)ddm;
+    float acc[RS];
+    for (uint j = 0; j < RS; j++) acc[j] = 0.0f;
+
+    for (uint p = lane >> 1; p < NB; p += 16) {
+        float4 xa0 = x4[p*8 + half_i*2 + 0], xa1 = x4[p*8 + half_i*2 + 1];
+        float4 xb0 = x4[p*8 + half_i*2 + 4], xb1 = x4[p*8 + half_i*2 + 5];
+        float xbs = half_i ? 0.0f : xbsum[xi*NB + p];
+        for (uint j = 0; j < RS; j++) {
+            device const uint* qb = qu + ((row0+j)*NB + p) * SU;
+            uint2 qw = *(device const uint2*)(qb + half_i*2);
+            uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
+            uchar4 l1 = as_type<uchar4>(qw.y & 0x0F0F0F0Fu);
+            uchar4 h0 = as_type<uchar4>((qw.x >> 4) & 0x0F0F0F0Fu);
+            uchar4 h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
+""" + dec + """
+            float dv = dot(xa0, float4(l0.x, l0.y, l0.z, l0.w))
+                     + dot(xa1, float4(l1.x, l1.y, l1.z, l1.w))
+                     + dot(xb0, float4(h0.x, h0.y, h0.z, h0.w))
+                     + dot(xb1, float4(h1.x, h1.y, h1.z, h1.w));
+            uchar2 sm = sm2[(row0+j)*NB + p];
+            half2  dd = dd2[(row0+j)*NSB + p/8];
+            half  s  = (half)((float)sm.x * (float)dd.x);
+            half  mn = (half)((float)as_type<char>(sm.y) * (float)dd.y);
+            acc[j] += (float)s * dv + (float)mn * xbs;
+        }
+    }
+    for (uint j = 0; j < RS; j++) {
+        float a = simd_sum(acc[j]);
+        if (lane == 0)
+            out[row0 + j] = a;
+    }
+"""
+    kern = mx.fast.metal_kernel(
+        name=f"k3h_gw{4 + xbits}_s{NSG}r{RS}_{IN}_{OUT}_{op}",
         input_names=["x", "qblk", "qsqm", "ddm", "xbsum"],
         output_names=["out"],
         header=hdr, source=body,
@@ -810,9 +909,18 @@ class GwQuantLinear:
             xin = bool(K3_XSUM)
             xbsum = (_xb_dummy() if xin
                      else mx.sum(x2d.reshape(1, self.NB, 32), axis=2))
-            NSG, RS = _k3_cfg(self.in_features, self.out_features, self.xbits)
-            kern = _get_kernel_k3(self.in_features, self.out_features,
-                                  self.xbits, NSG, RS, xin=xin)
+            if (K3_HALF and self.in_features % 512 == 0
+                    and _k3h_use(self.in_features, self.out_features,
+                                 self.xbits) and not xin):
+                NSG, RS = _k3h_cfg(self.in_features, self.out_features,
+                                   self.xbits)
+                kern = _get_kernel_k3h(self.in_features, self.out_features,
+                                       self.xbits, NSG, RS)
+            else:
+                NSG, RS = _k3_cfg(self.in_features, self.out_features,
+                                  self.xbits)
+                kern = _get_kernel_k3(self.in_features, self.out_features,
+                                      self.xbits, NSG, RS, xin=xin)
             n_tg = self.out_features // (NSG * RS)
             return kern(
                 inputs=[x2d, self.qblk, self.qsqm, self.ddm, xbsum],
@@ -878,10 +986,18 @@ class GwQuantLinearFused:
             xin = bool(K3_XSUM)
             xbsum = (_xb_dummy() if xin
                      else mx.sum(xstack.reshape(self.K, self.NB, 32), axis=2))
-            NSG, RS = _k3_cfg(self.in_features, self.out_per, self.xbits)
-            kern = _get_kernel_k3(self.in_features, self.out_features,
-                                  self.xbits, NSG, RS, out_per=self.out_per,
-                                  xin=xin)
+            if (K3_HALF and self.in_features % 512 == 0
+                    and _k3h_use(self.in_features, self.out_per, self.xbits)
+                    and not xin):
+                NSG, RS = _k3h_cfg(self.in_features, self.out_per, self.xbits)
+                kern = _get_kernel_k3h(self.in_features, self.out_features,
+                                       self.xbits, NSG, RS,
+                                       out_per=self.out_per)
+            else:
+                NSG, RS = _k3_cfg(self.in_features, self.out_per, self.xbits)
+                kern = _get_kernel_k3(self.in_features, self.out_features,
+                                      self.xbits, NSG, RS,
+                                      out_per=self.out_per, xin=xin)
             n_tg = self.out_features // (NSG * RS)
             out = kern(
                 inputs=[xstack, self.qblk, self.qsqm, self.ddm, xbsum],
