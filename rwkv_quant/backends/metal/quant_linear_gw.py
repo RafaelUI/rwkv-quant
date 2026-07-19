@@ -95,7 +95,14 @@ constant uint OUT_PER = {out_per if out_per else OUT};
     for (uint p = lane; p < NB; p += TG) {          // p -- блок из 32 колонок
         float4 xa0 = x4[p*8+0], xa1 = x4[p*8+1], xa2 = x4[p*8+2], xa3 = x4[p*8+3];
         float4 xb0 = x4[p*8+4], xb1 = x4[p*8+5], xb2 = x4[p*8+6], xb3 = x4[p*8+7];
-        float xbs = xbsum[xi*NB + p];
+        float xbs;
+        if (XIN) {
+            const float4 F1 = float4(1.0f);
+            xbs = dot(xa0, F1) + dot(xa1, F1) + dot(xa2, F1) + dot(xa3, F1)
+                + dot(xb0, F1) + dot(xb1, F1) + dot(xb2, F1) + dot(xb3, F1);
+        } else {
+            xbs = xbsum[xi*NB + p];
+        }
         for (uint j = 0; j < R; j++) {
 GUARD_HOT            uint4 qw = ((device const uint4*)(codes + (row0+j)*(IN_C/2)))[p];
             uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
@@ -239,7 +246,7 @@ GUARD_HOT            uint4 qw = ((device const uint4*)(codes + (row0+j)*(IN_C/2)
                          + dot(x4[p*8+5], w5)
                          + dot(x4[p*8+6], w6)
                          + dot(x4[p*8+7], w7);
-                acc[j*NN + n] += (float)s * dv + (float)mn * xbsum[n*NB + p];
+                acc[j*NN + n] += (float)s * dv + (float)mn * xbsA[n];
             }
         }
     }
@@ -407,6 +414,15 @@ GUARD_TAIL        for (uint n = 0; n < NN; n++) {
 # через __getattr__ для _dequant_w/бенчей).
 
 K3 = True
+_XB_DUMMY = None
+K3_XSUM = False   # xbsum в кернеле: НЕ бит-в-бит (порядок сумм), включать после ppl-гейта
+
+
+def _xb_dummy():
+    global _XB_DUMMY
+    if _XB_DUMMY is None:
+        _XB_DUMMY = mx.zeros((1,), dtype=mx.float32)
+    return _XB_DUMMY
 
 
 def _k3_cfg(IN, OUT, xbits):
@@ -471,16 +487,17 @@ constant uint SU    = {4 + xbits};
 {extra}"""
 
 
-def _get_kernel_k3(IN, OUT, xbits, NSG, RS, out_per=0):
+def _get_kernel_k3(IN, OUT, xbits, NSG, RS, out_per=0, xin=False):
     """N=1 GEMV (out_per=0) либо фьюз r/k/v (out_per>0, вход-стек)."""
     assert xbits in (0, 1, 2)
-    key = ("k3", IN, OUT, xbits, NSG, RS, out_per)
+    key = ("k3", IN, OUT, xbits, NSG, RS, out_per, xin)
     if key in _gw_kernel_cache:
         return _gw_kernel_cache[key]
     assert IN % 256 == 0 and OUT % (NSG * RS) == 0
     op = out_per if out_per else OUT
     assert op % (NSG * RS) == 0
-    hdr = _k3_hdr(IN, OUT, xbits, NSG, RS, f"constant uint OUT_PER = {op};")
+    hdr = _k3_hdr(IN, OUT, xbits, NSG, RS,
+                  f"constant uint OUT_PER = {op};\nconstant bool XIN = {str(bool(xin)).lower()};")
     dec = _K3_DECODE
     if xbits >= 1:
         dec += "            uint hb = qb[4];\n" + _k3_plane("hb", 4)
@@ -530,7 +547,7 @@ def _get_kernel_k3(IN, OUT, xbits, NSG, RS, out_per=0):
     }
 """
     kern = mx.fast.metal_kernel(
-        name=f"k3_gw{4 + xbits}_s{NSG}r{RS}_{IN}_{OUT}_{op}",
+        name=f"k3_gw{4 + xbits}_s{NSG}r{RS}_{IN}_{OUT}_{op}{'x' if xin else ''}",
         input_names=["x", "qblk", "qsqm", "ddm", "xbsum"],
         output_names=["out"],
         header=hdr, source=body,
@@ -539,15 +556,16 @@ def _get_kernel_k3(IN, OUT, xbits, NSG, RS, out_per=0):
     return kern
 
 
-def _get_kernel_k3nb(IN, OUT, xbits, NN, NSG, RS):
+def _get_kernel_k3nb(IN, OUT, xbits, NN, NSG, RS, xin=False):
     """N-батчевый GEMV кернеля-3: веса блока декодируются один раз на NN
     колонок (структура _get_kernel_gw_nb, раскладка кернеля-3)."""
     assert xbits in (0, 1, 2) and NN >= 2
-    key = ("k3nb", IN, OUT, xbits, NN, NSG, RS)
+    key = ("k3nb", IN, OUT, xbits, NN, NSG, RS, xin)
     if key in _gw_kernel_cache:
         return _gw_kernel_cache[key]
     assert IN % 256 == 0 and OUT % (NSG * RS) == 0
-    hdr = _k3_hdr(IN, OUT, xbits, NSG, RS, f"constant uint NN = {NN};")
+    hdr = _k3_hdr(IN, OUT, xbits, NSG, RS,
+                  f"constant uint NN = {NN};\nconstant bool XIN = {str(bool(xin)).lower()};")
     dec = _K3_DECODE
     if xbits >= 1:
         dec += "            uint hb = qb[4];\n" + _k3_plane("hb", 4)
@@ -567,6 +585,19 @@ def _get_kernel_k3nb(IN, OUT, xbits, NN, NSG, RS):
     for (uint j = 0; j < RS * NN; j++) acc[j] = 0.0f;
 
     for (uint p = lane; p < NB; p += 32) {
+        float xbsA[NN];
+        if (XIN) {
+            const float4 F1 = float4(1.0f);
+            for (uint n = 0; n < NN; n++) {
+                device const float4* x4s = (device const float4*)(x + n*IN_C);
+                xbsA[n] = dot(x4s[p*8+0], F1) + dot(x4s[p*8+1], F1)
+                        + dot(x4s[p*8+2], F1) + dot(x4s[p*8+3], F1)
+                        + dot(x4s[p*8+4], F1) + dot(x4s[p*8+5], F1)
+                        + dot(x4s[p*8+6], F1) + dot(x4s[p*8+7], F1);
+            }
+        } else {
+            for (uint n = 0; n < NN; n++) xbsA[n] = xbsum[n*NB + p];
+        }
         for (uint j = 0; j < RS; j++) {
             device const uint* qb = qu + ((row0+j)*NB + p) * SU;
 """ + dec + """
@@ -592,7 +623,7 @@ def _get_kernel_k3nb(IN, OUT, xbits, NN, NSG, RS):
                          + dot(x4[p*8+5], w5)
                          + dot(x4[p*8+6], w6)
                          + dot(x4[p*8+7], w7);
-                acc[j*NN + n] += (float)s * dv + (float)mn * xbsum[n*NB + p];
+                acc[j*NN + n] += (float)s * dv + (float)mn * xbsA[n];
             }
         }
     }
@@ -605,7 +636,7 @@ def _get_kernel_k3nb(IN, OUT, xbits, NN, NSG, RS):
     }
 """
     kern = mx.fast.metal_kernel(
-        name=f"k3nb_gw{4 + xbits}_n{NN}s{NSG}r{RS}_{IN}_{OUT}",
+        name=f"k3nb_gw{4 + xbits}_n{NN}s{NSG}r{RS}_{IN}_{OUT}{'x' if xin else ''}",
         input_names=["x", "qblk", "qsqm", "ddm", "xbsum"],
         output_names=["out"],
         header=hdr, source=body,
@@ -741,12 +772,14 @@ class GwQuantLinear:
         return _RB_FOR_NN.get(c, RB_NB)
 
     def _gemv_nb(self, x2d, c):
-        xbsum = mx.sum(x2d.reshape(c, self.NB, 32), axis=2)
         if self._k3 and not NB_V2:
+            xin = bool(K3_XSUM)
+            xbsum = (_xb_dummy() if xin
+                     else mx.sum(x2d.reshape(c, self.NB, 32), axis=2))
             NSG, RS = _k3_cfg_nb(self.in_features, self.out_features,
                                  self.xbits)
             kern = _get_kernel_k3nb(self.in_features, self.out_features,
-                                    self.xbits, c, NSG, RS)
+                                    self.xbits, c, NSG, RS, xin=xin)
             n_tg = self.out_features // (NSG * RS)
             return kern(
                 inputs=[x2d, self.qblk, self.qsqm, self.ddm, xbsum],
@@ -754,6 +787,7 @@ class GwQuantLinear:
                 output_shapes=[(c, self.out_features)],
                 output_dtypes=[mx.float32],
             )[0]
+        xbsum = mx.sum(x2d.reshape(c, self.NB, 32), axis=2)
         if NB_V2:
             rb = 2
             kern = _get_kernel_gw_nb2(self.in_features, self.out_features,
@@ -772,11 +806,13 @@ class GwQuantLinear:
         )[0]
 
     def _gemv1(self, x2d):
-        xbsum = mx.sum(x2d.reshape(1, self.NB, 32), axis=2)
         if self._k3:
+            xin = bool(K3_XSUM)
+            xbsum = (_xb_dummy() if xin
+                     else mx.sum(x2d.reshape(1, self.NB, 32), axis=2))
             NSG, RS = _k3_cfg(self.in_features, self.out_features, self.xbits)
             kern = _get_kernel_k3(self.in_features, self.out_features,
-                                  self.xbits, NSG, RS)
+                                  self.xbits, NSG, RS, xin=xin)
             n_tg = self.out_features // (NSG * RS)
             return kern(
                 inputs=[x2d, self.qblk, self.qsqm, self.ddm, xbsum],
@@ -784,6 +820,7 @@ class GwQuantLinear:
                 output_shapes=[(1, self.out_features)],
                 output_dtypes=[mx.float32],
             )[0]
+        xbsum = mx.sum(x2d.reshape(1, self.NB, 32), axis=2)
         kern = _get_kernel_gw(self.in_features, self.out_features, self.xbits)
         n_groups = (self.out_features + R - 1) // R
         return kern(
@@ -837,11 +874,14 @@ class GwQuantLinearFused:
 
     def __call__(self, xstack):
         # xstack: [K, IN] fp32
-        xbsum = mx.sum(xstack.reshape(self.K, self.NB, 32), axis=2)
         if self._k3:
+            xin = bool(K3_XSUM)
+            xbsum = (_xb_dummy() if xin
+                     else mx.sum(xstack.reshape(self.K, self.NB, 32), axis=2))
             NSG, RS = _k3_cfg(self.in_features, self.out_per, self.xbits)
             kern = _get_kernel_k3(self.in_features, self.out_features,
-                                  self.xbits, NSG, RS, out_per=self.out_per)
+                                  self.xbits, NSG, RS, out_per=self.out_per,
+                                  xin=xin)
             n_tg = self.out_features // (NSG * RS)
             out = kern(
                 inputs=[xstack, self.qblk, self.qsqm, self.ddm, xbsum],
@@ -850,6 +890,7 @@ class GwQuantLinearFused:
                 output_dtypes=[mx.float32],
             )[0]
             return out.reshape(self.K, self.out_per)
+        xbsum = mx.sum(xstack.reshape(self.K, self.NB, 32), axis=2)
         kern = _get_kernel_gw(self.in_features, self.out_features,
                               self.xbits, out_per=self.out_per)
         n_groups = (self.out_features + R - 1) // R
