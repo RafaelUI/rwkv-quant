@@ -4,3 +4,4 @@ __pycache__/
 tests/venv/
 *.log
 nohup.out
+NEXT_SESSION.md
