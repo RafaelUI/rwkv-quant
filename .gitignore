@@ -5,3 +5,6 @@ tests/venv/
 *.log
 nohup.out
 NEXT_SESSION.md
+dist/
+build/
+*.egg-info/
