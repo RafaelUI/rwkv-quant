@@ -18,12 +18,16 @@ from .formats import save
 
 
 def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
-             config: QuantConfig = None):
+             config: QuantConfig = None, real_gw: bool = True):
     """
     Quick-start: quantize(ckpt, out, preset="compression")
     Advanced:    quantize(ckpt, out, config=QuantConfig(proj=4, ...))
 
     preset игнорируется, если передан config.
+
+    real_gw=True (по умолчанию) -- реальная упаковка sb6, файл сжимается.
+    real_gw=False -- fake-quant для измерения ppl: та же математика ошибки,
+    но веса остаются плотными bf16 и файл НЕ уменьшается.
     """
     if config is None:
         if preset not in PRESETS:
@@ -43,7 +47,8 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         from safetensors.torch import load_file
         sd = load_file(f"{checkpoint_path}/model.safetensors")
 
-    return save(sd, config, output_path, naming, n_layer, n_embd, head_size, vocab_size)
+    return save(sd, config, output_path, naming, n_layer, n_embd, head_size,
+                vocab_size, real_gw=real_gw)
 
 
 def calibrate(checkpoint_path: str, eval_corpus_path: str, device: str = "mps",

@@ -5,6 +5,9 @@
 ppl-эффект (дёшево, дёргается тысячи раз при ablation), здесь -- один раз
 произвести реальные упакованные коды для сохранения на диск.
 """
+import os
+import warnings
+
 import torch
 
 from ..calibration.group_config import QuantConfig
@@ -51,11 +54,38 @@ def _real_quantize_sparse_outlier(w: torch.Tensor, bits: int, outlier_frac: floa
 
 
 _ACT_STATS_CACHE = {}
+_ACT_STATS_WARNED = set()
 
 
 def _load_act_stats(path):
+    """Статистика активаций для AW-режимов; {} если файла нет.
+
+    Пресеты указывают act_stats_path в /tmp (см. presets.py: "не переживает
+    перезагрузку -- пересобрать перед использованием"), поэтому отсутствие
+    файла -- НОРМАЛЬНАЯ ситуация, а не сбой. Раньше здесь был безусловный
+    torch.load, и документированный в README вызов
+        quantize("model.pth", "model.rwkvq", preset="reduction")
+    падал с FileNotFoundError на первом же cmix-тензоре.
+
+    Вырождение осмысленно: без статистики asym_sb6_aw ведёт себя как
+    asym_sb6_search (ex2=None), то есть теряет activation-взвешивание, но
+    остаётся корректным квантованием того же формата. Плюс статистика
+    привязана к КОНКРЕТНОЙ модели -- молча применять стат от 1.5B к другому
+    чекпоинту было бы хуже, чем не применять никакой.
+    """
     if path not in _ACT_STATS_CACHE:
-        _ACT_STATS_CACHE[path] = torch.load(path)
+        if not path or not os.path.exists(path):
+            if path and path not in _ACT_STATS_WARNED:
+                _ACT_STATS_WARNED.add(path)
+                warnings.warn(
+                    f"act_stats не найдены: {path}. AW-режимы (asym_sb6_aw) "
+                    "работают без activation-взвешивания. Пересоберите "
+                    "статистику или задайте config.act_stats_path=None, "
+                    "чтобы убрать это предупреждение.",
+                    RuntimeWarning, stacklevel=2)
+            _ACT_STATS_CACHE[path] = {}
+        else:
+            _ACT_STATS_CACHE[path] = torch.load(path)
     return _ACT_STATS_CACHE[path]
 
 
@@ -413,10 +443,28 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
 
 
 def save(state_dict: dict, config: QuantConfig, output_path: str,
-         naming: str, n_layer: int, n_embd: int, head_size: int, vocab_size: int):
+         naming: str, n_layer: int, n_embd: int, head_size: int, vocab_size: int,
+         real_gw: bool = True):
+    """Квантовать state_dict и записать .rwkvq.
+
+    real_gw=True (по умолчанию) -- РЕАЛЬНАЯ упаковка: группы с group_scale
+    пакуются в формат sb6 и файл действительно сжимается.
+
+    real_gw=False -- fake-quant: веса прогоняются через квантование и обратно,
+    но сохраняются плотными в bf16. Это режим ИЗМЕРЕНИЯ (оценить деградацию
+    ppl, не трогая кернели), а не выдачи артефакта.
+
+    Раньше здесь безусловно вызывался quantize_tensor без real_gw, то есть с
+    дефолтом False, и публичный API физически не мог произвести деплоимый
+    файл: quantize("model.pth", "model.rwkvq", preset="reduction") из README
+    отдавал bf16 в контейнере .rwkvq того же размера, что исходник. Реальная
+    упаковка при этом существовала и была бит-в-бит проверена, но дотянуться
+    до неё можно было только вызовом quantize_tensor(..., real_gw=True)
+    вручную -- что и делали скрипты в tests/.
+    """
     tensors = {}
     for key, w in state_dict.items():
-        tensors[key] = quantize_tensor(key, w, config)
+        tensors[key] = quantize_tensor(key, w, config, real_gw=real_gw)
 
     ckpt = QuantizedCheckpoint(
         naming=naming, n_layer=n_layer, n_embd=n_embd, head_size=head_size,
