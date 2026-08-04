@@ -172,6 +172,16 @@ w = codec.dequant_key(manifest, arrays, "emb.weight")   # float32
 `load_raw()` still reads checkpoints written by older versions — the two
 containers are told apart by their first bytes.
 
+The manifest is self-describing, which matters more than it sounds. Two
+things used to live only in comments and would silently corrupt a
+port: official ("world") checkpoints store the LoRA matrices
+`w1/w2/a1/a2/v1/v2/g1/g2` transposed, and the number of quantization
+blocks is `ceil(IN/gs)`, not `IN // gs` — `blocks.N.att.w1` is `[2048,
+96]` at `gs=64`, so a reader that divides gets one block where there are
+two and applies the wrong scale to the tail. Both are now recorded per
+tensor (`transposed`, `n_blocks`), along with the full quantization
+config as structured JSON.
+
 A finding that shaped the presets: **granularity beats bits.** Group-wise
 sb6 at INT4/5 replaced an earlier per-row + SpQR-outlier scheme of the same
 size with roughly half the quality loss. Sub-nibble packing (sub-887 MB at

@@ -309,16 +309,18 @@ def test_dequant(rng):
         cases.append((f"sb6 gs={gs} xbits={xbits}",
                       _mk_sb6(rng, 48, gs * sb * 3, gs, sb, xbits)))
 
-    # asym: с точным NB и с паддингом хвостовых блоков (NBpad)
-    for pad in (0, 3):
-        OUT, IN, gs = 32, 512, 64
-        NB = IN // gs
-        cases.append((f"asym pad={pad}", QuantizedTensor(
+    # asym: ровное число блоков и НЕРОВНОЕ (IN не кратен gs -- хвостовой
+    # блок неполный и имеет свой scale). Второй случай не выдуман: это
+    # форма реального blocks.N.att.w1 [2048, 96] при gs=64, и читатель,
+    # посчитавший NB делением нацело, получит на хвосте чужой масштаб
+    for OUT, IN, gs in ((32, 512, 64), (2048, 96, 64)):
+        NB = -(-IN // gs)
+        cases.append((f"asym IN={IN} gs={gs} NB={NB}", QuantizedTensor(
             key="synth", group="w_lora", bits=6, shape=(OUT, IN),
             gw_mode="asym", gw_gs=gs,
             codes=t(rng.integers(0, 64, (OUT, IN), dtype=np.uint8)),
-            gw_scale=t(rng.uniform(1e-4, 1e-2, (OUT, NB + pad)).astype(np.float32)),
-            gw_min=t(rng.uniform(-1e-2, 1e-2, (OUT, NB + pad)).astype(np.float32)),
+            gw_scale=t(rng.uniform(1e-4, 1e-2, (OUT, NB)).astype(np.float32)),
+            gw_min=t(rng.uniform(-1e-2, 1e-2, (OUT, NB)).astype(np.float32)),
         )))
 
     # rtn int8 per-row, в том числе 3-D (writer квантует всё с dim >= 2)

@@ -28,7 +28,42 @@ TENSOR_FIELDS = (
 )
 
 
-def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str):
+def config_to_json(cfg: QuantConfig) -> dict:
+    """QuantConfig -> структура, из которой его можно собрать обратно.
+
+    Раньше в файл шёл только repr(), а он ЛОССИ: QuantConfig.__repr__
+    печатает битность групп и overrides, но молча теряет group_scale,
+    group_scale_mode, clip_percentiles, outlier_fracs и act_stats_path --
+    то есть ровно то, чем REDUCTION отличается от COMPRESSION при
+    одинаковой битности. Воспроизвести квантование по такому файлу было
+    нельзя. repr() остаётся рядом как человекочитаемая строка."""
+    return {
+        "bits": dict(cfg.bits),
+        "clip_percentiles": dict(cfg.clip_percentiles),
+        "outlier_fracs": dict(cfg.outlier_fracs),
+        "bits_overrides": dict(cfg.bits_overrides),
+        "group_scale": dict(cfg.group_scale),
+        "group_scale_mode": dict(cfg.group_scale_mode),
+        "act_stats_path": cfg.act_stats_path,
+    }
+
+
+def _n_blocks(qt) -> int:
+    """Число блоков, которое РЕАЛЬНО покрывают квальные буферы.
+
+    Не выводится делением нацело: у asym блоков ceil(IN/gs), потому что
+    хвостовой неполный блок получает свой scale (`att.w1` [2048, 96] при
+    gs=64 -- два блока, а IN//gs = 1). Берём из формы буфера, чтобы
+    манифест утверждал факт, а не гипотезу."""
+    if qt.gw_mode == "sb6":
+        return int(qt.gw_qsqm.shape[-2]) * int(qt.gw_sb)
+    if qt.gw_mode == "asym":
+        return int(qt.gw_scale.shape[-1])
+    return 0
+
+
+def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str,
+               config: QuantConfig = None, tokenizer: str = None):
     """QuantizedCheckpoint -> .rwkvq в контейнере safetensors.
 
     Плоские имена "<ключ>::<поле>", метаданные -- одним JSON в
@@ -63,9 +98,16 @@ def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str):
             "group": qt.group or "other",
             "gw_gs": int(qt.gw_gs),
             "gw_sb": int(qt.gw_sb),
+            "n_blocks": _n_blocks(qt),
+            # ориентация: см. codec.is_transposed. Пишем факт, а не
+            # оставляем потребителю таблицу имён и надежду на внимание
+            "transposed": (ckpt.naming == "world"
+                           and codec.is_raw_lora_world(key)),
             "fields": fields,
         }
 
+    if config is None:
+        config = getattr(ckpt, "config", None)
     manifest = {
         "format": codec.FORMAT,
         "format_version": codec.FORMAT_VERSION,
@@ -73,6 +115,9 @@ def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str):
         "n_embd": int(ckpt.n_embd), "head_size": int(ckpt.head_size),
         "vocab_size": int(ckpt.vocab_size),
         "config_repr": ckpt.config_repr,
+        "config": config_to_json(config) if config is not None else None,
+        "tokenizer": tokenizer if tokenizer is not None
+        else getattr(ckpt, "tokenizer", None),
         "tensors": manifest_t,
     }
     from safetensors.torch import save_file
@@ -640,7 +685,7 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
 
 def save(state_dict: dict, config: QuantConfig, output_path: str,
          naming: str, n_layer: int, n_embd: int, head_size: int, vocab_size: int,
-         real_gw: bool = True):
+         real_gw: bool = True, tokenizer: str = None):
     """Квантовать state_dict и записать .rwkvq.
 
     real_gw=True (по умолчанию) -- РЕАЛЬНАЯ упаковка: группы с group_scale
@@ -665,6 +710,7 @@ def save(state_dict: dict, config: QuantConfig, output_path: str,
     ckpt = QuantizedCheckpoint(
         naming=naming, n_layer=n_layer, n_embd=n_embd, head_size=head_size,
         vocab_size=vocab_size, tensors=tensors, config_repr=repr(config),
+        config=config, tokenizer=tokenizer,
     )
     return save_rwkvq(ckpt, output_path)
 
@@ -695,7 +741,8 @@ def detect_meta(checkpoint_path: str, state_dict) -> dict:
 
 
 def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
-                  real_gw: bool = True, verbose: bool = True):
+                  real_gw: bool = True, verbose: bool = True,
+                  tokenizer: str = None):
     """Потоковое квантование чекпоинта: .pth/.safetensors -> .rwkvq.
 
     Отличие от save(): state_dict не держится в памяти целиком. Тензоры
@@ -739,7 +786,7 @@ def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
     del sd
 
     ckpt = QuantizedCheckpoint(tensors=tensors, config_repr=repr(config),
-                               **meta)
+                               config=config, tokenizer=tokenizer, **meta)
     save_rwkvq(ckpt, output_path)
     if verbose:
         print(f"-> {output_path} "

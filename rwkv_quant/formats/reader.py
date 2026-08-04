@@ -76,7 +76,28 @@ def _load_safetensors(path: str) -> QuantizedCheckpoint:
     return QuantizedCheckpoint(
         naming=m["naming"], n_layer=m["n_layer"], n_embd=m["n_embd"],
         head_size=m["head_size"], vocab_size=m["vocab_size"],
-        tensors=tensors, config_repr=m.get("config_repr", ""))
+        tensors=tensors, config_repr=m.get("config_repr", ""),
+        # v1 этих полей не имеет -- отсутствие тут норма, а не ошибка
+        config=config_from_json(m.get("config")),
+        tokenizer=m.get("tokenizer"))
+
+
+def config_from_json(d):
+    """Обратно к QuantConfig из структуры манифеста (см.
+    writer.config_to_json). None -> None: у файлов v1 конфиг был записан
+    только лосси-строкой repr(), собрать из неё нечего."""
+    if d is None:
+        return None
+    from ..calibration.group_config import QuantConfig
+    cfg = QuantConfig(
+        clip_percentiles=d.get("clip_percentiles"),
+        outlier_fracs=d.get("outlier_fracs"),
+        bits_overrides=d.get("bits_overrides"),
+        group_scale=d.get("group_scale"),
+        group_scale_mode=d.get("group_scale_mode"),
+        act_stats_path=d.get("act_stats_path"),
+        **d.get("bits", {}))
+    return cfg
 
 
 def _dequantize_one(qt) -> torch.Tensor:

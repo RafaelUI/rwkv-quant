@@ -37,8 +37,12 @@ MLX-потребителе). Промежуточная арифметика у�
 """
 import json
 import mmap as _mmap
+import re
 
 import numpy as np
+
+# world хранит эти LoRA-матрицы транспонированными -- см. is_transposed
+_RAW_LORA_WORLD = re.compile(r"^blocks\.\d+\.att\.[wavg][12]$")
 
 __all__ = [
     "pack_int4", "unpack_int4",
@@ -48,10 +52,16 @@ __all__ = [
     "dequant_sb6", "dequant_asym", "dequant_rtn",
     "MAGIC_ZIP", "FORMAT", "FORMAT_VERSION",
     "bf16_to_f32", "read_safetensors", "open_rwkvq", "dequant_key",
+    "is_transposed", "is_raw_lora_world",
 ]
 
 FORMAT = "rwkvq"
-FORMAT_VERSION = 1        # контейнер safetensors; pickle-эра версии не имела
+# 1 -- контейнер safetensors (pickle-эра версии не имела вовсе)
+# 2 -- самодескрипция: per-tensor n_blocks и transposed, структурированный
+#      config вместо repr(), ссылка на токенайзер. Читатель v2 понимает v1:
+#      недостающие поля выводятся как раньше (n_blocks из форм буферов,
+#      transposed -- по таблице имён), см. dequant_key.
+FORMAT_VERSION = 2
 
 # первые байты zip'а, который пишет torch.save -- по ним отличается
 # прежний pickle-контейнер от safetensors (там первые 8 байт -- длина
@@ -163,7 +173,7 @@ def unpack_bitplane(p: np.ndarray, n_cols: int) -> np.ndarray:
 
 # ---------------- деквантование ----------------
 
-def dequant_sb6(codes_packed, qsqm, d, dm, *, shape, gs, sb,
+def dequant_sb6(codes_packed, qsqm, d, dm, *, shape, gs, sb, nb=None,
                 qh=None, qh2=None) -> np.ndarray:
     """Каноническая sb6-раскладка -> float32 [OUT, IN].
 
@@ -172,10 +182,17 @@ def dequant_sb6(codes_packed, qsqm, d, dm, *, shape, gs, sb,
     qsqm          uint8  [OUT, NSB, 12] 8 qs и 8 qm по 6 бит (qm со сдвигом +31)
     d, dm         fp16   [OUT, NSB]    супер-scale для qs и qm
 
+    nb -- число блоков; None = вывести как IN // gs (верно, пока IN кратен
+    gs*sb, что справедливо для всех реальных чекпоинтов). В манифесте v2
+    оно записано явно, и расхождение здесь ловится ассертом, а не тихо
+    портит веса.
+
     Формула ровно как в кернеле: s = half(qs * d), m = half(qm * dm),
     w = q * s + m. Клип scale снизу -- как в writer (см. NaN-примечание там)."""
     OUT, IN = shape
-    NB = IN // gs
+    NB = IN // gs if nb is None else nb
+    assert qsqm.shape[-2] * sb == NB, (
+        f"qsqm покрывает {qsqm.shape[-2] * sb} блоков, ожидалось {NB}")
     q = unpack_nib_block(codes_packed, gs).astype(np.float32)
     if qh is not None:
         q = q + unpack_bitplane(qh, IN).astype(np.float32) * 16.0
@@ -192,13 +209,19 @@ def dequant_sb6(codes_packed, qsqm, d, dm, *, shape, gs, sb,
     return q * np.repeat(scale, gs, axis=1) + np.repeat(mn, gs, axis=1)
 
 
-def dequant_asym(codes, gw_scale, gw_min, *, shape, gs) -> np.ndarray:
+def dequant_asym(codes, gw_scale, gw_min, *, shape, gs, nb=None) -> np.ndarray:
     """gw-asym (LoRA @6, gw64) -> float32 [OUT, IN].
 
     codes -- uint8/int8-контейнер с UNSIGNED кодами, scale/min -- fp32 на
-    блок. gw_scale/gw_min могут иметь лишние колонки (NBpad от выравнивания
-    блоков): индексируемся по IN, хвост игнорируется."""
+    блок. ВНИМАНИЕ: блоков здесь CEIL(IN/gs), а не IN//gs -- хвостовой
+    неполный блок имеет свой scale. На реальных LoRA это не редкость:
+    у `blocks.N.att.w1` формы [2048, 96] при gs=64 блоков два, тогда как
+    IN//gs = 1. Читатель, посчитавший число блоков делением нацело,
+    молча возьмёт чужой масштаб на последних 32 колонках."""
     OUT, IN = shape
+    NB = -(-IN // gs) if nb is None else nb
+    assert gw_scale.shape[-1] == NB, (
+        f"gw_scale покрывает {gw_scale.shape[-1]} блоков, ожидалось {NB}")
     q = codes.astype(np.float32)
     idx = np.arange(IN) // gs
     return q * np.asarray(gw_scale, dtype=np.float32)[:, idx] \
@@ -282,12 +305,40 @@ def open_rwkvq(path: str):
     manifest = json.loads(meta["rwkvq"])
     if manifest.get("format") != FORMAT:
         raise ValueError(f"{path}: формат {manifest.get('format')!r}")
+    if manifest.get("format_version", 0) > FORMAT_VERSION:
+        raise ValueError(f"{path}: format_version "
+                         f"{manifest['format_version']} новее {FORMAT_VERSION}")
     return manifest, arrays
 
 
+def is_transposed(manifest, key) -> bool:
+    """Надо ли транспонировать тензор, чтобы получить вес nn.Linear [out,in].
+
+    Официальные (world) чекпоинты хранят LoRA-матрицы w1/w2/a1/a2/v1/v2/
+    g1/g2 в СЫРОЙ ориентации [in,out] -- rwkv7_ref транспонирует их после
+    загрузки, а writer квантует ДО, по сырым ключам. То есть блоки и
+    per-row scale у них посчитаны вдоль хранимых строк, и потребитель
+    обязан деквантовать СНАЧАЛА, транспонировать ПОТОМ. В манифесте v2
+    это записано явно; для v1 выводится по той же таблице имён."""
+    m = manifest["tensors"][key]
+    if "transposed" in m:
+        return bool(m["transposed"])
+    return is_raw_lora_world(key) and manifest.get("naming") == "world"
+
+
+def is_raw_lora_world(key: str) -> bool:
+    """Ключ world-чекпоинта, который хранится в сырой ориентации [in,out]:
+    blocks.N.att.{w,a,v,g}{1,2}. Единственное место, где эта таблица имён
+    записана в коде; writer по ней проставляет поле transposed, гейт
+    tests/test_manifest_selfdesc.py сверяет её с тем, что РЕАЛЬНО
+    транспонирует models/rwkv7_ref.py."""
+    return _RAW_LORA_WORLD.match(key) is not None
+
+
 def dequant_key(manifest, arrays, key) -> np.ndarray:
-    """Один тензор из открытого .rwkvq -> float32. Каст в bf16 -- на
-    вызывающей стороне (mx.bfloat16 в MLX, Float16/BFloat16 в Swift)."""
+    """Один тензор из открытого .rwkvq -> float32 в ТОМ ЖЕ виде, в каком
+    он лежал в исходном state_dict. Каст в bf16 и транспозицию (см.
+    is_transposed) делает вызывающая сторона."""
     m = manifest["tensors"][key]
     kind, shape = m["kind"], tuple(m["shape"])
 
@@ -300,10 +351,11 @@ def dequant_key(manifest, arrays, key) -> np.ndarray:
         return dequant_sb6(buf("codes_packed"), buf("gw_qsqm"),
                            buf("gw_d"), buf("gw_dm"),
                            shape=shape, gs=m["gw_gs"], sb=m["gw_sb"],
+                           nb=m.get("n_blocks"),
                            qh=buf("gw_qh"), qh2=buf("gw_qh2"))
     if kind == "asym":
         return dequant_asym(buf("codes"), buf("gw_scale"), buf("gw_min"),
-                            shape=shape, gs=m["gw_gs"])
+                            shape=shape, gs=m["gw_gs"], nb=m.get("n_blocks"))
     if kind == "rtn":
         ov = buf("outlier_values")
         return dequant_rtn(buf("scale"), shape=shape,

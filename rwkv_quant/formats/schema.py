@@ -80,7 +80,12 @@ class QuantizedCheckpoint:
     head_size: int
     vocab_size: int
     tensors: dict = field(default_factory=dict)  # key -> QuantizedTensor
-    config_repr: str = ""          # str(QuantConfig), для отладки/воспроизводимости
+    config_repr: str = ""          # str(QuantConfig), человекочитаемо и ЛОССИ
+    config: object = None          # сам QuantConfig: в манифест едет структурой
+    tokenizer: str = None          # ссылка на словарь, если известна
+    # ВНИМАНИЕ: файлы прежней (pickle) эры разворачиваются в этот же класс,
+    # и у них последних двух атрибутов в __dict__ просто нет -- читать их
+    # только через getattr(ckpt, ..., None).
 
 
 def pack_int4(codes: torch.Tensor) -> torch.Tensor:

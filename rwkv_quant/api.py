@@ -19,7 +19,7 @@ from .formats import save, quantize_file  # noqa: F401 (save -- публичны
 
 def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
              config: QuantConfig = None, real_gw: bool = True,
-             verbose: bool = True):
+             verbose: bool = True, tokenizer: str = None):
     """
     Quick-start: quantize(ckpt, out, preset="compression")
     Advanced:    quantize(ckpt, out, config=QuantConfig(proj=4, ...))
@@ -41,7 +41,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     # всю модель в bf16, 5.9 ГБ на 2.9B), потом грузила state_dict ЕЩЁ
     # РАЗ целиком -- на 16 ГБ это давало пик 9-12 ГБ и своп.
     return quantize_file(checkpoint_path, output_path, config,
-                         real_gw=real_gw, verbose=verbose)
+                         real_gw=real_gw, verbose=verbose, tokenizer=tokenizer)
 
 
 def calibrate(checkpoint_path: str, eval_corpus_path: str, device: str = "mps",
