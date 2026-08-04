@@ -54,6 +54,7 @@ __all__ = [
     "bf16_to_f32", "read_safetensors", "open_rwkvq", "dequant_key",
     "is_transposed", "is_raw_lora_world",
     "pack_mlx_affine", "unpack_mlx_affine", "sb6_to_mlx_affine",
+    "sb6_to_k3",
 ]
 
 FORMAT = "rwkvq"
@@ -338,6 +339,54 @@ def sb6_to_mlx_affine(codes_packed, qsqm, d, dm, *, shape, gs, sb, nb=None,
 
     wq = pack_mlx_affine(q.reshape(OUT, NB, gs), bits).reshape(OUT, NB * bits)
     return wq, scales, biases, bits
+
+
+# ---------------- K3-интерлив (раскладка загрузчика) ----------------
+#
+# Metal-ядро sb6 читает не дисковую раскладку, а K3-интерлив: коды и
+# масштабы ОДНОГО блока лежат рядом, отчего блок берётся 3-4
+# транзакциями вместо 7. До сих пор интерлив умел строить только
+# export_mlx (torch), и потребители возили рядом с .rwkvq отдельный
+# сайдкар. Здесь то же самое на numpy -- после этого сайдкар не нужен
+# никому: rwkv-metal и SwiftRWKV строят K3 при загрузке сами.
+#
+# Раскладка (источник -- backends/metal/quant_linear_gw.py):
+#   qblk[row, blk] = 16Б нибблов [+4Б qh] [+4Б qh2]
+#   qsqm[row, blk] = (qs, qm) двумя байтами, qm как int8 БЕЗ сдвига +31
+#   ddm[row, sblk] = (d, dm) двумя fp16
+#
+# Цена интерлива -- +0.125 бит/вес: qsqm занимает 2 байта на блок
+# вместо канонических 1.5. На 2.9B это +45 МБ В ПАМЯТИ (не на диске).
+
+def sb6_to_k3(codes_packed, qsqm, d, dm, *, shape, gs, sb, nb=None,
+              qh=None, qh2=None):
+    """sb6 (дисковая раскладка) -> (qblk, qsqm_k3, ddm, xbits).
+
+    Числа те же: это перестановка байт, а не пересчёт."""
+    assert gs == 32, f"K3 определён для блока 32, не {gs}"
+    OUT, IN = shape
+    NB = IN // gs if nb is None else nb
+    xbits = (0 if qh is None else 1) + (0 if qh2 is None else 1)
+
+    parts = [codes_packed.reshape(OUT, NB, 16)]
+    if qh is not None:
+        parts.append(qh.reshape(OUT, NB, 4))
+    if qh2 is not None:
+        parts.append(qh2.reshape(OUT, NB, 4))
+    qblk = np.ascontiguousarray(
+        np.concatenate(parts, axis=2).reshape(OUT, -1))
+
+    qs = unpack6(qsqm[..., :6], 8).reshape(OUT, NB)
+    # -31 применяется ЗДЕСЬ и хранится как int8: ядро читает байт через
+    # as_type<char> и повторного сдвига не делает
+    qm = (unpack6(qsqm[..., 6:], 8).reshape(OUT, NB).astype(np.int16)
+          - 31).astype(np.int8)
+    qsqm_k3 = np.ascontiguousarray(
+        np.stack([qs, qm.view(np.uint8)], axis=-1).reshape(OUT, -1))
+
+    ddm = np.ascontiguousarray(
+        np.stack([np.asarray(d), np.asarray(dm)], axis=-1).reshape(OUT, -1))
+    return qblk, qsqm_k3, ddm, xbits
 
 
 # ---------------- контейнер: чтение .rwkvq без torch ----------------
