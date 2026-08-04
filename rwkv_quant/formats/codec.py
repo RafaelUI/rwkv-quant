@@ -53,6 +53,7 @@ __all__ = [
     "MAGIC_ZIP", "FORMAT", "FORMAT_VERSION",
     "bf16_to_f32", "read_safetensors", "open_rwkvq", "dequant_key",
     "is_transposed", "is_raw_lora_world",
+    "pack_mlx_affine", "unpack_mlx_affine", "sb6_to_mlx_affine",
 ]
 
 FORMAT = "rwkvq"
@@ -244,6 +245,101 @@ def dequant_rtn(scale, *, shape, codes=None, codes_packed=None,
     return w
 
 
+# ---------------- перекладка в родной контейнер MLX ----------------
+#
+# Зачем. Потребители на MLX (SwiftRWKV, rwkv-metal) сейчас разворачивают
+# матрицу целиком на каждую проекцию, и это стоит 2.2x на декоде 2.9B
+# против плотного bf16 (SwiftRWKV/decode-bench). Родное ядро
+# `quantized_matmul` быстрее нынешнего пути в 2.1-4.9x и быстрее
+# плотного в 1.3-2.1x, но ему нужен свой битовый контейнер.
+#
+# ПЕРЕКЛАДКА БЕЗ ПОТЕРЬ, и это не оговорка, а суть. Наша sb6-формула --
+# w = q*s + m при беззнаковых кодах q и блоке 32 -- ЭТО И ЕСТЬ affine
+# MLX: там ровно w = q*scale + bias с той же группой. Значит меняется
+# только укладка бит, а числа остаются те же до последнего.
+# ЧЕГО ДЕЛАТЬ НЕЛЬЗЯ: mx.quantize(деквантованный_вес). Он пересчитает
+# scale/bias по min/max блока и потеряет калибровку -- ту самую, ради
+# которой пресеты и измерялись.
+#
+# Раскладка проверена для 4/5/6/8 бит: tests/probe_mlx_native_packing.py.
+
+def pack_mlx_affine(codes: np.ndarray, bits: int) -> np.ndarray:
+    """Коды [..., 32] (0..2^bits-1) -> uint32 [..., bits].
+
+    Группа из 32 кодов -- LSB-first битовый поток: поле позиции p
+    начинается на глобальном бите p*bits и переходит границу 32-битного
+    слова без выравнивания. На группу уходит ровно bits слов."""
+    assert codes.shape[-1] == 32, "группа MLX здесь всегда 32"
+    words = np.zeros((*codes.shape[:-1], bits), dtype=np.uint32)
+    c = codes.astype(np.uint32)
+    for p in range(32):
+        start = p * bits
+        w0, off = start // 32, start % 32
+        lo = min(bits, 32 - off)
+        hi = bits - lo
+        words[..., w0] |= ((c[..., p] & ((1 << lo) - 1)) << off).astype(np.uint32)
+        if hi:
+            words[..., w0 + 1] |= ((c[..., p] >> lo) & ((1 << hi) - 1)).astype(np.uint32)
+    return words
+
+
+def unpack_mlx_affine(words: np.ndarray, bits: int, nb: int) -> np.ndarray:
+    """Обратно: uint32 [..., NB*bits] -> коды [..., NB, 32]."""
+    w = words.reshape(*words.shape[:-1], nb, bits).astype(np.uint32)
+    out = np.zeros((*w.shape[:-1], 32), dtype=np.uint32)
+    for p in range(32):
+        start = p * bits
+        w0, off = start // 32, start % 32
+        lo = min(bits, 32 - off)
+        hi = bits - lo
+        v = (w[..., w0] >> off) & ((1 << lo) - 1)
+        if hi:
+            v = v | ((w[..., w0 + 1] & ((1 << hi) - 1)) << lo)
+        out[..., p] = v
+    return out
+
+
+def sb6_to_mlx_affine(codes_packed, qsqm, d, dm, *, shape, gs, sb, nb=None,
+                      qh=None, qh2=None):
+    """sb6 -> (wq uint32, scales fp16, biases fp16, bits) для
+    mx.quantized_matmul(group_size=32).
+
+    Числа не пересчитываются: коды берутся как есть, scale и min
+    считаются ровно той же формулой, что в dequant_sb6, и уже являются
+    fp16 по построению (half-роундтрип внутри).
+
+    ЕДИНСТВЕННОЕ РАСХОЖДЕНИЕ -- вырожденные блоки. Writer клипует scale
+    снизу числом 1e-8, а в fp16 оно не представимо (минимальная
+    субнормаль ~6e-8) и становится нулём. У блока, где qs*d ушло под
+    fp16, в контейнере окажется scale = 0 против 1e-8 в эталоне; все
+    веса такого блока равны bias, и разница по модулю не превышает
+    63 * 1e-8 = 6.3e-7. На REDUCTION/1.5B таких блоков ноль, но
+    закладываться на это нельзя -- гейт их считает и печатает
+    (tests/test_mlx_affine_repack.py)."""
+    assert gs == 32, f"родная группа MLX здесь 32, а не {gs}"
+    OUT, IN = shape
+    NB = IN // gs if nb is None else nb
+    bits = 4 + (0 if qh is None else 1) + (0 if qh2 is None else 1)
+
+    q = unpack_nib_block(codes_packed, gs).astype(np.uint32)
+    if qh is not None:
+        q = q + unpack_bitplane(qh, IN).astype(np.uint32) * 16
+    if qh2 is not None:
+        q = q + unpack_bitplane(qh2, IN).astype(np.uint32) * 32
+
+    qs = unpack6(qsqm[..., :6], 8).reshape(OUT, NB).astype(np.float32)
+    qm = (unpack6(qsqm[..., 6:], 8).reshape(OUT, NB).astype(np.int16)
+          - 31).astype(np.float32)
+    dd = np.repeat(np.asarray(d, dtype=np.float32), sb, axis=1)
+    ddm = np.repeat(np.asarray(dm, dtype=np.float32), sb, axis=1)
+    scales = np.maximum((qs * dd).astype(np.float16).astype(np.float32),
+                        np.float32(1e-8)).astype(np.float16)
+    biases = (qm * ddm).astype(np.float16)
+
+    wq = pack_mlx_affine(q.reshape(OUT, NB, gs), bits).reshape(OUT, NB * bits)
+    return wq, scales, biases, bits
+
+
 # ---------------- контейнер: чтение .rwkvq без torch ----------------
 #
 # Всё, что ниже, -- полная читалка формата на numpy. Порт в Swift или
@@ -276,7 +372,16 @@ def read_safetensors(path: str):
     который читает всё в анонимную память до первого обращения.
     Возвращённые массивы read-only; при записи в них делать .copy()."""
     with open(path, "rb") as f:
-        n = int.from_bytes(f.read(8), "little")
+        head8 = f.read(8)
+        # Без этой проверки pickle-контейнер прежней эры читается как
+        # safetensors: первые 8 байт zip'а дают длину хедера порядка
+        # 10^18, и вместо внятной ошибки прилетает MemoryError.
+        if head8[:4] == MAGIC_ZIP:
+            raise ValueError(
+                f"{path}: это pickle-контейнер (torch.save), а не "
+                f"safetensors. Пересохранить: "
+                f"writer.save_rwkvq(reader.load_raw(path), новый_путь)")
+        n = int.from_bytes(head8, "little")
         header = json.loads(f.read(n))
         mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
     buf = np.frombuffer(mm, dtype=np.uint8)
