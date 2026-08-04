@@ -21,9 +21,12 @@ rwkv-quant/
 │   │
 │   ├── formats/                    # the portable quantized checkpoint format.
 │   │   ├── __init__.py             #   this is the missing "unified format" gap
-│   │   ├── schema.py                #   in the RWKV ecosystem -- per-tensor bits +
-│   │   ├── writer.py                #   sparse outlier indices/values, backend-agnostic
-│   │   └── reader.py
+│   │   ├── schema.py               #   in the RWKV ecosystem -- per-tensor bits +
+│   │   ├── codec.py                #   sparse outlier indices/values, backend-agnostic
+│   │   ├── writer.py               # codec.py: НОРМАТИВНАЯ раскладка на чистом
+│   │   ├── reader.py               #   numpy, без torch -- с неё портируются
+│   │   └── export_mlx.py           #   rwkv-metal и SwiftRWKV (гейт:
+│   │                               #   tests/test_codec_parity.py)
 │   │
 │   ├── models/
 │   │   ├── __init__.py
@@ -78,6 +81,17 @@ The RWKV ecosystem doesn't currently have a shared quantized-checkpoint
 format (unlike GGUF for llama.cpp) — `rwkv_quant`'s `.rwkvq` format is
 meant to be backend-independent so a checkpoint quantized on a Mac can be
 served from a CUDA box without re-running calibration.
+
+**`formats/codec.py` не импортирует torch — и это не стилистика.**
+Потребители формата (`rwkv-metal` на MLX, `SwiftRWKV`) torch-free, и до
+сих пор портировали раскладку с докстрингов, сверяясь с эталоном руками.
+`codec.py` — нормативная реализация на numpy: биты и арифметика
+деквантования всех трёх квантованных раскладок. `schema.py` и `reader.py`
+держат torch-двойники **осознанно**: замер
+(`tests/bench_codec_dequant_ab.py`) показал 2.6x на деквант в пользу
+torch, потому что он параллелит поэлементные операции по ядрам.
+Расхождение двух реализаций ловит `tests/test_codec_parity.py` — при
+правке раскладки править оба файла и гонять гейт.
 
 **`models/rwkv7_ref.py` is explicitly not a production inference path.**
 It's a from-scratch PyTorch port used only so calibration/ablation can

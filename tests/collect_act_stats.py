@@ -7,7 +7,11 @@ import torch
 import rwkv_quant.models.rwkv7_ref as ref_mod
 from rwkv_quant.models.rwkv7_ref import RWKV7Ref
 
-CKPT_PTH = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
+# RWKVQ_CKPT позволяет снять статистику для другого чекпоинта (2.9B) без
+# копии скрипта; по умолчанию -- прежний 1.5B.
+CKPT_PTH = os.environ.get(
+    "RWKVQ_CKPT",
+    os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth"))
 CORPUS = os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_world.pt")
 
 # argv: [corpus_path] [out_path] [slice]; дефолты -- прежнее поведение

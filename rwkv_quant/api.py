@@ -14,11 +14,12 @@ from .presets import PRESETS
 from .calibration import GROUPS, QuantConfig
 from .calibration.ablation import single_group_ablation, perplexity, combined_sanity_check
 from .models.rwkv7_ref import RWKV7Ref
-from .formats import save
+from .formats import save, quantize_file  # noqa: F401 (save -- публичный API)
 
 
 def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
-             config: QuantConfig = None, real_gw: bool = True):
+             config: QuantConfig = None, real_gw: bool = True,
+             verbose: bool = True):
     """
     Quick-start: quantize(ckpt, out, preset="compression")
     Advanced:    quantize(ckpt, out, config=QuantConfig(proj=4, ...))
@@ -34,21 +35,13 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
             raise ValueError(f"unknown preset {preset!r}, choose from {list(PRESETS)}")
         config = PRESETS[preset]
 
-    # метаданные (naming/n_layer/...) дешевле всего взять из уже написанного
-    # загрузчика RWKV7Ref, вместо повторной ручной детекции формата
-    model = RWKV7Ref(checkpoint_path, device="cpu", dtype=torch.bfloat16)
-    naming, n_layer, n_embd = model.naming, model.n_layer, model.n_embd
-    head_size, vocab_size = model.head_size, model.vocab_size
-    del model
-
-    if checkpoint_path.endswith(".pth"):
-        sd = torch.load(checkpoint_path, map_location="cpu")
-    else:
-        from safetensors.torch import load_file
-        sd = load_file(f"{checkpoint_path}/model.safetensors")
-
-    return save(sd, config, output_path, naming, n_layer, n_embd, head_size,
-                vocab_size, real_gw=real_gw)
+    # Потоковый путь: mmap + потензорное квантование с немедленным
+    # освобождением, метаданные -- из форм тензоров. Прежняя версия
+    # сначала инстанцировала RWKV7Ref ради пяти чисел (то есть поднимала
+    # всю модель в bf16, 5.9 ГБ на 2.9B), потом грузила state_dict ЕЩЁ
+    # РАЗ целиком -- на 16 ГБ это давало пик 9-12 ГБ и своп.
+    return quantize_file(checkpoint_path, output_path, config,
+                         real_gw=real_gw, verbose=verbose)
 
 
 def calibrate(checkpoint_path: str, eval_corpus_path: str, device: str = "mps",

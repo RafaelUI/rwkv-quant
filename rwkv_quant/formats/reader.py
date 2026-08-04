@@ -6,10 +6,22 @@
   - load_dequantized(path) -> обычный bf16 state_dict, готовый для
                                RWKV7Ref(...) -- нужен для валидации/сравнения
                                ppl квантованной модели с оригиналом.
+
+TORCH-FREE ДВОЙНИК (04.08). Нормативная реализация того же декванта без
+torch -- codec.dequant_sb6 / dequant_asym / dequant_rtn; именно с неё
+портируются rwkv-metal и SwiftRWKV. Здешний код остался torch'евым не по
+инерции, а по замеру: tests/bench_codec_dequant_ab.py на 344M элементов
+даёт torch 289 мс против numpy 760 мс (2.63x) -- torch распараллеливает
+поэлементные операции по ядрам, numpy нет.
+
+Что обе реализации совпадают бит-в-бит, доказывает
+tests/test_codec_parity.py: 2.9 G элементов чекпоинта 2.9B, все четыре
+раскладки, ноль расхождений. При правке раскладки править ОБЕ и гонять
+гейт.
 """
 import torch
 
-from .schema import (QuantizedCheckpoint, int8_codes, unpack6,
+from .schema import (QuantizedCheckpoint, int8_codes, unpack6,  # noqa: F401
                      unpack_nib_block, unpack_bitplane)
 
 

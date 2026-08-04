@@ -20,8 +20,25 @@ sum(x*n) - 8*sum(x) выносится из цикла одной строкой
 хранятся нибблами. Поля codes / codes_packed взаимоисключающие.
 Это даёт INT4-группам честную половину размера int8 и на диске, и в GPU-памяти
 (packed-кернель в backends/metal/quant_linear_v2.py читает нибблы напрямую).
+
+ТА ЖЕ РАСКЛАДКА ЕСТЬ В codec.py, на чистом numpy и без torch -- она
+нормативная, с неё портируются torch-free потребители (rwkv-metal,
+SwiftRWKV). Дублирование ОСОЗНАННОЕ: план предполагал сделать здешние
+функции обёртками над codec, но замер это отменил.
+tests/bench_codec_dequant_ab.py на 344M элементов: torch 289 мс,
+torch-арифметика с numpy-распаковкой 476 мс (1.65x), полностью numpy
+760 мс (2.63x) -- torch распараллеливает поэлементные операции по ядрам,
+numpy нет. Платить 1.65x на каждом построении bf16-эталона ради
+устранения сорока строк дублирования незачем.
+
+Страховка от расхождения двух реализаций -- гейт
+tests/test_codec_parity.py: упаковщики на случайных данных во всех формах
+плюс полный деквант обоих чекпоинтов (2.9 G элементов на 2.9B, все четыре
+раскладки, ноль расхождений). При правке раскладки править ОБА файла и
+гонять гейт.
 """
 from dataclasses import dataclass, field
+
 import torch
 
 
@@ -69,7 +86,8 @@ class QuantizedCheckpoint:
 def pack_int4(codes: torch.Tensor) -> torch.Tensor:
     """int8 [rows, cols] (значения в [-8, 7]) -> uint8 [rows, ceil(cols/2)].
     BIASED SPLIT-раскладка (см. докстринг модуля): в ниббле code + 8,
-    low-ниббл байта i = колонка i, high = колонка i + ceil(cols/2)."""
+    low-ниббл байта i = колонка i, high = колонка i + ceil(cols/2).
+    Numpy-двойник: codec.pack_int4."""
     assert codes.dtype == torch.int8
     assert int(codes.min()) >= -8 and int(codes.max()) <= 7
     rows, cols = codes.shape
@@ -82,7 +100,8 @@ def pack_int4(codes: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_int4(packed: torch.Tensor, n_cols: int) -> torch.Tensor:
-    """Обратно к int8 [rows, n_cols] со знаковым расширением нибблов."""
+    """Обратно к int8 [rows, n_cols] со знаковым расширением нибблов.
+    Numpy-двойник: codec.unpack_int4."""
     assert packed.dtype == torch.uint8
     lo = (packed & 0xF).to(torch.int16) - 8   # biased -> знаковый код
     hi = (packed >> 4).to(torch.int16) - 8
@@ -102,7 +121,8 @@ def int8_codes(qt) -> torch.Tensor:
 
 def pack6(v: torch.Tensor) -> torch.Tensor:
     """uint8-значения 0..63, последняя размерность кратна 4 -> байты 3/4.
-    Чанк из 4 значений (24 бита) -> 3 байта little-endian bitstream."""
+    Чанк из 4 значений (24 бита) -> 3 байта little-endian bitstream.
+    Numpy-двойник: codec.pack6."""
     assert v.dtype == torch.uint8 and v.shape[-1] % 4 == 0
     x = v.to(torch.int32).reshape(*v.shape[:-1], -1, 4)
     b0 = (x[..., 0] | (x[..., 1] << 6)) & 0xFF
@@ -112,7 +132,8 @@ def pack6(v: torch.Tensor) -> torch.Tensor:
 
 
 def unpack6(b: torch.Tensor, n: int) -> torch.Tensor:
-    """Обратно: байты 3/4 -> uint8 0..63, n значений в последней размерности."""
+    """Обратно: байты 3/4 -> uint8 0..63, n значений в последней размерности.
+    Numpy-двойник: codec.unpack6."""
     assert b.dtype == torch.uint8 and b.shape[-1] % 3 == 0
     x = b.to(torch.int32).reshape(*b.shape[:-1], -1, 3)
     v0 = x[..., 0] & 0x3F
@@ -127,7 +148,8 @@ def pack_nib_block(q: torch.Tensor, gs: int = 32) -> torch.Tensor:
     """БЛОК-ЛОКАЛЬНЫЙ split для gw-кодов (unsigned 0..15, БЕЗ bias):
     внутри блока из gs колонок байт j = q[j] | (q[j + gs/2] << 4),
     j = 0..gs/2-1. Один блок-32 = 16 байт = один uint4-лоад в кернеле.
-    [OUT, IN] (IN % gs == 0) -> uint8 [OUT, IN/2]."""
+    [OUT, IN] (IN % gs == 0) -> uint8 [OUT, IN/2].
+    Numpy-двойник: codec.pack_nib_block."""
     assert q.dtype == torch.uint8 and int(q.max()) <= 15
     OUT, IN = q.shape
     assert IN % gs == 0
@@ -137,7 +159,8 @@ def pack_nib_block(q: torch.Tensor, gs: int = 32) -> torch.Tensor:
 
 
 def unpack_nib_block(p: torch.Tensor, gs: int = 32) -> torch.Tensor:
-    """Обратно к uint8-кодам 0..15, [OUT, IN]."""
+    """Обратно к uint8-кодам 0..15, [OUT, IN].
+    Numpy-двойник: codec.unpack_nib_block."""
     assert p.dtype == torch.uint8
     OUT, HB = p.shape
     h = gs // 2
@@ -148,7 +171,8 @@ def unpack_nib_block(p: torch.Tensor, gs: int = 32) -> torch.Tensor:
 
 def pack_bitplane(bit: torch.Tensor) -> torch.Tensor:
     """Старшие биты int5-кодов (0/1, [OUT, IN], IN % 8 == 0) -> uint8
-    [OUT, IN/8], бит (c % 8) байта (c // 8) = колонка c (little-endian)."""
+    [OUT, IN/8], бит (c % 8) байта (c // 8) = колонка c (little-endian).
+    Numpy-двойник: codec.pack_bitplane."""
     OUT, IN = bit.shape
     assert IN % 8 == 0
     b = bit.to(torch.uint8).view(OUT, IN // 8, 8)
@@ -157,6 +181,7 @@ def pack_bitplane(bit: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_bitplane(p: torch.Tensor, n_cols: int) -> torch.Tensor:
+    """Numpy-двойник: codec.unpack_bitplane."""
     OUT = p.shape[0]
     sh = torch.arange(8, dtype=torch.uint8)
     bits = (p.unsqueeze(-1) >> sh) & 1

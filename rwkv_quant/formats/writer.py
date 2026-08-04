@@ -12,6 +12,7 @@ import torch
 
 from ..calibration.group_config import QuantConfig
 from ..calibration.outlier_scan import GROUP_KEY_PATTERNS
+from ..models.naming import detect_naming
 from .schema import (QuantizedTensor, QuantizedCheckpoint, pack_int4,
                      pack6, pack_nib_block, pack_bitplane)
 
@@ -87,6 +88,41 @@ def _load_act_stats(path):
         else:
             _ACT_STATS_CACHE[path] = torch.load(path)
     return _ACT_STATS_CACHE[path]
+
+
+_EX2_MISMATCH_WARNED = set()
+
+
+def _get_ex2(path, key, w):
+    """Статистика активаций для тензора -- или None, если её нет ИЛИ она
+    от другой модели.
+
+    Ключи чекпоинтов одинаковы у всех размеров RWKV-7, поэтому
+    `stats.get(key)` радостно вернёт статистику 1.5B (2048 каналов) для
+    0.1B (768) -- и это всплывёт лишь падением reshape где-то в
+    _groupwise_fake_dequant. Хуже того, при совпадении размерностей
+    (например, две модели одного n_embd) не всплыло бы вовсе, и мы бы
+    молча калибровали одну модель по активациям другой. Сверка длины --
+    минимальная защита; полноценной была бы подпись чекпоинта в файле
+    статистики.
+    """
+    if not path:
+        return None
+    ex2 = _load_act_stats(path).get(key)
+    if ex2 is None:
+        return None
+    if ex2.numel() != w.shape[-1]:
+        tag = (path, w.shape[-1], int(ex2.numel()))
+        if tag not in _EX2_MISMATCH_WARNED:
+            _EX2_MISMATCH_WARNED.add(tag)
+            warnings.warn(
+                f"act_stats из {path} сняты для {ex2.numel()} входных "
+                f"каналов, а тензор имеет {w.shape[-1]} -- статистика от "
+                f"ДРУГОЙ модели, игнорируется. Пересоберите её на текущем "
+                f"чекпоинте (tests/collect_act_stats.py).",
+                RuntimeWarning, stacklevel=2)
+        return None
+    return ex2
 
 
 def _weighted_rtn_rows(w32, bits, ex2, chunk=2048):
@@ -293,6 +329,94 @@ def _make_qt_gw_asym(key, group, bits, w, gs):
         gw_min=parts["mn"].squeeze(-1).float())
 
 
+def _groupwise_sym_fake_dequant(w: torch.Tensor, bits: int, gs: int = 16,
+                                sb: int = 16, ex2=None, search: bool = True,
+                                outlier_frac: float = 0.0) -> torch.Tensor:
+    """ПРОТОТИП симметричного блочного кванта в раскладке block_q6_K
+    (llama.cpp/ggml-common.h): scale на блок из gs весов БЕЗ min, сами
+    scale квантуются в int8 против одной fp16-константы d на суперблок
+    из sb блоков. Выход -- dense bf16 (fake-dequant), как у
+    _groupwise_fake_dequant: меряем ppl схемы, не написав формата.
+
+    Зачем: наш asym_sb6 -- аналог block_q4_K (асимметрия, блок 32,
+    6-битные scale/min), и мы применяем эту раскладку и на 4 битах, и на
+    6. llama.cpp на шести битах структуру МЕНЯЕТ и получает +0.41%
+    против наших +2.36% при том же бюджете. Гипотеза: на 6 битах
+    отдельный min не окупается -- распределение весов почти симметрично,
+    а платим мы за него дважды (6 бит на min И урезанный до 6 бит scale),
+    тогда как Q6_K тратит тот же бюджет на вдвое меньший блок с 8-битным
+    scale.
+
+    Бюджет: bits + 8/gs + 16/(gs*sb) бит на вес.
+      bits=6, gs=16, sb=16 -> 6.5625 (ровно Q6_K)
+      наш asym_sb6 при gs=32, sb=8 -> 6.5
+
+    outlier_frac > 0: per-row top-k по |w| исключаются из блочной
+    статистики и возвращаются ТОЧНЫМИ (SpQR-семантика, как в
+    _real_quantize_sparse_outlier). В gw-ветке этого не было никогда:
+    при переходе с per-row+SpQR на groupwise разреженную надстройку
+    выкинули целиком, и комбинация groupwise + точные выбросы
+    не проверялась.
+    """
+    w32 = w.float()
+    OUT, IN = w32.shape
+    omask = None
+    if outlier_frac > 0.0:
+        k = max(1, int(round(IN * outlier_frac)))
+        kth = torch.topk(w32.abs(), k, dim=1).values[:, -1:].clamp_min(1e-20)
+        omask = w32.abs() >= kth
+        w_body = torch.where(omask, torch.zeros_like(w32), w32)
+    else:
+        w_body = w32
+
+    pad = (-IN) % (gs * sb)
+    wp = torch.nn.functional.pad(w_body, (0, pad)) if pad else w_body
+    NB = wp.shape[1] // gs
+    wg = wp.view(OUT, NB, gs)
+    if ex2 is not None:
+        ev = ex2.float().clamp_min(1e-12).view(1, -1)
+        evp = torch.nn.functional.pad(ev, (0, pad)) if pad else ev
+        evg = evp.view(1, NB, gs)
+    else:
+        evg = None
+
+    qmax = 2 ** (bits - 1) - 1                    # 31 при bits=6
+    qmin = -qmax - 1                              # -32
+    amax = wg.abs().amax(dim=2, keepdim=True).clamp_min(1e-12)
+    base = amax / qmax
+    factors = (torch.linspace(0.7, 1.15, 19) if search
+               else torch.tensor([1.0]))
+    best_s, best_e = base.clone(), None
+    for f in factors:
+        s = base * f
+        q = torch.clamp(torch.round(wg / s), qmin, qmax)
+        e = (wg - q * s) ** 2
+        err = (e if evg is None else evg * e).sum(dim=2, keepdim=True)
+        if best_e is None:
+            best_s, best_e = s, err
+        else:
+            b = err < best_e
+            best_s = torch.where(b, s, best_s)
+            best_e = torch.minimum(best_e, err)
+
+    # суперблок: scale блоков -> int8 против общей fp16 d. d проходит
+    # half-роундтрип ДО выбора кодов -- как в асимметричной ветке, чтобы
+    # будущий кернель восстанавливал ровно эти числа.
+    ssb = best_s.view(OUT, -1, sb, 1)
+    d = (ssb.amax(dim=2, keepdim=True) / 127.0).clamp_min(1e-12).half().float()
+    qs = torch.clamp(torch.round(ssb / d), -128, 127)
+    scale_q = (qs * d).view(OUT, NB, 1).half().float()
+
+    nz = scale_q.abs() > 0
+    denom = torch.where(nz, scale_q, torch.ones_like(scale_q))
+    q = torch.clamp(torch.round(wg / denom), qmin, qmax)
+    q = torch.where(nz, q, torch.zeros_like(q))
+    deq = (q * scale_q).view(OUT, -1)[:, :IN]
+    if omask is not None:
+        deq = torch.where(omask, w32, deq)
+    return deq
+
+
 _E2M1_GRID = None
 def _mxfp4_fake_dequant(w: torch.Tensor, gs: int, outlier_frac: float = 0.0) -> torch.Tensor:
     """ПРОТОТИП MXFP4 (OCP MX): блок gs колонок, shared E8M0 scale (степень
@@ -398,34 +522,43 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
         if real_gw:
             # реальная упаковка формата v2 вместо dense fake-dequant
             if mode in ("asym_sb6", "asym_sb6_search", "asym_sb6_aw") and bits in (4, 5, 6):
-                ex2 = (_load_act_stats(sp).get(key)
-                       if (sp and mode == "asym_sb6_aw") else None)
+                ex2 = _get_ex2(sp, key, w) if mode == "asym_sb6_aw" else None
                 return _make_qt_gw_sb6(key, group, bits, w, gs, ex2,
                                        search=(mode != "asym_sb6"))
             if mode == "asym" and 5 <= bits <= 8:
                 return _make_qt_gw_asym(key, group, bits, w, gs)
             raise NotImplementedError(f"real_gw: mode={mode} bits={bits} ({key})")
-        if mode == "mxfp4":
+        if mode.startswith("sym"):
+            # Q6_K-подобная раскладка (см. _groupwise_sym_fake_dequant).
+            # gs здесь -- размер блока (16 у Q6_K против 32 у нашего sb6),
+            # sb фиксирован так, чтобы суперблок оставался 256 весов.
+            # "_aw" подаёт ex2 в критерий поиска, "_plain" убирает поиск.
+            ex2 = _get_ex2(sp, key, w) if mode.endswith("_aw") else None
+            deq = _groupwise_sym_fake_dequant(
+                w, bits, gs=gs, sb=max(1, 256 // gs), ex2=ex2,
+                search=not mode.endswith("_plain"),
+                outlier_frac=cfg.outlier_fracs.get(group, 0.0))
+        elif mode == "mxfp4":
             deq = _mxfp4_fake_dequant(w, gs, cfg.outlier_fracs.get(group, 0.0))
         elif mode == "asym_sb6":
             deq = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=6)
         elif mode == "asym_sb6_search":
             deq = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=-6)
         elif mode == "asym_sb6_aw":
-            ex2 = _load_act_stats(sp).get(key) if sp else None
-            deq = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=-6, ex2=ex2)
+            deq = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=-6,
+                                          ex2=_get_ex2(sp, key, w))
         else:
             deq = _groupwise_fake_dequant(w, bits, gs)
         return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
                                 dense=deq.to(torch.bfloat16))
     if sp and bits < 16:
-        stats = _load_act_stats(sp)
-        if key in stats:
+        ex2 = _get_ex2(sp, key, w)
+        if ex2 is not None:
             frac = cfg.outlier_fracs.get(group, 0.0)
-            codes, scale, oi, ov = _weighted_quantize(w, bits, stats[key], frac)
+            codes, scale, oi, ov = _weighted_quantize(w, bits, ex2, frac)
             return _make_qt(key, group, bits, w.shape, codes, scale, oi, ov)
-        # нет статистики (emb: вход -- индексы токенов; LoRA не писали) --
-        # проваливаемся в обычный путь ниже
+        # нет статистики (emb: вход -- индексы токенов; LoRA не писали) или
+        # она от другой модели -- проваливаемся в обычный путь ниже
     if bits >= 16:
         return QuantizedTensor(key=key, group=group, bits=16, shape=tuple(w.shape),
                                 dense=w.to(torch.bfloat16).clone().contiguous())
@@ -471,4 +604,82 @@ def save(state_dict: dict, config: QuantConfig, output_path: str,
         vocab_size=vocab_size, tensors=tensors, config_repr=repr(config),
     )
     torch.save(ckpt, output_path)
+    return ckpt
+
+
+def detect_meta(checkpoint_path: str, state_dict) -> dict:
+    """naming / n_layer / n_embd / head_size / vocab_size прямо из ключей.
+
+    Раньше эти пять чисел брались инстанцированием RWKV7Ref -- то есть
+    ради метаданных в память поднималась ВСЯ модель в bf16 (5.9 ГБ на
+    2.9B), а потом выбрасывалась. Здесь читаются только формы, и при
+    mmap-загрузке тела тензоров вообще не трогаются.
+
+    head_size берётся из r_k -- он имеет форму [n_head, head_size] в обеих
+    схемах именования (в world это blocks.N.att.r_k, в custom --
+    blocks.N.tmix.r_k), поэтому размер головы не приходится угадывать.
+    """
+    n_layer = 1 + max(int(k.split(".")[1]) for k in state_dict
+                      if k.startswith("blocks."))
+    emb = state_dict["emb.weight"]
+    r_k = next(v for k, v in state_dict.items() if k.endswith("r_k"))
+    return {
+        "naming": detect_naming(checkpoint_path, state_dict),
+        "n_layer": n_layer,
+        "n_embd": int(emb.shape[1]),
+        "vocab_size": int(emb.shape[0]),
+        "head_size": int(r_k.shape[-1]),
+    }
+
+
+def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
+                  real_gw: bool = True, verbose: bool = True):
+    """Потоковое квантование чекпоинта: .pth/.safetensors -> .rwkvq.
+
+    Отличие от save(): state_dict не держится в памяти целиком. Тензоры
+    читаются через mmap (страницы file-backed, ядро вытесняет их само,
+    не через своп) и по одному заменяются квантованными, исходная ссылка
+    сразу отпускается.
+
+    Зачем: прежний путь на 2.9B давал пик 9-12 ГБ -- 5.9 ГБ исходного
+    state_dict, поверх него растущий словарь результата (2.4 ГБ) и fp32-
+    воркспейс грид-поиска (до 1 ГБ на cmix 10240x2560, там держится
+    порядка десяти копий блока). На 16 ГБ это гарантированный своп, а
+    своп во время квантования 2.9B -- десятки минут. Здесь пик равен
+    результату плюс воркспейс одного тензора, около 2.5 ГБ.
+
+    torch.load(mmap=True) требует zip-сериализации (все современные .pth)
+    и map_location="cpu".
+    """
+    if checkpoint_path.endswith(".pth"):
+        sd = torch.load(checkpoint_path, map_location="cpu", mmap=True)
+    else:
+        from safetensors.torch import load_file
+        path = checkpoint_path
+        if os.path.isdir(path):
+            path = os.path.join(path, "model.safetensors")
+        sd = load_file(path)
+
+    meta = detect_meta(checkpoint_path, sd)
+    if verbose:
+        print(f"{os.path.basename(checkpoint_path)}: {len(sd)} тензоров, "
+              f"naming={meta['naming']} L={meta['n_layer']} "
+              f"D={meta['n_embd']} H={meta['head_size']} "
+              f"V={meta['vocab_size']}", flush=True)
+
+    tensors = {}
+    keys = list(sd.keys())
+    for i, key in enumerate(keys):
+        tensors[key] = quantize_tensor(key, sd[key], config, real_gw=real_gw)
+        sd[key] = None            # отпускаем ссылку на mmap-вид немедленно
+        if verbose and (i + 1) % 200 == 0:
+            print(f"  {i+1}/{len(keys)}", flush=True)
+    del sd
+
+    ckpt = QuantizedCheckpoint(tensors=tensors, config_repr=repr(config),
+                               **meta)
+    torch.save(ckpt, output_path)
+    if verbose:
+        print(f"-> {output_path} "
+              f"({os.path.getsize(output_path)/1e6:.1f} МБ)", flush=True)
     return ckpt

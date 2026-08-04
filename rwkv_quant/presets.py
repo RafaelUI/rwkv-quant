@@ -19,6 +19,28 @@ NEXT_SESSION.md) -- это не первая калибровка "на глаз
 поиска -- см. tests/collect_act_stats.py (~28с сборки, /tmp/act_stats_1p5b.pt
 не переживает перезагрузку -- пересобрать перед использованием, если файла
 нет).
+
+small=16 (04.08, было 8). Группа small -- это k_k / k_a / r_k, 147K
+параметров на 1.5B, 0.01% модели. Leave-one-out по группам
+(tests/ablate_group_contrib.py) показал, что она уносит 1.59 из 2.36 п.п.
+деградации REDUCTION -- ДВЕ ТРЕТИ, тогда как proj+cmix+emb_head вместе
+дают 0.69. Причина в том, что k_k/k_a/r_k -- поканальные модуляторы ВНУТРИ
+рекуррентности (нормировка ключа, темп in-context обучения,
+receptance-бонус): их ошибка не портит одно предсказание, а искажает
+обновление состояния и копится по длине последовательности. Отсюда же
+рост деградации с контекстом (+1.52% на 128 токенах против +2.57% на 512,
+tests/eval_corpora_compare.py).
+
+Не квантовать их стоит +0.14 МБ, то есть 0.011% файла. Замерено на обоих
+масштабах (tests/confirm_small_fix.py, tests/eval_2p9b_one.py),
+мультиязычный корпус, 512 токенов:
+  1.5B REDUCTION   2.36% -> 0.77%   (сербский 5.52% -> 1.00%)
+  1.5B COMPRESSION 5.41% -> 3.63%
+  2.9B REDUCTION   1.52% -> 1.37%
+  2.9B COMPRESSION 4.38% -> 4.24%
+Прежнее значение 8 подбиралось на eval_corpus_world[:8] -- срезе из 1016
+предсказаний короткого английского, который занижает деградацию вшестеро
+(см. закон 9 в NEXT_SESSION.md).
 """
 from .calibration.group_config import QuantConfig
 
@@ -36,7 +58,7 @@ from .calibration.group_config import QuantConfig
 # с writer'ом; decode ~17.7 мс/ток на M4 base (A/B 19.07).
 REDUCTION = QuantConfig(
     proj=6, cmix=6, emb_head=6,
-    w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+    w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16,
     outlier_fracs={},
     group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
                  "w_lora": 64, "a_lora": 64, "v_lora": 64},
@@ -61,7 +83,7 @@ REDUCTION = QuantConfig(
 # (суб-ниббл/sparsity), не тюнинг битности.
 COMPRESSION = QuantConfig(
     proj=5, cmix=4, emb_head=5,
-    w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=8,
+    w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16,
     outlier_fracs={},
     group_scale={"proj": 32, "cmix": 32, "emb_head": 32,
                  "w_lora": 64, "a_lora": 64, "v_lora": 64},
