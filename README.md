@@ -155,6 +155,23 @@ nibbles; INT5/INT6 add one/two bit-planes on top. Scale search is
 activation-weighted where it helps (per-group setting). The format is
 backend-independent; per-tensor bits and modes live in the file, not in code.
 
+**The container is safetensors, not pickle.** A `.rwkvq` file is a
+safetensors archive: flat `key::field` buffers plus one JSON manifest in
+`__metadata__`. It has no executable payload, memory-maps instead of
+loading (2.9B: 0.03 s and 0.25 GB resident, against 0.24 s and 2.08 GB for
+the old `torch.save` container), and reads without torch or even without
+this package installed — `formats/codec.py` is a complete reader in pure
+numpy, meant to be ported to Swift/C++ as-is:
+
+```python
+from rwkv_quant.formats import codec
+manifest, arrays = codec.open_rwkvq("model.rwkvq")
+w = codec.dequant_key(manifest, arrays, "emb.weight")   # float32
+```
+
+`load_raw()` still reads checkpoints written by older versions — the two
+containers are told apart by their first bytes.
+
 A finding that shaped the presets: **granularity beats bits.** Group-wise
 sb6 at INT4/5 replaced an earlier per-row + SpQR-outlier scheme of the same
 size with roughly half the quality loss. Sub-nibble packing (sub-887 MB at

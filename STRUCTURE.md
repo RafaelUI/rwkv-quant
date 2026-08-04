@@ -85,13 +85,28 @@ served from a CUDA box without re-running calibration.
 **`formats/codec.py` не импортирует torch — и это не стилистика.**
 Потребители формата (`rwkv-metal` на MLX, `SwiftRWKV`) torch-free, и до
 сих пор портировали раскладку с докстрингов, сверяясь с эталоном руками.
-`codec.py` — нормативная реализация на numpy: биты и арифметика
-деквантования всех трёх квантованных раскладок. `schema.py` и `reader.py`
-держат torch-двойники **осознанно**: замер
+`codec.py` — нормативная реализация формата ЦЕЛИКОМ на numpy: разбор
+контейнера safetensors через mmap, битовая раскладка, деквант всех трёх
+квантованных раскладок. Порт делается с одного файла:
+
+```python
+manifest, arrays = codec.open_rwkvq("model.rwkvq")
+w = codec.dequant_key(manifest, arrays, "emb.weight")   # float32
+```
+
+`schema.py` и `reader.py` держат torch-двойники **осознанно**: замер
 (`tests/bench_codec_dequant_ab.py`) показал 2.6x на деквант в пользу
 torch, потому что он параллелит поэлементные операции по ядрам.
 Расхождение двух реализаций ловит `tests/test_codec_parity.py` — при
 правке раскладки править оба файла и гонять гейт.
+
+**Контейнер `.rwkvq` — safetensors, не pickle.** Плоские буферы
+`ключ::поле` плюс манифест одним JSON в `__metadata__`. Прежний
+`torch.save` требовал torch И установленного `rwkv_quant` той же версии
+(pickle пишет полные имена классов), исполнял код при загрузке и читал
+файл целиком в анонимную память. Новый контейнер отображается: 2.9B
+грузится за 0.03 с при 0.25 ГБ maxrss против 0.24 с и 2.08 ГБ.
+`load_raw` читает оба — контейнеры различаются по первым байтам.
 
 **`models/rwkv7_ref.py` is explicitly not a production inference path.**
 It's a from-scratch PyTorch port used only so calibration/ablation can

@@ -5,6 +5,7 @@
 ppl-эффект (дёшево, дёргается тысячи раз при ablation), здесь -- один раз
 произвести реальные упакованные коды для сохранения на диск.
 """
+import json
 import os
 import warnings
 
@@ -13,8 +14,70 @@ import torch
 from ..calibration.group_config import QuantConfig
 from ..calibration.outlier_scan import GROUP_KEY_PATTERNS
 from ..models.naming import detect_naming
+from . import codec
 from .schema import (QuantizedTensor, QuantizedCheckpoint, pack_int4,
                      pack6, pack_nib_block, pack_bitplane)
+
+# поля QuantizedTensor, которые едут на диск отдельными буферами; всё
+# остальное (bits/shape/group/gw_mode/gw_gs/gw_sb) -- скаляры и живут в
+# манифесте
+TENSOR_FIELDS = (
+    "codes", "codes_packed", "scale", "dense",
+    "outlier_indices", "outlier_values",
+    "gw_d", "gw_dm", "gw_qsqm", "gw_qh", "gw_qh2", "gw_scale", "gw_min",
+)
+
+
+def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str):
+    """QuantizedCheckpoint -> .rwkvq в контейнере safetensors.
+
+    Плоские имена "<ключ>::<поле>", метаданные -- одним JSON в
+    "__metadata__"["rwkvq"]. Чем это лучше прежнего torch.save:
+
+      - читается без torch И без установленного пакета rwkv_quant
+        (pickle писал полные имена классов, поэтому файл был привязан к
+        версии пакета) -- см. codec.open_rwkvq, полная читалка на numpy;
+      - mmap и потензорное чтение вместо «всё в анонимную память»;
+      - нет исполнения произвольного кода при загрузке
+        (torch.load(weights_only=False) буквально исполняет файл);
+      - zero-copy в MLX/Metal и читаемость из Rust/C++/Swift.
+
+    Прежние файлы продолжают читаться: reader.load_raw различает
+    контейнеры по первым байтам (torch.save пишет zip PK\\x03\\x04).
+    """
+    tensors, manifest_t = {}, {}
+    for key, qt in ckpt.tensors.items():
+        fields = []
+        for f in TENSOR_FIELDS:
+            v = getattr(qt, f, None)
+            if v is None or v.numel() == 0:
+                continue
+            # safetensors требует непрерывного буфера; для dense это ещё
+            # и обрывает связь с mmap'нутым исходником
+            tensors[f"{key}::{f}"] = v.detach().contiguous()
+            fields.append(f)
+        manifest_t[key] = {
+            "kind": "dense" if qt.bits >= 16 else (qt.gw_mode or "rtn"),
+            "shape": [int(x) for x in qt.shape],
+            "bits": int(qt.bits),
+            "group": qt.group or "other",
+            "gw_gs": int(qt.gw_gs),
+            "gw_sb": int(qt.gw_sb),
+            "fields": fields,
+        }
+
+    manifest = {
+        "format": codec.FORMAT,
+        "format_version": codec.FORMAT_VERSION,
+        "naming": ckpt.naming, "n_layer": int(ckpt.n_layer),
+        "n_embd": int(ckpt.n_embd), "head_size": int(ckpt.head_size),
+        "vocab_size": int(ckpt.vocab_size),
+        "config_repr": ckpt.config_repr,
+        "tensors": manifest_t,
+    }
+    from safetensors.torch import save_file
+    save_file(tensors, output_path, metadata={"rwkvq": json.dumps(manifest)})
+    return ckpt
 
 
 def _real_quantize(w: torch.Tensor, bits: int):
@@ -603,8 +666,7 @@ def save(state_dict: dict, config: QuantConfig, output_path: str,
         naming=naming, n_layer=n_layer, n_embd=n_embd, head_size=head_size,
         vocab_size=vocab_size, tensors=tensors, config_repr=repr(config),
     )
-    torch.save(ckpt, output_path)
-    return ckpt
+    return save_rwkvq(ckpt, output_path)
 
 
 def detect_meta(checkpoint_path: str, state_dict) -> dict:
@@ -678,7 +740,7 @@ def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
 
     ckpt = QuantizedCheckpoint(tensors=tensors, config_repr=repr(config),
                                **meta)
-    torch.save(ckpt, output_path)
+    save_rwkvq(ckpt, output_path)
     if verbose:
         print(f"-> {output_path} "
               f"({os.path.getsize(output_path)/1e6:.1f} МБ)", flush=True)

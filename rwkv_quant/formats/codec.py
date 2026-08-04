@@ -1,16 +1,21 @@
 """
-Битовая раскладка .rwkvq и деквантование -- БЕЗ torch, только numpy.
+Формат .rwkvq целиком -- БЕЗ torch, только numpy: контейнер, битовая
+раскладка, деквантование.
 
-Это нормативная реализация формата. Всё, что описано в докстринге
-schema.py как раскладка на диске, живёт здесь; schema.py оставляет от
-себя тонкие torch-обёртки, reader.py делегирует сюда деквант. Один
-источник истины: если раскладка меняется, она меняется в одном файле.
+Это нормативная реализация. Потребители формата -- rwkv-metal (MLX) и
+SwiftRWKV -- принципиально torch-free и до сих пор портировали
+распаковку по докстрингам, сверяясь с эталоном вручную. Теперь порт
+делается с этого файла, и он самодостаточен:
 
-Зачем отдельный модуль. Потребители формата -- rwkv-metal (MLX) и
-SwiftRWKV -- принципиально torch-free, и до сих пор были вынуждены
-портировать распаковку по докстрингам и сверяться с эталоном вручную.
-Теперь порт делается с этих функций, а гейт tests/test_codec_parity.py
-доказывает, что они бит-в-бит равны прежнему torch-пути.
+    manifest, arrays = codec.open_rwkvq("model.rwkvq")
+    w = codec.dequant_key(manifest, arrays, "emb.weight")   # float32
+
+Ни pickle, ни исполнения кода при загрузке, ни зависимости от пакета
+rwkv_quant. Буферы -- виды на mmap, страницы file-backed.
+
+Torch-двойники в schema.py и reader.py оставлены осознанно (они быстрее
+в 2.6x, см. закон 16 в NEXT_SESSION.md); что обе реализации совпадают
+бит-в-бит, доказывает гейт tests/test_codec_parity.py.
 
 ГРАНИЦА ТИПОВ. Здесь нет bfloat16: numpy его не знает. Все три
 `dequant_*` возвращают float32 -- это точное надмножество bf16, каст в
@@ -30,6 +35,9 @@ MLX-потребителе). Промежуточная арифметика у�
   rtn    per-row scale, коды int8 либо biased split-нибблы при bits<=4,
          опциональная разреженная SpQR-надстройка поверх.
 """
+import json
+import mmap as _mmap
+
 import numpy as np
 
 __all__ = [
@@ -38,7 +46,17 @@ __all__ = [
     "pack_nib_block", "unpack_nib_block",
     "pack_bitplane", "unpack_bitplane",
     "dequant_sb6", "dequant_asym", "dequant_rtn",
+    "MAGIC_ZIP", "FORMAT", "FORMAT_VERSION",
+    "bf16_to_f32", "read_safetensors", "open_rwkvq", "dequant_key",
 ]
+
+FORMAT = "rwkvq"
+FORMAT_VERSION = 1        # контейнер safetensors; pickle-эра версии не имела
+
+# первые байты zip'а, который пишет torch.save -- по ним отличается
+# прежний pickle-контейнер от safetensors (там первые 8 байт -- длина
+# JSON-хедера, то есть небольшое число, и байт 0x50 в нём не встречается)
+MAGIC_ZIP = b"PK\x03\x04"
 
 
 # ---------------- нибблы per-row RTN (bits <= 4) ----------------
@@ -201,3 +219,95 @@ def dequant_rtn(scale, *, shape, codes=None, codes_packed=None,
         oi = np.asarray(outlier_indices)
         w[oi[:, 0], oi[:, 1]] = np.asarray(outlier_values, dtype=np.float32)
     return w
+
+
+# ---------------- контейнер: чтение .rwkvq без torch ----------------
+#
+# Всё, что ниже, -- полная читалка формата на numpy. Порт в Swift или
+# C++ делается с неё: разобрать safetensors (u64-длина хедера, JSON,
+# сырые буферы), достать манифест из "__metadata__", позвать нужный
+# dequant_*. Ни pickle, ни исполнения кода, ни зависимости от torch.
+
+# safetensors-имена типов -> numpy. BF16 numpy не знает, поэтому едет как
+# uint16 и разворачивается через bf16_to_f32 (сдвиг на 16 бит -- точный,
+# bf16 есть усечённый fp32).
+_ST_DTYPE = {
+    "BOOL": np.bool_, "U8": np.uint8, "I8": np.int8, "I16": np.int16,
+    "U16": np.uint16, "F16": np.float16, "BF16": np.uint16,
+    "I32": np.int32, "U32": np.uint32, "F32": np.float32,
+    "F64": np.float64, "I64": np.int64, "U64": np.uint64,
+}
+
+
+def bf16_to_f32(u16: np.ndarray) -> np.ndarray:
+    """bf16, приехавший как uint16, -> float32. Точно и без таблиц:
+    bf16 -- это старшие 16 бит fp32, младшие нули."""
+    return (u16.astype(np.uint32) << 16).view(np.float32)
+
+
+def read_safetensors(path: str):
+    """(метаданные, {имя: ndarray}) через mmap, без копирования.
+
+    Массивы -- ВИДЫ на отображённый файл: страницы file-backed, ядро
+    вытесняет их само. Именно ради этого контейнер и менялся с pickle,
+    который читает всё в анонимную память до первого обращения.
+    Возвращённые массивы read-only; при записи в них делать .copy()."""
+    with open(path, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(n))
+        mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+    buf = np.frombuffer(mm, dtype=np.uint8)
+    base = 8 + n
+    meta = header.pop("__metadata__", {})
+    arrays = {}
+    for name, info in header.items():
+        b, e = info["data_offsets"]
+        dt = _ST_DTYPE[info["dtype"]]
+        shape = tuple(info["shape"])
+        a = buf[base + b:base + e]
+        arrays[name] = (a.view(dt).reshape(shape) if a.size
+                        else np.empty(shape, dt))
+    return meta, arrays
+
+
+def open_rwkvq(path: str):
+    """(манифест, буферы) для .rwkvq в контейнере safetensors.
+
+    Манифест -- JSON из "__metadata__"["rwkvq"]: пять чисел про модель
+    плюс per-tensor запись {kind, shape, bits, group, gw_gs, gw_sb,
+    fields}. Буферы адресуются как "<ключ>::<поле>"."""
+    meta, arrays = read_safetensors(path)
+    if "rwkvq" not in meta:
+        raise ValueError(f"{path}: не .rwkvq -- в __metadata__ нет ключа rwkvq")
+    manifest = json.loads(meta["rwkvq"])
+    if manifest.get("format") != FORMAT:
+        raise ValueError(f"{path}: формат {manifest.get('format')!r}")
+    return manifest, arrays
+
+
+def dequant_key(manifest, arrays, key) -> np.ndarray:
+    """Один тензор из открытого .rwkvq -> float32. Каст в bf16 -- на
+    вызывающей стороне (mx.bfloat16 в MLX, Float16/BFloat16 в Swift)."""
+    m = manifest["tensors"][key]
+    kind, shape = m["kind"], tuple(m["shape"])
+
+    def buf(field):
+        return arrays.get(f"{key}::{field}")
+
+    if kind == "dense":
+        return bf16_to_f32(buf("dense"))
+    if kind == "sb6":
+        return dequant_sb6(buf("codes_packed"), buf("gw_qsqm"),
+                           buf("gw_d"), buf("gw_dm"),
+                           shape=shape, gs=m["gw_gs"], sb=m["gw_sb"],
+                           qh=buf("gw_qh"), qh2=buf("gw_qh2"))
+    if kind == "asym":
+        return dequant_asym(buf("codes"), buf("gw_scale"), buf("gw_min"),
+                            shape=shape, gs=m["gw_gs"])
+    if kind == "rtn":
+        ov = buf("outlier_values")
+        return dequant_rtn(buf("scale"), shape=shape,
+                           codes=buf("codes"), codes_packed=buf("codes_packed"),
+                           outlier_indices=buf("outlier_indices"),
+                           outlier_values=None if ov is None else bf16_to_f32(ov))
+    raise ValueError(f"{key}: неизвестная раскладка {kind!r}")

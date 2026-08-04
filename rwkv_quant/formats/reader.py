@@ -19,14 +19,64 @@ tests/test_codec_parity.py: 2.9 G элементов чекпоинта 2.9B, в
 раскладки, ноль расхождений. При правке раскладки править ОБЕ и гонять
 гейт.
 """
+import json
+
 import torch
 
-from .schema import (QuantizedCheckpoint, int8_codes, unpack6,  # noqa: F401
-                     unpack_nib_block, unpack_bitplane)
+from . import codec
+from .schema import (QuantizedCheckpoint, QuantizedTensor,  # noqa: F401
+                     int8_codes, unpack6, unpack_nib_block, unpack_bitplane)
 
 
 def load_raw(path: str) -> QuantizedCheckpoint:
-    return torch.load(path, map_location="cpu", weights_only=False)
+    """.rwkvq -> QuantizedCheckpoint. Читает ОБА контейнера.
+
+    Различаются по первым байтам: torch.save пишет zip (PK\\x03\\x04),
+    safetensors -- little-endian u64 с длиной JSON-хедера. Прежние файлы
+    поддерживаются один релиз; новые пишутся только в safetensors
+    (writer.save_rwkvq -- там же и мотивация).
+    """
+    with open(path, "rb") as f:
+        head = f.read(4)
+    if head == codec.MAGIC_ZIP:
+        # pickle: исполняет код при загрузке и требует установленного
+        # rwkv_quant той же версии -- ровно то, от чего уходим
+        return torch.load(path, map_location="cpu", weights_only=False)
+    return _load_safetensors(path)
+
+
+def _load_safetensors(path: str) -> QuantizedCheckpoint:
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt", device="cpu") as f:
+        meta = f.metadata() or {}
+        if "rwkvq" not in meta:
+            raise ValueError(f"{path}: safetensors без манифеста rwkvq")
+        m = json.loads(meta["rwkvq"])
+        if m.get("format") != codec.FORMAT:
+            raise ValueError(f"{path}: формат {m.get('format')!r}, "
+                             f"ожидался {codec.FORMAT!r}")
+        if m.get("format_version", 0) > codec.FORMAT_VERSION:
+            raise ValueError(
+                f"{path}: format_version {m['format_version']} новее, чем "
+                f"понимает этот rwkv_quant ({codec.FORMAT_VERSION})")
+
+        tensors = {}
+        for key, t in m["tensors"].items():
+            kind = t["kind"]
+            qt = QuantizedTensor(
+                key=key, group=t["group"], bits=t["bits"],
+                shape=tuple(t["shape"]),
+                gw_mode=kind if kind in ("sb6", "asym") else "",
+                gw_gs=t["gw_gs"], gw_sb=t["gw_sb"])
+            for field in t["fields"]:
+                setattr(qt, field, f.get_tensor(f"{key}::{field}"))
+            tensors[key] = qt
+
+    return QuantizedCheckpoint(
+        naming=m["naming"], n_layer=m["n_layer"], n_embd=m["n_embd"],
+        head_size=m["head_size"], vocab_size=m["vocab_size"],
+        tensors=tensors, config_repr=m.get("config_repr", ""))
 
 
 def _dequantize_one(qt) -> torch.Tensor:
