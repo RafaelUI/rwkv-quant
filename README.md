@@ -169,6 +169,28 @@ manifest, arrays = codec.open_rwkvq("model.rwkvq")
 w = codec.dequant_key(manifest, arrays, "emb.weight")   # float32
 ```
 
+That import pulls in numpy and nothing else — the package's other entry
+points are lazy, so `import rwkv_quant` does not drag torch in. This is
+load-bearing rather than tidy: consumers of the format run in
+environments that have no torch at all, and the guarantee is enforced by
+a gate that blocks torch at the import machinery and then exercises the
+codec (`tests/test_torch_free_import.py`).
+
+`codec` also builds the two *loader* layouts a backend may want, from the
+same file and still without torch:
+
+```python
+qblk, qsqm, ddm, xbits = codec.sb6_to_k3(...)          # Metal GEMV kernel
+wq, scales, biases, bits = codec.sb6_to_mlx_affine(...) # MLX quantized_matmul
+```
+
+Both are relayouts, not requantizations — the codes, scales and biases
+are the calibrated ones, byte for byte. (Calling `mx.quantize()` on a
+dequantized weight would look equivalent and quietly is not: it
+recomputes scale/bias from block min/max and throws the calibration
+away.) This is why a `.rwkvq` no longer needs a companion sidecar file:
+whatever layout the backend wants, it can build at load time.
+
 `load_raw()` still reads checkpoints written by older versions — the two
 containers are told apart by their first bytes.
 
