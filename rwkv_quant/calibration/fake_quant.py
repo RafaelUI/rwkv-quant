@@ -8,6 +8,8 @@ percentile-clipped вариант, и SpQR-style sparse outlier extraction.
 несёт реальный обученный сигнал. Для dense-групп нужен SpQR-style подход:
 сохранить выбросы точно (разреженно, в bf16), а не резать/искажать их.
 """
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -69,22 +71,102 @@ def fake_quantize(w: torch.Tensor, bits: int, per_channel: bool = True, clip_per
 # сам w. Это не расточительность: без неё освобождённый тензор мог бы
 # отдать свой адрес новому, и кеш молча вернул бы чужие веса. Веса
 # модели и так живут весь прогон, так что ссылка ничего не стоит.
+#
+# ПОЛИТИКА «ЛИБО ВЕСЬ РАБОЧИЙ НАБОР, ЛИБО НИЧЕГО» -- вывод из замера, а
+# не из вкуса. tests/probe_ppl_memory.py и /tmp-бенч на 1.5B (M4, 16 ГБ,
+# чередование в одном процессе, закон 1):
+#
+#   ИЗОЛИРОВАННО (одна группа cmix, рабочий набор влезает):
+#     кеш ВЫКЛ  69.3 / 68.7 с      кеш ВКЛ  33.2 / 33.2 с   -> 2.08x
+#     ppl бит-в-бит, своп не двинулся
+#
+#   КОМПОЗИТ (квантованы ВСЕ группы, рабочий набор ~2.8 ГБ, не влезает):
+#     кеш ВЫКЛ   90 с, пик свопа +0 МБ
+#     кеш 1536 МБ  119 с, пик свопа +4424 МБ
+#
+# То есть при нехватке места частичный кеш проигрывает ОТСУТСТВИЮ кеша по
+# ОБЕИМ осям сразу: он и медленнее (промахи + давление на память), и
+# устраивает своп, который по закону 11 делает замер недействительным.
+# Поэтому вытеснения здесь нет вовсе: как только рабочий набор перестаёт
+# помещаться в бюджет, кеш ОТКЛЮЧАЕТСЯ до конца замера и освобождает уже
+# накопленное. Промежуточного режима не предусмотрено намеренно -- он
+# измеренно хуже обоих крайних.
+#
+# Бюджет выводится из СВОБОДНОЙ памяти в момент старта замера, а не из
+# константы: 1536 МБ выглядели скромно и всё равно утащили машину в своп,
+# потому что пол замера уже занимал 76% памяти.
 _CACHE = {}
 _CACHE_ON = False
+_CACHE_BYTES = 0
+_CACHE_BUDGET = 0
+_CACHE_GAVE_UP = False
+# доля СВОБОДНОЙ памяти, которую позволено занять кешу; переопределяется
+# RWKVQ_CACHE_FRACTION, жёсткий потолок -- RWKVQ_CACHE_MAX_MB
+_CACHE_FRACTION = float(os.environ.get("RWKVQ_CACHE_FRACTION", "0.25"))
+_CACHE_MAX = int(os.environ.get("RWKVQ_CACHE_MAX_MB", "2048")) << 20
 
 
-def cache_begin():
+def available_bytes():
+    """Свободная память по vm_stat: free + inactive + speculative.
+
+    Не RSS и не ps: для unified memory они бесполезны (закон 11).
+    inactive засчитывается, потому что ядро отдаёт эти страницы без
+    записи в своп. При невозможности определить -- ноль, и кеш просто не
+    включится: лучше медленно, чем в свопе.
+    """
+    try:
+        import subprocess
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+        page = 16384
+        first = out.splitlines()[0]
+        if "page size of" in first:
+            page = int(first.split("page size of")[1].split("bytes")[0].strip())
+        n = {}
+        for line in out.splitlines()[1:]:
+            if ":" not in line:
+                continue
+            k, v = line.split(":", 1)
+            n[k.strip()] = int(v.strip().rstrip("."))
+        return page * (n.get("Pages free", 0) + n.get("Pages inactive", 0)
+                       + n.get("Pages speculative", 0))
+    except Exception:                                        # noqa: BLE001
+        return 0
+
+
+def cache_begin(budget_bytes=None):
     """Включить кеш на время одного замера (см. ablation.perplexity)."""
-    global _CACHE_ON
-    _CACHE_ON = True
+    global _CACHE_ON, _CACHE_BYTES, _CACHE_BUDGET, _CACHE_GAVE_UP
     _CACHE.clear()
+    _CACHE_BYTES, _CACHE_GAVE_UP = 0, False
+    _CACHE_BUDGET = (budget_bytes if budget_bytes is not None
+                     else min(int(available_bytes() * _CACHE_FRACTION), _CACHE_MAX))
+    _CACHE_ON = _CACHE_BUDGET > 0
 
 
 def cache_end():
-    """Выключить и освободить: держит до одной копии модели в bf16."""
-    global _CACHE_ON
+    """Выключить и освободить."""
+    global _CACHE_ON, _CACHE_BYTES
     _CACHE_ON = False
+    _CACHE_BYTES = 0
     _CACHE.clear()
+
+
+def cache_stats():
+    return {"entries": len(_CACHE), "bytes": _CACHE_BYTES,
+            "budget": _CACHE_BUDGET, "gave_up": _CACHE_GAVE_UP}
+
+
+def _cache_put(key, w, out):
+    """Положить в кеш либо, если бюджет исчерпан, сдаться до конца замера."""
+    global _CACHE_BYTES, _CACHE_ON, _CACHE_GAVE_UP
+    nbytes = out.numel() * out.element_size()
+    if _CACHE_BYTES + nbytes > _CACHE_BUDGET:
+        _CACHE_ON, _CACHE_GAVE_UP = False, True
+        _CACHE.clear()
+        _CACHE_BYTES = 0
+        return
+    _CACHE[key] = (w, out)
+    _CACHE_BYTES += nbytes
 
 
 def _gw_fake(w, group, cfg, key):
@@ -151,11 +233,11 @@ def q(w, group, cfg: "QuantConfig", key: str = None):
               cfg.outlier_fracs.get(group, 0.0),
               getattr(cfg, "act_stats_path", None), key)
         hit = _CACHE.get(ck)
-        if hit is None:
-            # (сильная ссылка на w -- см. комментарий у _CACHE)
-            hit = (w, _gw_fake(w, group, cfg, key).to(w.dtype))
-            _CACHE[ck] = hit
-        return hit[1]
+        if hit is not None:
+            return hit[1]
+        out = _gw_fake(w, group, cfg, key).to(w.dtype)
+        _cache_put(ck, w, out)      # сильная ссылка на w -- см. у _CACHE
+        return out
 
     if group in cfg.outlier_fracs and w.dim() >= 2:
         return fake_quantize_sparse_outlier(w, bits, cfg.outlier_fracs[group])

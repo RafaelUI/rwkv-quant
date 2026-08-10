@@ -21,7 +21,11 @@ GROUP_KEY_PATTERNS = {
     "g_lora": ["g_lora_A", "g_lora_B", ".g1", ".g2"],
     "small": ["k_k", "k_a", "r_k"],
     "cmix": ["cmix.key.weight", "cmix.value.weight", "ffn.key.weight", "ffn.value.weight"],
-    "emb_head": ["emb.weight", "head.weight"],
+    # emb и head -- РАЗНЫЕ группы (см. group_config: квантование emb
+    # измеренно не стоит ничего, про head такого замера нет). Псевдоним
+    # "emb_head" продолжает работать на уровне QuantConfig.
+    "emb": ["emb.weight"],
+    "head": ["head.weight"],
 }
 
 # Bias-термы LoRA-веток, которые НЕ квантуются никогда и ни на одном пути:

@@ -256,7 +256,7 @@ class RWKV7Ref(nn.Module):
     def forward(self, idx: torch.Tensor, cfg: QuantConfig = None):
         if cfg is None:
             cfg = QuantConfig()
-        x = F.embedding(idx, q(self.emb_weight, "emb_head", cfg, "emb.weight"))
+        x = F.embedding(idx, q(self.emb_weight, "emb", cfg, "emb.weight"))
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln0_w.float(), self.ln0_b.float()).to(x.dtype)
 
         v_first = torch.empty_like(x)
@@ -269,5 +269,5 @@ class RWKV7Ref(nn.Module):
 
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln_out_w.float(), self.ln_out_b.float()).to(x.dtype)
         _rec("head.weight", x)
-        logits = x @ q(self.head_weight, "emb_head", cfg, "head.weight").T
+        logits = x @ q(self.head_weight, "head", cfg, "head.weight").T
         return logits

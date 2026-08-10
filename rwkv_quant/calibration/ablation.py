@@ -33,12 +33,18 @@ def perplexity(model, data: torch.Tensor, cfg: QuantConfig = None, batch_size: i
         total_nll, total_tok = 0.0, 0
         for i in range(0, data.size(0), batch_size):
             batch = data[i:i + batch_size]
-            logits = model.forward(batch[:, :-1], cfg)
+            logits = model.forward(batch[:, :-1], cfg).float()
             target = batch[:, 1:]
-            logp = F.log_softmax(logits.float(), dim=-1)
-            nll = -logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            # NLL через logsumexp, а НЕ материализацию log_softmax: логиты
+            # тут [B, T, 65536], и полный fp32-logp плюс копии softmax дают
+            # порядка 0.8 ГБ транзиента на батч (замечание в
+            # tests/eval_multiling.py, там от этого уже ушли). Результат
+            # тождественный: log_softmax(x)[i] = x[i] - logsumexp(x).
+            nll = (torch.logsumexp(logits, dim=-1)
+                   - logits.gather(-1, target.unsqueeze(-1)).squeeze(-1))
             total_nll += nll.sum().item()
             total_tok += nll.numel()
+            del logits, nll
     finally:
         fake_quant.cache_end()
     return torch.exp(torch.tensor(total_nll / total_tok)).item()

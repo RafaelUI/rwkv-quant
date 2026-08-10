@@ -109,9 +109,17 @@ def test_matches_real_pack(w):
 
 
 def test_cache(w):
+    """Кеш обязан быть прозрачным по числам и честным по памяти.
+
+    Политика «либо весь рабочий набор, либо ничего» -- не вкус, а вывод
+    замера: при нехватке бюджета частичный кеш проигрывает отсутствию
+    кеша и по времени (119 с против 90), и по свопу (+4424 МБ против +0).
+    См. комментарий в fake_quant и tests/probe_ppl_memory.py.
+    """
     cfg = _cfg(4, "asym_sb6_search")
     ref = fake_quant.q(w, "cmix", cfg, KEY).clone()
-    fake_quant.cache_begin()
+
+    fake_quant.cache_begin(budget_bytes=512 << 20)
     a1 = fake_quant.q(w, "cmix", cfg, KEY)
     a2 = fake_quant.q(w, "cmix", cfg, KEY)
     assert a1 is a2, "второй вызов обязан прийти из кеша"
@@ -119,15 +127,29 @@ def test_cache(w):
     n = len(fake_quant._CACHE)
     fake_quant.cache_end()
     assert not fake_quant._CACHE, "кеш обязан умирать вместе с замером"
-    # кеш обязан различать конфиги, а не только тензор
-    fake_quant.cache_begin()
+
+    # различает конфиги, а не только тензор
+    fake_quant.cache_begin(budget_bytes=512 << 20)
     b1 = fake_quant.q(w, "cmix", _cfg(4, "asym_sb6"), KEY)
     b2 = fake_quant.q(w, "cmix", _cfg(6, "asym_sb6"), KEY)
     assert (b1.float() - b2.float()).abs().max().item() > 0, \
         "кеш склеил разные битности"
     fake_quant.cache_end()
-    print(f"4. кеш: попадание работает ({n} запись), конфиги не склеены, "
-          f"очистка после замера OK")
+
+    # бюджет меньше одного тензора -> кеш СДАЁТСЯ целиком, а не вытесняет
+    fake_quant.cache_begin(budget_bytes=1024)
+    c1 = fake_quant.q(w, "cmix", cfg, KEY)
+    st = fake_quant.cache_stats()
+    assert st["gave_up"] and not fake_quant._CACHE, (
+        "при нехватке бюджета кеш обязан отключиться, а не дрожать: "
+        f"{st}")
+    assert (c1.float() - ref.float()).abs().max().item() == 0.0, \
+        "отключение кеша не смеет менять числа"
+    fake_quant.cache_end()
+
+    assert fake_quant.available_bytes() > 0, "vm_stat не читается -- кеш не включится"
+    print(f"4. кеш: попадание ({n} запись), конфиги не склеены, при нехватке "
+          f"бюджета отключается целиком, числа не меняются")
 
 
 def test_bad_shape(w):
