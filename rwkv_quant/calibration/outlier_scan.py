@@ -24,6 +24,21 @@ GROUP_KEY_PATTERNS = {
     "emb_head": ["emb.weight", "head.weight"],
 }
 
+# Bias-термы LoRA-веток, которые НЕ квантуются никогда и ни на одном пути:
+# models/rwkv7_ref.py использует их в forward сырыми (F.linear(..., t.w_lora_B_b)
+# без обёртки q()), а formats/writer.quantize_tensor отдаёт их плотными bf16.
+# Причина не стилистическая: w0 имеет форму (1,1,C), и per-row RTN даёт ОДНУ
+# scale на все C каналов decay-gate'а -- это напрямую портит рекуррентность на
+# каждом токене каждого слоя (ppl 11.4 -> 248 на 1.5B при w_lora=INT4).
+#
+# Таблица живёт здесь, а не в writer, потому что на неё смотрят ОБА слоя:
+# writer -- чтобы не квантовать, calibration/schema_space -- чтобы не считать
+# эти тензоры при выводе применимости схем. Пока она была только в writer,
+# schema_space видел у w_lora трёхмерный w0 и делал вывод, что блочные схемы
+# группе недоступны, -- при том что квантуются там только двумерные w1/w2.
+LORA_BIAS_SUFFIXES = (".w_lora_B.bias", ".a_lora_B.bias", ".v_lora_B.bias",
+                      ".w0", ".a0", ".v0")
+
 
 def scan_channel_outliers(state_dict, tensor_names_by_layer, label: str = "", top_n: int = 5):
     """

@@ -187,26 +187,26 @@ class RWKV7Ref(nn.Module):
         _rec(f"blocks.{layer_id}.att.receptance.weight", xr)
         _rec(f"blocks.{layer_id}.att.key.weight", xk)
         _rec(f"blocks.{layer_id}.att.value.weight", xv)
-        r = xr @ q(t.r_proj, "proj", cfg).T
-        w_ = -F.softplus(-(F.linear(torch.tanh(xw @ q(t.w_lora_A, "w_lora", cfg).T),
-                                     q(t.w_lora_B_w, "w_lora", cfg), t.w_lora_B_b))) - 0.5
-        k = xk @ q(t.k_proj, "proj", cfg).T
-        v = xv @ q(t.v_proj, "proj", cfg).T
+        r = xr @ q(t.r_proj, "proj", cfg, f"blocks.{layer_id}.att.receptance.weight").T
+        w_ = -F.softplus(-(F.linear(torch.tanh(xw @ q(t.w_lora_A, "w_lora", cfg, f"blocks.{layer_id}.att.w1").T),
+                                     q(t.w_lora_B_w, "w_lora", cfg, f"blocks.{layer_id}.att.w2"), t.w_lora_B_b))) - 0.5
+        k = xk @ q(t.k_proj, "proj", cfg, f"blocks.{layer_id}.att.key.weight").T
+        v = xv @ q(t.v_proj, "proj", cfg, f"blocks.{layer_id}.att.value.weight").T
 
         if layer_id == 0:
             v_first = v
         else:
-            resid_gate = torch.sigmoid(F.linear(xv @ q(t.v_lora_A, "v_lora", cfg).T,
-                                                 q(t.v_lora_B_w, "v_lora", cfg), t.v_lora_B_b))
+            resid_gate = torch.sigmoid(F.linear(xv @ q(t.v_lora_A, "v_lora", cfg, f"blocks.{layer_id}.att.v1").T,
+                                                 q(t.v_lora_B_w, "v_lora", cfg, f"blocks.{layer_id}.att.v2"), t.v_lora_B_b))
             v = v + (v_first - v) * resid_gate
 
-        a = torch.sigmoid(F.linear(xa @ q(t.a_lora_A, "a_lora", cfg).T,
-                                    q(t.a_lora_B_w, "a_lora", cfg), t.a_lora_B_b))
-        g = torch.sigmoid(xg @ q(t.g_lora_A, "g_lora", cfg).T) @ q(t.g_lora_B_w, "g_lora", cfg).T
+        a = torch.sigmoid(F.linear(xa @ q(t.a_lora_A, "a_lora", cfg, f"blocks.{layer_id}.att.a1").T,
+                                    q(t.a_lora_B_w, "a_lora", cfg, f"blocks.{layer_id}.att.a2"), t.a_lora_B_b))
+        g = torch.sigmoid(xg @ q(t.g_lora_A, "g_lora", cfg, f"blocks.{layer_id}.att.g1").T) @ q(t.g_lora_B_w, "g_lora", cfg, f"blocks.{layer_id}.att.g2").T
 
-        k_k = q(t.k_k, "small", cfg).reshape(1, 1, C)
-        k_a = q(t.k_a, "small", cfg).reshape(1, 1, C)
-        r_k = q(t.r_k, "small", cfg).reshape(H, N)
+        k_k = q(t.k_k, "small", cfg, f"blocks.{layer_id}.att.k_k").reshape(1, 1, C)
+        k_a = q(t.k_a, "small", cfg, f"blocks.{layer_id}.att.k_a").reshape(1, 1, C)
+        r_k = q(t.r_k, "small", cfg, f"blocks.{layer_id}.att.r_k").reshape(H, N)
 
         kk = k * k_k
         kk = F.normalize(kk.view(B, T, H, N), dim=-1, p=2.0).view(B, T, C)
@@ -221,7 +221,7 @@ class RWKV7Ref(nn.Module):
         out = out + bonus
         og = out * g
         _rec(f"blocks.{layer_id}.att.output.weight", og)
-        out = og @ q(t.o_proj, "proj", cfg).T
+        out = og @ q(t.o_proj, "proj", cfg, f"blocks.{layer_id}.att.output.weight").T
         return out, v_first
 
     @staticmethod
@@ -249,14 +249,14 @@ class RWKV7Ref(nn.Module):
         xx = self._time_shift(x) - x
         k = x + xx * c.x_k
         _rec(f"blocks.{layer_id}.ffn.key.weight", k)
-        k = torch.relu(k @ q(c.key, "cmix", cfg).T) ** 2
+        k = torch.relu(k @ q(c.key, "cmix", cfg, f"blocks.{layer_id}.ffn.key.weight").T) ** 2
         _rec(f"blocks.{layer_id}.ffn.value.weight", k)
-        return k @ q(c.value, "cmix", cfg).T
+        return k @ q(c.value, "cmix", cfg, f"blocks.{layer_id}.ffn.value.weight").T
 
     def forward(self, idx: torch.Tensor, cfg: QuantConfig = None):
         if cfg is None:
             cfg = QuantConfig()
-        x = F.embedding(idx, q(self.emb_weight, "emb_head", cfg))
+        x = F.embedding(idx, q(self.emb_weight, "emb_head", cfg, "emb.weight"))
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln0_w.float(), self.ln0_b.float()).to(x.dtype)
 
         v_first = torch.empty_like(x)
@@ -269,5 +269,5 @@ class RWKV7Ref(nn.Module):
 
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln_out_w.float(), self.ln_out_b.float()).to(x.dtype)
         _rec("head.weight", x)
-        logits = x @ q(self.head_weight, "emb_head", cfg).T
+        logits = x @ q(self.head_weight, "emb_head", cfg, "head.weight").T
         return logits

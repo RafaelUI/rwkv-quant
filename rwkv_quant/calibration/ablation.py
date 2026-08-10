@@ -12,22 +12,35 @@ import time
 import torch
 import torch.nn.functional as F
 
+from . import fake_quant
 from .group_config import GROUPS, QuantConfig
 from .outlier_scan import group_param_counts
 
 
 @torch.no_grad()
 def perplexity(model, data: torch.Tensor, cfg: QuantConfig = None, batch_size: int = 2) -> float:
+    """ppl под конфигом. Кеш квантованных весов живёт РОВНО один вызов.
+
+    Почему так, а не глобально: блочные схемы с грид-поиском на два
+    порядка дороже per-row RTN, и без кеша каждый батч переквантовывал бы
+    всю модель заново. Но кеш держит до одной копии модели в bf16, а
+    машина замера -- 16 ГБ (закон 11), поэтому он обязан умирать вместе с
+    замером, а не жить между конфигами.
+    """
     cfg = cfg or QuantConfig()
-    total_nll, total_tok = 0.0, 0
-    for i in range(0, data.size(0), batch_size):
-        batch = data[i:i + batch_size]
-        logits = model.forward(batch[:, :-1], cfg)
-        target = batch[:, 1:]
-        logp = F.log_softmax(logits.float(), dim=-1)
-        nll = -logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
-        total_nll += nll.sum().item()
-        total_tok += nll.numel()
+    fake_quant.cache_begin()
+    try:
+        total_nll, total_tok = 0.0, 0
+        for i in range(0, data.size(0), batch_size):
+            batch = data[i:i + batch_size]
+            logits = model.forward(batch[:, :-1], cfg)
+            target = batch[:, 1:]
+            logp = F.log_softmax(logits.float(), dim=-1)
+            nll = -logp.gather(-1, target.unsqueeze(-1)).squeeze(-1)
+            total_nll += nll.sum().item()
+            total_tok += nll.numel()
+    finally:
+        fake_quant.cache_end()
     return torch.exp(torch.tensor(total_nll / total_tok)).item()
 
 
