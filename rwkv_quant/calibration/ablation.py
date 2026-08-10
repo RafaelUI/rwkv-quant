@@ -47,7 +47,26 @@ def perplexity(model, data: torch.Tensor, cfg: QuantConfig = None, batch_size: i
             del logits, nll
     finally:
         fake_quant.cache_end()
-    return torch.exp(torch.tensor(total_nll / total_tok)).item()
+
+    mean_nll = total_nll / total_tok
+    # ЗАЩИТА ОТ ТИХОГО МУСОРА. На 2.9B MPS исчерпывает память и роняет
+    # command buffer (kIOGPUCommandBufferCallbackErrorOutOfMemory), но
+    # PyTorch на этом НЕ падает: сообщение уходит в stderr, а тензоры
+    # возвращаются нулевыми. Наружу приходит ppl = 1.0000 -- число,
+    # которое в таблице выглядит как результат, а не как сбой. Один такой
+    # прогон в длинной ablation отравляет весь вывод.
+    # Мера строгая и дешёвая: средний NLL по настоящему тексту не может
+    # быть нулём или отрицательным (softmax по 65536 классам не даёт
+    # вероятности ровно 1), а NaN/inf не может быть вовсе.
+    if not math.isfinite(mean_nll) or mean_nll <= 1e-6:
+        raise RuntimeError(
+            f"ppl вырождена (средний NLL = {mean_nll!r}) -- почти наверняка "
+            f"логиты не посчитались. Типичная причина на Apple Silicon: "
+            f"MPS исчерпал память и уронил command buffer, а PyTorch на "
+            f"этом не падает (смотрите stderr на "
+            f"'Insufficient Memory'/'command buffer exited with error'). "
+            f"Уменьшите batch_size или длину последовательности.")
+    return torch.exp(torch.tensor(mean_nll)).item()
 
 
 def model_size_bytes(counts, incols, other_count, bits_map=None, outlier_fracs=None) -> float:

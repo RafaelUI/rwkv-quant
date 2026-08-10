@@ -115,6 +115,51 @@ def test_pack_roundtrip():
     print(f"3. fake == реальная упаковка -> деквант: max|Δ| = {worst}")
 
 
+def test_chunking():
+    """Полосовой путь == цельный, БИТ-В-БИТ.
+
+    Эталон из fixtures снят на 0.1B, где тензоры мельче порога полосы, --
+    то есть он этот путь НЕ покрывает. Проверка нужна отдельная и с
+    принудительно мелкой полосой, иначе гейт зелёный ровно там, где
+    ничего не проверено (закон 17 про синтетику, ставший привычкой).
+    """
+    sd = golden.load_sd()
+    cases = [("real::cmix", sd["blocks.3.ffn.key.weight"].to(torch.bfloat16)),
+             ("real::emb", sd["emb.weight"][:8192].to(torch.bfloat16)),
+             ("synth::odd_rows", torch.randn(1000, 768, dtype=torch.bfloat16))]
+    saved = gw._CHUNK_BYTES
+    worst = 0.0
+    try:
+        for tag, w in cases:
+            gw._CHUNK_BYTES = 1 << 60          # полос нет
+            for bits in (4, 6):
+                for sb_bits in (6, -6):
+                    ref = gw.groupwise_fake_dequant(w, bits, 32, sb=8,
+                                                    sb_bits=sb_bits)
+                    refp = gw.groupwise_fake_dequant(w, bits, 32, sb=8,
+                                                     sb_bits=sb_bits,
+                                                     return_parts=True)
+                    for cb in (1 << 14, 1 << 17):   # 16 КБ и 128 КБ на полосу
+                        gw._CHUNK_BYTES = cb
+                        got = gw.groupwise_fake_dequant(w, bits, 32, sb=8,
+                                                        sb_bits=sb_bits)
+                        d = (ref.float() - got.float()).abs().max().item()
+                        worst = max(worst, d)
+                        assert d == 0.0, f"{tag} bits={bits} sb={sb_bits} cb={cb}: {d}"
+                        gotp = gw.groupwise_fake_dequant(
+                            w, bits, 32, sb=8, sb_bits=sb_bits,
+                            return_parts=True)
+                        assert set(gotp) == set(refp), f"{tag}: набор parts"
+                        for k in refp:
+                            dd = (refp[k].float() - gotp[k].float()).abs().max().item()
+                            worst = max(worst, dd)
+                            assert dd == 0.0, f"{tag} parts[{k}] cb={cb}: {dd}"
+                        gw._CHUNK_BYTES = 1 << 60
+    finally:
+        gw._CHUNK_BYTES = saved
+    print(f"4. полосы == цельный расчёт (и deq, и parts): max|Δ| = {worst}")
+
+
 def explain(target):
     """Пересчитать ОДИН случай и показать его — то, что теряется при
     сверке по хешам, возвращается здесь и ровно для одного тензора."""
@@ -139,5 +184,6 @@ if __name__ == "__main__":
     test_identity()
     ok = test_golden()
     test_pack_roundtrip()
+    test_chunking()
     print(f"своп после: {golden.swapusage()}")
     print("\nГЕЙТ ЗЕЛЁНЫЙ" + ("" if ok else " (эталон пропущен)"))

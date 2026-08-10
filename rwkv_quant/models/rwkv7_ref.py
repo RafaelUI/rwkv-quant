@@ -62,7 +62,16 @@ class RWKV7Ref(nn.Module):
 
         naming = detect_naming(ckpt_path, None)
         if naming == "world":
-            sd = torch.load(ckpt_path, map_location="cpu")
+            # mmap=True -- закон 13. Без него на 2.9B чекпоинт (5.9 ГБ)
+            # целиком читается в АНОНИМНУЮ память, и поверх него тут же
+            # растёт копия на устройстве: пик под 12 ГБ на машине с 16 и
+            # гарантированный своп. С mmap страницы file-backed, ядро
+            # вытесняет их само по мере того, как get() переносит тензоры
+            # на MPS, и записи в своп не происходит вовсе.
+            # writer.quantize_file делает ровно это с 04.08; здесь строка
+            # осталась прежней и обесценивала ту правку для всех замеров,
+            # которые идут через референсную модель.
+            sd = torch.load(ckpt_path, map_location="cpu", mmap=True)
         else:
             from safetensors.torch import load_file
             sd = load_file(f"{ckpt_path}/model.safetensors")

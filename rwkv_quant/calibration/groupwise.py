@@ -131,6 +131,16 @@ def get_ex2(path, key, w):
 
 # ---------------- асимметричная блочная схема (наш sb6) ----------------
 
+# Сколько байт fp32-входа обрабатывать за раз. Функция ниже держит
+# порядка десятка полноразмерных промежуточных тензоров (грид-поиск: q,
+# qm_, wm_, cov, var, s_ls, m_ls, q2, e2, err -- и всё это в fp32), так
+# что пик примерно на порядок больше входа. Замер на форме emb у 2.9B
+# [65536, 2560]: вход 0.34 ГБ в bf16, ПИК 5.67 ГБ, то есть 17x. Двух
+# таких тензоров (emb и head) хватает, чтобы утащить 16-гигабайтную
+# машину в своп, и именно это происходило на композитных прогонах 2.9B.
+_CHUNK_BYTES = int(os.environ.get("RWKVQ_GW_CHUNK_MB", "32")) << 20
+
+
 def groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int,
                            sb: int = 0, sb_bits: int = 6, ex2=None,
                            return_parts: bool = False):
@@ -139,7 +149,56 @@ def groupwise_fake_dequant(w: torch.Tensor, bits: int, gs: int,
     return_parts=True отдаёт сырые компоненты -- из них writer собирает
     реальную упаковку sb6, поэтому дискретизация здесь И в файле одна.
     Оверхед раскладки при gs=32, sb=8, sb_bits=6: 4 + (2*6)/32 + (2*16)/256
-    = 4.5 бит/элемент."""
+    = 4.5 бит/элемент.
+
+    СЧИТАЕТСЯ ПО ПОЛОСАМ СТРОК. Вся математика -- поблочная вдоль ВХОДНОЙ
+    оси и построчная вдоль выходной: ни scale, ни min, ни коды не зависят
+    от других строк (ровно поэтому у sb6 возможна и построчная выборка).
+    Значит разбиение по строкам даёт БИТ-В-БИТ тот же результат, а пик
+    памяти падает с «десяток копий всего тензора» до «десяток копий
+    полосы». Гейт tests/test_groupwise_parity.py сверяет 396 случаев по
+    хешам и ловит любое расхождение.
+    """
+    if w.dim() == 2 and not (ex2 is not None and ex2.dim() > 1):
+        rows_per = max(1, _CHUNK_BYTES // max(1, int(w.shape[1]) * 4))
+        if w.shape[0] > rows_per:
+            return _chunked(w, bits, gs, sb, sb_bits, ex2, return_parts,
+                            rows_per)
+    return _gw_one(w, bits, gs, sb, sb_bits, ex2, return_parts)
+
+
+def _chunked(w, bits, gs, sb, sb_bits, ex2, return_parts, rows_per):
+    if not return_parts:
+        # Выход пишется в ЗАРАНЕЕ выделенный буфер, а не собирается
+        # torch.cat из списка полос: cat держит и список, и результат
+        # одновременно, то есть удваивает самую большую живую аллокацию
+        # ровно там, где мы от неё уходим.
+        out = None
+        for r0 in range(0, w.shape[0], rows_per):
+            part = _gw_one(w[r0:r0 + rows_per], bits, gs, sb, sb_bits, ex2,
+                           False)
+            if out is None:
+                # device обязателен: без него torch.empty кладёт буфер на
+                # CPU, и для модели на MPS результат уезжал бы с
+                # устройства -- молча, ценой копирования туда-обратно на
+                # каждом тензоре каждого батча.
+                out = torch.empty((w.shape[0], part.shape[1]),
+                                  dtype=part.dtype, device=part.device)
+            out[r0:r0 + part.shape[0]] = part
+            del part
+        return out
+    outs = []
+    for r0 in range(0, w.shape[0], rows_per):
+        outs.append(_gw_one(w[r0:r0 + rows_per], bits, gs, sb, sb_bits,
+                            ex2, True))
+    keys = outs[0].keys()
+    return {k: torch.cat([o[k] for o in outs], dim=0) for k in keys}
+
+
+def _gw_one(w: torch.Tensor, bits: int, gs: int,
+            sb: int = 0, sb_bits: int = 6, ex2=None,
+            return_parts: bool = False):
+    """Одна полоса строк. Раньше это была вся функция целиком."""
     w32 = w.float()
     OUT, IN = w32.shape
     pad = (-IN) % gs
