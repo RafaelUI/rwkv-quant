@@ -10,37 +10,69 @@ Reference machine: M4 MacBook Air 16 GB (base chip, fanless).
 
 ## Results
 
-| model | size | ppl | vs bf16 | decode | prefill (T=1024) |
+Quality on a **multilingual held-out corpus** (38 x 512 tokens = 19 456
+predictions; Russian / English / Serbian), scored end-to-end through the
+real quantized kernel. Speed on an M4 MacBook Air 16 GB, fanless.
+
+### 1.5B (`rwkv7-g1h-1.5b`, bf16 ppl 8.1980, 3055 MB)
+
+| build | size | Δppl vs bf16 | en / ru / sr | decode | prefill |
 |---|---|---|---|---|---|
-| bf16 (no quant) | 2953 MB | 11.430 | — | — | — |
-| **`reduction`** (ours — groupwise int6 + AW) | 1255.9 MB (2.35x) | 11.4438 | **+0.12%** | 17.7 ms/tok | 437 tok/s |
-| **`compression`** (ours — groupwise int4/5 + AW) | 970.7 MB (3.04x) | 11.7125 | +2.47% | **14.8 ms/tok** (14.15 fused, 14.02 w/ n-gram speculation) | 545 tok/s |
-| MollySophia MLX int6† (community, native MLX affine) | 1272.0 MB | 11.5507 | +1.06% | 15.10 ms/tok | 591 tok/s |
-| Canonical int6 RTN‡ (naive per-row, no groups/AW) | 1530.5 MB | 13.2726 | +16.12% | 19.44 ms/tok | 630 tok/s |
-| Canonical int4 RTN‡ (naive per-row, no groups/AW) | 767.1 MB | 3798.62 | ~332x (broken) | 13.65 ms/tok | 543 tok/s |
+| **`reduction`** (groupwise int6) | 1255.4 MB (2.43x) | **+0.77%** | +1.04 / +0.55 / +1.00% | 17.7 ms/tok | 437 tok/s |
+| **`compression`** (groupwise int4/5) | 970.2 MB (3.15x) | **+3.63%** | +4.01 / +3.40 / +3.78% | **14.8 ms/tok** | 545 tok/s |
 
-`reduction` beats the community int6 build on quality (9x less degradation)
-at a comparable size. `compression` beats it on every axis: smaller, faster,
-and less than half the quality loss. Against the canonical (naive,
-off-the-shelf-style) baselines: `reduction` is both **smaller and 130x less
-degraded** than canonical int6 despite the same nominal bit depth — canonical
-int6 has no real sub-byte packing in this codebase, so it lands at roughly
-the same disk size as int8 would; naive bit-width choice alone does not buy
-real compression without a dedicated packer. Canonical int4 goes further and
-simply breaks the model (ppl 3798, not a typo). See [Method](#method) for why.
+### 2.9B (`rwkv7-g1h-2.9b`, bf16 ppl 7.1630, 5896 MB)
 
-† MollySophia hasn't published a G1H build, so her row is measured on the G1
-checkpoint, not G1H — size/decode/prefill are apples-to-apples (identical
-architecture, same process, same machine), but part of the ppl gap may
-reflect the different base checkpoint, not only the quantization scheme.
+| build | size | Δppl vs bf16 | en / ru / sr |
+|---|---|---|---|
+| **`reduction`** | 2420.9 MB (2.44x) | **+1.37%** | +0.93 / +1.57 / +1.36% |
+| **`compression`** | 1854.7 MB (3.18x) | **+4.24%** | +5.69 / +3.05 / +5.46% |
 
-‡ Canonical rows were measured on the same reference machine and corpus, but
-as separate single-model runs (`tests/eval_canonical_int4.py` /
-`eval_canonical_int6.py`), not in the same interleaved four-way A/B process
-used for the bf16/MollySophia/`compression`/`reduction` row — see
-[What "ppl" means](#what-ppl-means-and-how-its-measured) for why that
-distinction matters for the timing columns (not for ppl, which doesn't
-depend on thermal state).
+### Against llama.cpp (1.5B, same data split)
+
+Calibration data (our activation stats / their imatrix) and evaluation
+data are split identically for both systems. Absolute ppl is not
+comparable across the two (llama.cpp tokenizes the stream differently),
+so both are reported as Δ% against their own FP baseline.
+
+| | size | Δppl | | | size | pp512 | tg128 |
+|---|---|---|---|---|---|---|---|
+| `reduction` | 1255 MB | +0.77% | | `compression` | 970 MB | 455.7 t/s | **65.6 t/s** |
+| Q6_K + imatrix | 1336 MB | +0.19% | | Q4_K_M + imatrix | 990 MB | **745.2** | 58.2 t/s |
+| `compression` | 970 MB | +3.63% | | `reduction` | 1255 MB | 353.7 t/s | **54.9 t/s** |
+| Q4_K_M + imatrix | 990 MB | +3.44% | | Q6_K + imatrix | 1336 MB | **705.5** | 48.6 t/s |
+
+**Quality is at parity, within methodological error, at both points.**
+Decode is ours by **+12.8% and +12.9%** — the same margin at both sizes,
+so not noise. **Prefill we lose roughly 2x**: llama.cpp runs GEMM through
+BLAS+Metal, we dequantize to fp16 and matmul in MLX. That is the largest
+deliberate gap in the project; for a chat application it matters less
+than decode.
+
+Without imatrix we look like winners (Q6_K +0.41%, Q4_K_M +7.65%) — the
+entire margin was explained by us having activation-aware scale search
+and them not. Reporting only that comparison would have been dishonest.
+
+### Efficiency against memory bandwidth (95.7 GB/s achievable, not the 120 on paper)
+
+| | traffic/token | achieved | share |
+|---|---|---|---|
+| `compression` | 878 MB | 57.6 GB/s | 60% |
+| `reduction` | 1146 MB | 62.9 GB/s | 66% |
+| Q4_K_M | ~905 MB | 52.6 GB/s | 55% |
+
+We are already more bandwidth-efficient than llama.cpp. Closing the
+remaining ~35% to a sane ceiling is heavy micro-tuning, deliberately
+deferred.
+
+> **Earlier versions of this README reported +0.12% and +2.47%.** Those
+> numbers came from an 8-sequence x 128-token slice of short English
+> text — 1016 predictions. That slice understates degradation **sixfold**
+> against the same corpus in full, and tenfold against the multilingual
+> one at 512 tokens. The measurement was real; the corpus was flattering.
+> Measuring on a convenient sample is worse than not measuring, because
+> it produces false confidence. See
+> [What "ppl" means](#what-ppl-means-and-how-its-measured).
 
 ## Method
 
@@ -93,18 +125,38 @@ the quality loss of per-row+SpQR at the same size — see
 teacher forcing — informally, how "surprised" the model is by the correct
 next token on average, exponentiated back into a per-token scale. Lower is
 better; a bf16 model is the reference point, and every other row is reported
-as `+X%` — the relative *increase* in ppl caused by quantization (so `+0.12%`
-means near-lossless, `~332x` means broken).
+as `+X%` — the relative *increase* in ppl caused by quantization (so `+0.8%`
+means near-lossless, `+300x` would mean broken).
 
-All numbers in this README come from the same fixed corpus: an 8-sequence x
-128-token slice (1024 tokens, 1016 scored after the next-token shift) from a
-~91k-character, multi-language, multi-topic text mix (literature, technical
-writing, encyclopedic text, several languages), tokenized once with the
-standard RWKV World tokenizer (byte-level trie, greedy longest match) and
-reused unchanged across every row. **This is not a published benchmark** —
-not WikiText, not LAMBADA — so the absolute ppl numbers are only meaningful
-*relative to each other*, on this exact slice, with this exact tokenizer;
-don't compare them to numbers from other papers or other corpora.
+Quality numbers come from `eval_corpus_multiling.pt`: 38 sequences x 512
+tokens = 19 456 scored predictions, split 20 Russian / 9 English / 9
+Serbian, tokenized once with the standard RWKV World tokenizer
+(byte-level trie, greedy longest match) and reused unchanged across every
+row. Activation statistics for the AW modes are collected on **held-out
+chunks** — never on the text the perplexity is measured on. **This is not
+a published benchmark** — not WikiText, not LAMBADA — so absolute ppl is
+meaningful only *relative to other rows here*, on this exact corpus, with
+this exact tokenizer.
+
+**The corpus decides more than the quantization scheme does.** This is
+the single most expensive lesson in the project, so it is stated plainly
+rather than buried. The same `reduction` build measures:
+
+| corpus | predictions | Δppl |
+|---|---|---|
+| English, 8 x 128 | 1 016 | +0.12% |
+| English, 24 x 128 | 3 048 | +0.74% |
+| multilingual, 128 tok | — | +1.52% |
+| multilingual, 512 tok | 19 456 | **+2.36%** |
+
+Same weights, same kernel, same machine — a 20x spread driven entirely by
+sample size, language mix and context length. Degradation also *grows
+with context*, which a short-context corpus cannot see at all: quantization
+error in the channel-wise modulators inside the recurrence does not spoil
+one prediction, it distorts the state update and accumulates along the
+sequence. (`reduction` is +2.36% here and +0.77% in the table above
+because the table includes the `small=16` fix; see
+[Method](#method) item 4.)
 
 Every row is scored through its own real quantized kernel end-to-end (never
 a dequant-to-dense shortcut) — `reduction`/`compression` via
@@ -119,16 +171,24 @@ row; only the linear projections differ by scheme.
 ```python
 from rwkv_quant import quantize
 
-# near-lossless, 2.35x smaller than bf16 (+0.12% ppl on the 1.5B reference)
+# near-lossless: 2.4x smaller, +0.77% ppl on the 1.5B reference
 quantize("model.pth", "model.rwkvq", preset="reduction")
 
-# 3.04x smaller, moderate cost (+2.47% ppl), fastest decode
+# 3.2x smaller, +3.63% ppl, fastest decode
 quantize("model.pth", "model.rwkvq", preset="compression")
 ```
 
 Both presets use activation-weighted (AW) scale search and expect activation
 statistics at the path set in `QuantConfig.act_stats_path`
 (`tests/collect_act_stats.py` produces them in ~30 s).
+
+**If that file is missing, the AW modes silently degrade to their
+non-weighted variants** — you still get a valid checkpoint of the same
+format, just quantized slightly differently. The default path lives in
+`/tmp` and does not survive a reboot, so the same call can produce two
+different files on two different days. Pass an explicit
+`act_stats_path`, or set it to `None`, if you need the result to be
+reproducible.
 
 Inference (Metal / MLX):
 
@@ -273,17 +333,51 @@ whose outlier tail is trained signal. For dense groups the current presets
 use group-wise asymmetric scales (see [Format](#format)); the earlier
 SpQR-style sparse-outlier path is retained in `calibration/` for study.
 
+## What a bit actually costs on disk
+
+The search in `calibrate()` minimizes file size, so its cost model is
+measured, not derived (`tests/probe_schema_cost.py --check` re-verifies it
+against the writer):
+
+| scheme | bits/weight | | scheme | bits/weight |
+|---|---|---|---|---|
+| sb6 @4 | 4.500 | | asym gw64 @5 | **9.000** |
+| sb6 @5 | 5.500 | | asym gw64 @6 | **9.000** |
+| sb6 @6 | 6.500 | | asym gw64 @8 | **9.000** |
+| per-row RTN @4 | 4.021 | | per-row RTN @6 | **8.021** |
+| | | | per-row RTN @8 | **8.021** |
+
+Two consequences that are easy to miss:
+
+- **The `asym` container does not shrink with bit depth.** Codes sit in
+  `uint8` and scale/min are `fp32` per block of 64, so 5, 6 and 8 bits
+  produce byte-identical files. Bit depth there is a *quality* knob that
+  costs nothing — which also means the presets' current `w_lora=6` is
+  paying for nothing.
+- **Per-row RTN has no sub-byte packing above 4 bits.** `@6` and `@8` are
+  the same size. This is the same trap the "canonical int6" baseline fell
+  into: choosing a lower bit width buys no compression without a packer
+  that can actually store it.
+
 ## Caveats
 
-- Presets are calibrated on one 1.5B checkpoint; recalibrate for other sizes
-  (`small`/`g_lora` stay INT8 in both presets for a reason).
+- Presets are calibrated on `rwkv7-g1h-1.5b` and re-validated on 2.9B;
+  recalibrate for other sizes (`small` stays bf16 and `g_lora` stays INT8
+  in both presets for a reason).
+- **Sensitivity genuinely does not transfer between scales, including in
+  ways that reverse a decision.** Recent example: dropping `emb` from 6 to
+  5 bits is free on 1.5B (−0.07 pp, −16.8 MB) and costs +0.61 pp on 2.9B.
+  Any preset change is validated on both checkpoints before it lands.
 - Kernel dispatch tables are tuned on an M4 base chip; other Apple Silicon
   will work but may prefer different (simdgroups x rows) configs.
-- ppl deltas are measured on a small held-out corpus; treat them as relative
+- ppl deltas are measured on one held-out corpus; treat them as relative
   quality signals, not benchmarks.
 - `scripts/` and `examples/` are placeholders for now — the maintained entry
   points are `rwkv_quant.api` and the benches/gates under `tests/`.
 - CUDA backend is an empty stub; Metal is the only real inference path today.
+- 2.9B calibration runs need ~15.5 GB peak (measured with
+  `/usr/bin/time -l`, `peak memory footprint`; RSS under-reports this by
+  5x on unified memory). One config per process.
 
 ## Repo layout
 
@@ -313,16 +407,28 @@ contribute:
   around 887 MB for this model at acceptable quality — going smaller needs a
   new on-disk format (sparsity- or sub-nibble-based), not just a bit-width
   tuning pass.
-- **`calibrate()` is single-group ablation.** It picks per-group bit width
-  independently and doesn't fully model interaction effects when several
-  groups are quantized simultaneously; a joint search would be more accurate
-  but much more expensive to run.
-- **Presets are calibrated on one 1.5B checkpoint.** Validating (or
-  recalibrating) `reduction`/`compression` on other model sizes — especially
-  much smaller or much larger ones, where sensitivity per group is known to
-  shift (see [Why quantization sensitivity doesn't transfer across
-  scale](#why-quantization-sensitivity-doesnt-transfer-across-scale)) — is
-  open.
+- **`calibrate()` screens groups in isolation.** It picks each group's
+  scheme independently and then refines the composite until it fits the
+  budget, but it does not model interaction effects during the search; a
+  joint search would be more accurate and much more expensive.
+- **Schemes are chosen per *group*, not per *tensor*.** A group is
+  quantized with one scheme, so a group whose tensors have mixed shapes
+  falls back to whatever works for all of them. The LoRA branches are
+  exactly that case: `w2/a2/v2/g2` have `IN = n_embd` and qualify for the
+  cheaper, more accurate groupwise `sb6` layout, while `w1/a1/v1` have
+  `IN = rank` (96, 64) and do not — so the whole group takes the worse
+  scheme. The on-disk format already records the layout **per tensor**
+  (`kind` in the manifest), so this is a writer-dispatch limitation, not a
+  format one.
+- **Non-uniform code books (NF4/AF4-style).** Every scheme here maps codes
+  to a uniform grid. A normally-distributed code book costs the same
+  number of bits and only changes a 16-entry lookup table in the kernel —
+  the classic "free quality" lever, and the one most likely to unlock a
+  lower bit width. Not tried.
+- **Presets are calibrated on 1.5B and validated on 2.9B.** Smaller and
+  much larger checkpoints are open, and sensitivity is known to shift
+  (see [Why quantization sensitivity doesn't transfer across
+  scale](#why-quantization-sensitivity-doesnt-transfer-across-scale)).
 
 ## Author
 
