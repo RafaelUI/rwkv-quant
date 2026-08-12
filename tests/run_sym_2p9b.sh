@@ -22,6 +22,34 @@ export RWKVQ_BATCH="${RWKVQ_BATCH:-1}"
 export RWKVQ_NSEQ="${RWKVQ_NSEQ:-16}"
 # Кавычки вокруг "${@:-...}" склеивали умолчание в ОДИН аргумент, и
 # скрипт честно отвечал "неизвестный режим bf16 asym_sb6_aw sym_aw".
+# Закон 15, вшитый в скрипт, а не оставленный комментарием: статистика
+# обязана принадлежать ТОМУ чекпоинту, который меряем. Иначе _get_ex2
+# вернёт None, sym_aw тихо выродится в sym, и прогон даст не тот ответ,
+# что заказан. Файл с "2p9b" в имени и содержимым 1.5B уже случался.
+"${PY:-$HOME/Develop/tests/venv/bin/python}" - "$RWKVQ_CKPT" "$RWKVQ_ACT_STATS" <<'CHECK' || exit 1
+import sys, torch
+ckpt, stats = sys.argv[1], sys.argv[2]
+import os
+if not os.path.exists(stats):
+    print(f"НЕТ ФАЙЛА СТАТИСТИКИ: {stats}")
+    print("Собрать (RWKVQ_CKPT обязателен, иначе возьмётся 1.5B):")
+    print(f"  RWKVQ_CKPT={ckpt} \\")
+    print("  ~/Develop/tests/venv/bin/python tests/collect_act_stats.py \\")
+    print(f"    ~/Develop/WKV-kvant/act_calib_multiling.pt {stats} ':'")
+    sys.exit(1)
+sd = torch.load(ckpt, map_location="cpu", mmap=True)
+want = int(sd["emb.weight"].shape[1])
+d = torch.load(stats)
+k = [x for x in d if x.endswith("ffn.key.weight")][0]
+got = int(d[k].numel())
+if got != want:
+    print(f"СТАТИСТИКА ОТ ДРУГОЙ МОДЕЛИ: {stats} снята для {got} каналов, "
+          f"а у {os.path.basename(ckpt)} их {want}.\nПересобрать с "
+          f"RWKVQ_CKPT={ckpt}")
+    sys.exit(1)
+print(f"статистика сходится: {got} каналов, {len(d)} тензоров")
+CHECK
+
 if [ $# -eq 0 ]; then
   set -- bf16 asym_sb6_aw sym_aw
 fi
