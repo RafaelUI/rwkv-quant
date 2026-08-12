@@ -302,6 +302,9 @@ def _gw_one(w: torch.Tensor, bits: int, gs: int,
 
 # ---------------- симметричная блочная схема (Q6_K-подобная) ----------------
 
+_SYM_FACTORS = tuple(torch.linspace(0.7, 1.15, 19).tolist())
+
+
 def groupwise_sym_fake_dequant(w: torch.Tensor, bits: int, gs: int = 16,
                                sb: int = 16, ex2=None, search: bool = True,
                                outlier_frac: float = 0.0) -> torch.Tensor:
@@ -348,8 +351,25 @@ def groupwise_sym_fake_dequant(w: torch.Tensor, bits: int, gs: int = 16,
     qmin = -qmax - 1                              # -32
     amax = wg.abs().amax(dim=2, keepdim=True).clamp_min(1e-12)
     base = amax / qmax
-    factors = (torch.linspace(0.7, 1.15, 19) if search
-               else torch.tensor([1.0]))
+    # Python-float, а НЕ torch.linspace. Сетка тензором создаётся на CPU,
+    # и на MPS цикл поиска молча переставал обновлять best_s: схема всегда
+    # оставляла ПЕРВЫЙ множитель 0.7, то есть заведомо худший. Наружу это
+    # выходило как max|w| = 0.7 * истинного и ошибка в 10 раз выше
+    # (1.79e-1 против 1.76e-2 на том же тензоре), а по ppl -- как 208542
+    # против 8.23, что легко принять за «раскладка не годится».
+    # Асимметричная ветка перебирает обычные float и потому работала.
+    # Значения берутся ИЗ linspace, но материализуются в Python-float.
+    # Сетка тензором создаётся на CPU, и на MPS цикл поиска молча
+    # переставал обновлять best_s: схема всегда оставляла ПЕРВЫЙ
+    # множитель 0.7, то есть заведомо худший. Наружу это выходило как
+    # max|w| = 0.7 * истинного и ошибка в 10 раз выше (1.79e-1 против
+    # 1.76e-2 на том же тензоре), а по ppl -- как 208542 против 8.23,
+    # что легко принять за "раскладка не годится". Асимметричная ветка
+    # перебирает обычные float и потому работала.
+    # .tolist() вместо литералов -- чтобы значения совпали с прежними
+    # ДО ПОСЛЕДНЕГО БИТА: написанные от руки 0.725 и т.д. отличаются от
+    # float32-узлов linspace, и гейт эталона это поймал на 8 случаях.
+    factors = (_SYM_FACTORS if search else (1.0,))
     best_s, best_e = base.clone(), None
     for f in factors:
         s = base * f
