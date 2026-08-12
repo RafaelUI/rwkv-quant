@@ -160,6 +160,28 @@ def test_chunking():
     print(f"4. полосы == цельный расчёт (и deq, и parts): max|Δ| = {worst}")
 
 
+def test_ex2_device():
+    """AW-режимы работают, когда статистика на CPU, а веса -- нет.
+
+    Статистика приходит из `torch.load`, то есть всегда с CPU, а
+    калибровка держит модель на MPS. Пока `q()` не умела блочные схемы,
+    AW-путь ходил только из writer'а по CPU-тензорам, и несовпадение
+    устройств было невозможно; после подключения калибровки оно стало
+    возможным и немедленно уронило оба AW-режима. Всплыло только когда
+    act_stats впервые собрали -- до этого `get_ex2` возвращал None, и
+    ветка не исполнялась вовсе. Тест держит её исполняемой.
+    """
+    devs = ["cpu"] + (["mps"] if torch.backends.mps.is_available() else [])
+    for dev in devs:
+        w = torch.randn(512, 768, dtype=torch.bfloat16, device=dev)
+        ex2 = torch.rand(768)                    # ВСЕГДА cpu
+        a = gw.groupwise_fake_dequant(w, 6, 32, sb=8, sb_bits=-6, ex2=ex2)
+        b = gw.groupwise_sym_fake_dequant(w, 6, gs=16, sb=16, ex2=ex2)
+        assert a.device.type == dev and b.device.type == dev, (
+            f"{dev}: выход уехал на {a.device}/{b.device}")
+    print(f"5. AW с ex2 на CPU при весах на {devs}: OK")
+
+
 def explain(target):
     """Пересчитать ОДИН случай и показать его — то, что теряется при
     сверке по хешам, возвращается здесь и ровно для одного тензора."""
@@ -185,5 +207,6 @@ if __name__ == "__main__":
     ok = test_golden()
     test_pack_roundtrip()
     test_chunking()
+    test_ex2_device()
     print(f"своп после: {golden.swapusage()}")
     print("\nГЕЙТ ЗЕЛЁНЫЙ" + ("" if ok else " (эталон пропущен)"))

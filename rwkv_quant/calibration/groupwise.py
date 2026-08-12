@@ -211,7 +211,11 @@ def _gw_one(w: torch.Tensor, bits: int, gs: int,
     if ex2 is not None:
         # AW: вес колонки = E[x^2] её входного канала. Влияет только на
         # критерий поиска и LS, формат/раскладка не меняются.
-        ev = ex2.float().clamp_min(1e-12)
+        # .to(device) обязателен: статистика приходит из torch.load, то
+        # есть с CPU, а веса при калибровке лежат на MPS. Пока q() не
+        # умела блочные схемы, этот путь ходил только из writer'а по
+        # CPU-тензорам, и несовпадение устройств было невозможно.
+        ev = ex2.to(w32.device).float().clamp_min(1e-12)
         evp = torch.nn.functional.pad(ev, (0, pad)) if pad else ev
         evg = evp.view(1, wp.shape[1] // gs, gs)
     else:
@@ -325,7 +329,7 @@ def groupwise_sym_fake_dequant(w: torch.Tensor, bits: int, gs: int = 16,
     NB = wp.shape[1] // gs
     wg = wp.view(OUT, NB, gs)
     if ex2 is not None:
-        ev = ex2.float().clamp_min(1e-12).view(1, -1)
+        ev = ex2.to(w32.device).float().clamp_min(1e-12).view(1, -1)
         evp = torch.nn.functional.pad(ev, (0, pad)) if pad else ev
         evg = evp.view(1, NB, gs)
     else:
