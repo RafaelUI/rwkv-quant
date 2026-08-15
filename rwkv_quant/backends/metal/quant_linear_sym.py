@@ -76,10 +76,25 @@ def _plane_pair(src, shift):
     return "\n".join(out) + "\n"
 
 
-def _hdr(IN, OUT, NSG, RS, NN):
+def _hdr(IN, OUT, NSG, RS, NN, OUT_PER=0):
+    """OUT_PER -- ФЬЮЗ r/k/v одним параметром, а не второй копией кернеля.
+
+    Строки K матриц лежат конкатенированными, и строка сама говорит, какой
+    вход ей нужен: `xi = row0 / OUT_PER`. При OUT_PER = OUT_C это даёт
+    xi = 0 и NK = 1, то есть индексация вырождается в прежнюю `x + n*IN_C`
+    ровно, без единого лишнего сложения в горячем цикле (константы
+    сворачиваются). Отдельного «фьюзнутого кернеля» специально НЕТ:
+    закон 23 -- параллельные реализации расходятся ровно тогда, когда
+    правку вносят в одну из них.
+
+    Что перегенерация исходника не изменила нефьюзнутый путь -- не
+    заявление, а гейт: выходы GEMV заморожены в файл ДО правки и
+    сверяются на равенство (tests/test_sym_fuse_parity.py)."""
     return f"""
-constant uint IN_C  = {IN};
-constant uint OUT_C = {OUT};
+constant uint IN_C   = {IN};
+constant uint OUT_C  = {OUT};
+constant uint OUT_PER= {OUT_PER or OUT};
+constant uint NK     = {OUT // (OUT_PER or OUT)};
 constant uint NB    = {IN // 16};
 constant uint NSB   = {IN // 256};
 constant uint NPAIR = {IN // 32};
@@ -89,18 +104,22 @@ constant uint NN    = {NN};
 """
 
 
-def _get_kernel_sym8(IN, OUT, NSG, RS, NN=1):
+def _get_kernel_sym8(IN, OUT, NSG, RS, NN=1, OUT_PER=0):
     """bits=8: один uint4 = один блок из 16 знаковых кодов."""
-    key = ("sym8", IN, OUT, NSG, RS, NN)
+    key = ("sym8", IN, OUT, NSG, RS, NN, OUT_PER)
     if key in _gw_kernel_cache:
         return _gw_kernel_cache[key]
     assert IN % 256 == 0 and OUT % (NSG * RS) == 0
+    # все RS строк одного sg обязаны смотреть в ОДИН вход: row0 кратен RS,
+    # поэтому достаточно, чтобы OUT_PER делился на RS
+    assert not OUT_PER or OUT_PER % RS == 0, (OUT_PER, RS)
     body = """
     uint tgid = threadgroup_position_in_grid.x;
     uint tix  = thread_position_in_threadgroup.x;
     uint sg   = tix / 32;
     uint lane = tix % 32;
     uint row0 = tgid * (NSG * RS) + sg * RS;
+    uint xi   = row0 / OUT_PER;          // при OUT_PER=OUT_C всегда 0
 
     device const uint*  qu = (device const uint*)qblk;
     device const char*  sc = (device const char*)qs;
@@ -121,7 +140,8 @@ def _get_kernel_sym8(IN, OUT, NSG, RS, NN=1):
             half s = (half)((float)sc[(row0+j)*NB + p]
                             * (float)d[(row0+j)*NSB + p/16]);
             for (uint n = 0; n < NN; n++) {
-                device const float4* x4 = (device const float4*)(x + n*IN_C);
+                device const float4* x4 =
+                    (device const float4*)(x + (n*NK + xi)*IN_C);
                 float dv = dot(x4[p*4+0], q0) + dot(x4[p*4+1], q1)
                          + dot(x4[p*4+2], q2) + dot(x4[p*4+3], q3);
                 acc[n*RS + j] += (float)s * dv;
@@ -136,21 +156,22 @@ def _get_kernel_sym8(IN, OUT, NSG, RS, NN=1):
         }
 """
     kern = mx.fast.metal_kernel(
-        name=f"sym8_s{NSG}r{RS}n{NN}_{IN}_{OUT}",
+        name=f"sym8_s{NSG}r{RS}n{NN}p{OUT_PER or OUT}_{IN}_{OUT}",
         input_names=["x", "qblk", "qs", "d"],
         output_names=["out"],
-        header=_hdr(IN, OUT, NSG, RS, NN), source=body,
+        header=_hdr(IN, OUT, NSG, RS, NN, OUT_PER), source=body,
     )
     _gw_kernel_cache[key] = kern
     return kern
 
 
-def _get_kernel_sym6(IN, OUT, NSG, RS, NN=1):
+def _get_kernel_sym6(IN, OUT, NSG, RS, NN=1, OUT_PER=0):
     """bits=6: пара блоков за итерацию -- 6 uint, как у sb6 при xbits=2."""
-    key = ("sym6", IN, OUT, NSG, RS, NN)
+    key = ("sym6", IN, OUT, NSG, RS, NN, OUT_PER)
     if key in _gw_kernel_cache:
         return _gw_kernel_cache[key]
     assert IN % 256 == 0 and OUT % (NSG * RS) == 0
+    assert not OUT_PER or OUT_PER % RS == 0, (OUT_PER, RS)
     dec = """
             uint4 qw = uint4(qb[0], qb[1], qb[2], qb[3]);
             uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
@@ -170,6 +191,7 @@ def _get_kernel_sym6(IN, OUT, NSG, RS, NN=1):
     uint sg   = tix / 32;
     uint lane = tix % 32;
     uint row0 = tgid * (NSG * RS) + sg * RS;
+    uint xi   = row0 / OUT_PER;          // при OUT_PER=OUT_C всегда 0
 
     device const uint* qu = (device const uint*)qblk;
     device const char* sc = (device const char*)qs;
@@ -194,13 +216,15 @@ def _get_kernel_sym6(IN, OUT, NSG, RS, NN=1):
             half s0 = (half)((float)sc[(row0+j)*NB + 2*p]     * dsb);
             half s1 = (half)((float)sc[(row0+j)*NB + 2*p + 1] * dsb);
             for (uint n = 0; n < NN; n++) {
-                device const float4* x4 = (device const float4*)(x + n*IN_C);
+                uint xn = n*NK + xi;
+                device const float4* x4 =
+                    (device const float4*)(x + xn*IN_C);
                 float dv0 = dot(x4[p*8+0], f0) + dot(x4[p*8+1], f1)
                           + dot(x4[p*8+2], f2) + dot(x4[p*8+3], f3);
                 float dv1 = dot(x4[p*8+4], f4) + dot(x4[p*8+5], f5)
                           + dot(x4[p*8+6], f6) + dot(x4[p*8+7], f7);
                 // снятие сдвига +32: sum((q-32)*x) = sum(q*x) - 32*sum(x)
-                float b0 = xbsum[n*NB + 2*p], b1 = xbsum[n*NB + 2*p + 1];
+                float b0 = xbsum[xn*NB + 2*p], b1 = xbsum[xn*NB + 2*p + 1];
                 acc[n*RS + j] += (float)s0 * (dv0 - 32.0f * b0)
                                + (float)s1 * (dv1 - 32.0f * b1);
             }
@@ -214,10 +238,10 @@ def _get_kernel_sym6(IN, OUT, NSG, RS, NN=1):
         }
 """
     kern = mx.fast.metal_kernel(
-        name=f"sym6_s{NSG}r{RS}n{NN}_{IN}_{OUT}",
+        name=f"sym6_s{NSG}r{RS}n{NN}p{OUT_PER or OUT}_{IN}_{OUT}",
         input_names=["x", "qblk", "qs", "d", "xbsum"],
         output_names=["out"],
-        header=_hdr(IN, OUT, NSG, RS, NN), source=body,
+        header=_hdr(IN, OUT, NSG, RS, NN, OUT_PER), source=body,
     )
     _gw_kernel_cache[key] = kern
     return kern
@@ -300,6 +324,11 @@ class SymQuantLinear:
         out = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
         return out.reshape(*lead_shape, self.out_features)
 
+    def can_fuse_with(self, other):
+        return (self.bits == other.bits
+                and self.in_features == other.in_features
+                and self.out_features == other.out_features)
+
     def _gemv(self, x2d, c):
         NSG, RS = self.cfg_override or _cfg(self.in_features,
                                             self.out_features)
@@ -319,3 +348,61 @@ class SymQuantLinear:
             output_shapes=[(c, self.out_features)],
             output_dtypes=[mx.float32],
         )[0]
+
+
+class SymQuantLinearFused:
+    """Фьюз K однотипных SymQuantLinear (r/k/v proj) в один launch.
+
+    Аналог GwQuantLinearFused для раскладки sym, и он нужен не ради
+    симметрии: `GwQuantLinearFused` требует `GwQuantLinear`, поэтому при
+    proj в sym фьюз просто НЕ СТРОИЛСЯ (не падал -- молча не строился), и
+    документированные −0.8 мс на шаге целевой пресет не получал вовсе.
+
+    Механика ровно та же: строки K матриц конкатенируются (формат
+    нетронут, ни один буфер не пересчитывается), а кернель выбирает вход
+    по номеру строки через OUT_PER. Порядок суммирования внутри строки не
+    меняется, поэтому фьюз обязан быть БИТ-В-БИТ равен K отдельным
+    вызовам, и гейт tests/test_sym_fuse_parity.py требует именно этого.
+
+    Только decode-путь: __call__(xstack [K, IN]) -> [K, out_per].
+    Цена -- копия буферов поверх оригиналов (оригиналы нужны нефьюзнутому
+    пути и GEMM-префиллу), поэтому строится он лениво, вместе со всем
+    остальным фьюзом (см. QuantTMix._build_fused).
+    """
+
+    def __init__(self, lins):
+        l0 = lins[0]
+        assert all(isinstance(l, SymQuantLinear) for l in lins)
+        assert all(l0.can_fuse_with(l) for l in lins)
+        self.K = len(lins)
+        self.bits = l0.bits
+        self.out_per = l0.out_features
+        self.out_features = self.out_per * self.K
+        self.in_features = l0.in_features
+        self.NB, self.NSB = l0.NB, l0.NSB
+        self.qblk = mx.concatenate([l.qblk for l in lins], axis=0)
+        self.qs = mx.concatenate([l.qs for l in lins], axis=0)
+        self.d = mx.concatenate([l.d for l in lins], axis=0)
+        mx.eval(self.qblk, self.qs, self.d)
+        self.cfg_override = None
+
+    def __call__(self, xstack):
+        # xstack: [K, IN] fp32
+        NSG, RS = self.cfg_override or _cfg(self.in_features, self.out_per)
+        n_tg = self.out_features // (NSG * RS)
+        if self.bits == 8:
+            kern = _get_kernel_sym8(self.in_features, self.out_features,
+                                    NSG, RS, 1, self.out_per)
+            inputs = [xstack, self.qblk, self.qs, self.d]
+        else:
+            xbsum = mx.sum(xstack.reshape(self.K, self.NB, 16), axis=2)
+            kern = _get_kernel_sym6(self.in_features, self.out_features,
+                                    NSG, RS, 1, self.out_per)
+            inputs = [xstack, self.qblk, self.qs, self.d, xbsum]
+        out = kern(
+            inputs=inputs,
+            grid=(n_tg * NSG * 32, 1, 1), threadgroup=(NSG * 32, 1, 1),
+            output_shapes=[(1, self.out_features)],
+            output_dtypes=[mx.float32],
+        )[0]
+        return out.reshape(self.K, self.out_per)

@@ -1,14 +1,27 @@
 """Гейт фьюза: (1) relmax логитов fused/unfused на префилле и в decode,
 (2) greedy 48 токенов идентичен, (3) ppl корпуса через ФЬЮЗНУТЫЙ
-forward_stateful == референс кернельного пути (11.7125), (4) A/B-скорость
-compiled fused vs unfused."""
+forward_stateful == референс кернельного пути (11.7125 для champion_v2),
+(4) A/B-скорость compiled fused vs unfused.
+
+Модель задаётся аргументом; умолчание -- /tmp/champion_v2.rwkvq
+(COMPRESSION, sb6). Для sym-пресета гонять
+`tests/test_fuse_parity.py /tmp/reduction_sym_head8.rwkvq`: у него другой
+фьюз (SymQuantLinearFused) и якорь ppl не тот, поэтому утверждение 3 там
+только печатается.
+
+ФЬЮЗ МЕНЯЕТ ПОРЯДОК СУММИРОВАНИЯ и бит-в-бит не обязан -- отсюда relmax,
+а не равенство. Бит-в-бит обязан быть только ФЬЮЗ ПРОЕКЦИЙ, и это
+отдельный гейт (tests/test_sym_fuse_parity.py)."""
 import sys, os, time
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch, numpy as np, mlx.core as mx
 from rwkv_quant.formats.reader import load_raw
 import rwkv_quant.backends.metal.quant_model as qm
 
-model = qm.QuantRWKV7(load_raw("/tmp/champion_v2.rwkvq"))
+MODEL_PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/champion_v2.rwkvq"
+PPL_REF = 11.7125 if MODEL_PATH.endswith("champion_v2.rwkvq") else None
+print(f"модель: {MODEL_PATH}")
+model = qm.QuantRWKV7(load_raw(MODEL_PATH))
 data = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_world.pt"))[:8].numpy()
 prompt = mx.array(data[0:1, :64].astype(np.int32))
 
@@ -56,7 +69,10 @@ for i in range(0, data.shape[0], 4):
     V = logp.shape[-1]
     nll = -logp.reshape(-1, V)[np.arange(target.size), target.reshape(-1)]
     total_nll += nll.sum(); total_tok += nll.size
-print(f"ppl fused stateful path: {float(np.exp(total_nll/total_tok)):.4f}  (референс кернельного пути 11.7125)")
+_ppl = float(np.exp(total_nll / total_tok))
+print(f"ppl fused stateful path: {_ppl:.4f}" +
+      (f"  (референс кернельного пути {PPL_REF})" if PPL_REF else
+       "  (якоря для этой модели нет -- см. докстринг)"))
 
 # --- 4. A/B скорость compiled ---
 def bench(fuse, n=30, warm=8):

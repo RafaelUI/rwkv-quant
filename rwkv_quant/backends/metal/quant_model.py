@@ -40,7 +40,7 @@ from ...formats.reader import _dequantize_one, dequantize_banded  # noqa: F401
 from .quant_linear import QuantLinear  # noqa: F401 (v1, референс)
 from .quant_linear_v2 import QuantLinearV2
 from .quant_linear_gw import GwQuantLinear, GwQuantLinearFused
-from .quant_linear_sym import SymQuantLinear
+from .quant_linear_sym import SymQuantLinear, SymQuantLinearFused
 
 # Реализация Linear-кернеля для всей модели. v2 (threadgroup-редукция,
 # char4-загрузки) численно эквивалентна v1 (tests/test_quant_linear_v2.py)
@@ -380,6 +380,11 @@ class QuantTMix:
                 and len({(l.in_features, l.out_features, l.has_qh)
                          for l in lins}) == 1):
             self._rkv_fused = GwQuantLinearFused(lins)
+        elif (all(isinstance(l, SymQuantLinear) for l in lins)
+                and all(lins[0].can_fuse_with(l) for l in lins)):
+            # раскладка sym: без этой ветки целевой пресет (proj в sym)
+            # фьюза не получал ВООБЩЕ -- он молча не строился
+            self._rkv_fused = SymQuantLinearFused(lins)
         # ленивая постройка обязана оставлять буферы МАТЕРИАЛИЗОВАННЫМИ:
         # иначе mx.compile трассирует шаг вместе с их графом и пересчитывает
         # его на каждый вызов -- ровно то, ради чего существует
