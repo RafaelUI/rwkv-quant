@@ -47,6 +47,10 @@ BOOT = 20000
 
 CONFIGS = [("fp16", None, 0), ("sep@8", "sep", 8), ("sep@6", "sep", 6),
            ("glue@8", "glue", 8)]
+_only = os.environ.get("RWKVQ_LORA_CONFIGS")     # напр. "fp16,sep@8"
+if _only:
+    keep = _only.split(",")
+    CONFIGS = [c for c in CONFIGS if c[0] in keep]
 
 
 def swap_mb():

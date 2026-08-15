@@ -59,7 +59,13 @@ def main():
     built = sum(b.tmix._lq_A is not None for b in model.blocks)
     assert built == len(model.blocks), f"буферы не построены: {built}"
 
-    modes = [None, "sep", "glue"]
+    # RWKVQ_MODES=None,sep -- сузить набор. На 2.9B это не косметика:
+    # буферы склейки живут одновременно с поветочными, а склейка уже
+    # отвергнута замером, и платить за неё памятью на большом чекпоинте
+    # незачем.
+    _m = os.environ.get("RWKVQ_MODES")
+    modes = ([None if m == "None" else m for m in _m.split(",")] if _m
+             else [None, "sep", "glue"])
     fns = {}
     for m in modes:                             # своя трассировка на вариант
         qm.LORA_Q = m
