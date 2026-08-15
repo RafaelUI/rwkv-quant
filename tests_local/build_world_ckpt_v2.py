@@ -1,15 +1,43 @@
+"""Восстановление имён параметров из тренировочного чекпоинта.
+
+В снимке лежит `master_params` -- ПЛОСКИЙ список тензоров в порядке
+named_parameters(), без имён. Имена восстанавливаются генерацией того же
+порядка и СВЕРКОЙ ФОРМ: если хоть одна не совпала, файл не пишется вовсе.
+Это и делает восстановление проверяемым, а не правдоподобным.
+
+Размерности БЕРУТСЯ ИЗ САМОГО ЧЕКПОИНТА, а не зашиты: emb идёт первым,
+из него C и словарь; ранги LoRA -- из форм первого блока. Зашитые
+константы описывали ровно один чекпоинт, и второй такой же
+архитектуры пришлось бы копировать файлом (закон 23: копии расходятся).
+
+    python tests_local/build_world_ckpt_v2.py <src.pt> <out.pth>
+"""
+import sys
+
 import torch
 
-SRC = '/Users/s/Develop/ckpt_step135000.pt'
-OUT = '/tmp/ckpt_step135000_world.pth'
-N_LAYER = 24
-C = 1024
-D_DECAY_LORA = 64
-D_AAA_LORA = 64
-D_MV_LORA = 32
-D_GATE_LORA = 128
-DIM_FFN = C * 4
-H, N = 16, 64
+SRC = sys.argv[1] if len(sys.argv) > 1 else '/Users/s/Develop/ckpt_step135000.pt'
+OUT = sys.argv[2] if len(sys.argv) > 2 else '/tmp/ckpt_step135000_world.pth'
+
+# закон 13: mmap обязателен -- снимок с состоянием оптимизатора весит
+# гигабайты, и грузить его целиком незачем
+_sd_train = torch.load(SRC, map_location='cpu', mmap=True, weights_only=False)
+_mp = _sd_train['master_params']
+_shapes = [tuple(t.shape) for t in _mp]
+
+VOCAB, C = _shapes[0]                       # emb.weight идёт первым
+DIM_FFN = next(a for a, b in _shapes if b == C and a % C == 0 and a > C)
+# ранги лор: формы (C, r) в первом блоке, в порядке w, a, (v), g
+_ranks = [b for a, b in _shapes[:40] if a == C and b < C]
+D_DECAY_LORA, D_AAA_LORA = _ranks[0], _ranks[1]
+D_MV_LORA = _ranks[2] if len(_ranks) > 3 else _ranks[1]
+D_GATE_LORA = _ranks[3] if len(_ranks) > 3 else _ranks[2]
+H, N = next((a, b) for a, b in _shapes if a * b == C and a < b)
+# слоёв -- по числу матриц att.receptance (их ровно одна на блок)
+N_LAYER = sum(1 for sh in _shapes if sh == (C, C)) // 4
+print(f"из чекпоинта: C={C} vocab={VOCAB} n_layer={N_LAYER} ffn={DIM_FFN} "
+      f"ранги w/a/v/g = {D_DECAY_LORA}/{D_AAA_LORA}/{D_MV_LORA}/{D_GATE_LORA} "
+      f"H={H} N={N}")
 
 def expect(name):
     # (name, expected_shape or None if variable/skip strict check)
@@ -70,8 +98,7 @@ for i in range(N_LAYER):
     names += block_names(i)
 names += ["ln_out.weight", "ln_out.bias"]
 
-sd_train = torch.load(SRC, map_location='cpu')
-mp = sd_train['master_params']
+sd_train, mp = _sd_train, _mp
 print("names:", len(names), "master_params:", len(mp))
 assert len(mp) == len(names), f"COUNT MISMATCH {len(mp)} vs {len(names)}"
 
