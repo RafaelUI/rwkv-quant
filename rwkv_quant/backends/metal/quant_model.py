@@ -61,6 +61,31 @@ LORA_Q8 = False  # int8-лоры в decode-фьюзе: НЕ бит-в-бит, в
 # tests/test_fuse_parity.py.
 FUSE_TAIL = True
 
+# ---------------------------------------------------------------------------
+# LoRA-ветки под нативный mx.quantized_matmul. ЭТО НОВОЕ КВАНТОВАНИЕ, А НЕ
+# РЕПАК: в .rwkvq LoRA лежит в asym gw64, но writer квантует её по СЫРЫМ
+# ключам state_dict, до транспозиции, поэтому группы там идут вдоль ВЫХОДНОЙ
+# оси матмула, а quantized_matmul требует их вдоль ВХОДНОЙ. Значит меняются и
+# значения -- ppl-гейт обязателен (tests/eval_lora_quant.py).
+#
+#   LORA_Q = None    -- как было, плотный fp16 (умолчание)
+#            "sep"   -- четыре down (группы вдоль D, gs=64) и четыре up
+#                       (группы вдоль ранга, gs=32) порознь
+#            "glue"  -- четыре down ОДНИМ матмулом [R, 2D] по z = [x, xx]
+#
+# ПРО СКЛЕЙКУ, ЧТОБЫ НЕ ПОВТОРЯТЬ ОШИБКУ ЗАМЕРА. У четырёх down-проекций
+# РАЗНЫЕ входы (xw/xa/xv/xg -- x, слитый с token-shift по своему
+# коэффициенту), поэтому одного матмула [512, D] с общим входом не
+# существует. Точная склейка возможна потому, что x_i = x + xx*c_i:
+# матрица [R, 2D] = [A | A*c] по входу z = [x, xx] даёт ровно те же
+# значения. Цена -- ВДВОЕ больше строк весов; в fp16 это чистый проигрыш
+# (замерено, tests/probe_lora_shapes.py), при шести битах удвоенная
+# склейка (1.70 МБ/слой) дешевле нынешнего fp16 порознь (2.10 МБ/слой).
+LORA_Q = None
+LORA_QBITS = 6
+LORA_GS_DOWN = 64     # группы вдоль D (2048 -- кратно всегда)
+LORA_GS_UP = 32       # группы вдоль ранга (96/64/256 -- 32 делит все три)
+
 _RWKV_METAL_PATH = os.environ.get("RWKV_METAL_PATH", os.path.expanduser("~/Develop/rwkv-metal"))
 if _RWKV_METAL_PATH not in sys.path:
     sys.path.insert(0, _RWKV_METAL_PATH)
@@ -105,6 +130,53 @@ def _dense(qt) -> mx.array:
     dt = (torch.float16 if len(qt.shape) == 2 and min(qt.shape) >= 32
           else torch.float32)
     return mx.array(dequantize_banded(qt, dt).numpy())
+
+
+def reset_lora_q(model):
+    """Сбросить квантованные LoRA-буферы во всех слоях.
+
+    НУЖНО ВЫЗЫВАТЬ ПОСЛЕ СМЕНЫ LORA_QBITS/LORA_GS_*: буферы строятся ЛЕНИВО
+    и кешируются, поэтому смена битности без сброса молча оставляет прежние
+    -- ровно та ловушка, на которой споткнулась аблация фьюза (она не видела
+    закешированных копий весов). Возвращает число сброшенных слоёв, чтобы
+    вызывающий мог убедиться, что сброс вообще что-то нашёл."""
+    n = 0
+    for b in getattr(model, "blocks", []):
+        tm = b.tmix
+        if getattr(tm, "_lora_q_built", False):
+            n += 1
+        tm._lora_q_built = False
+        tm._lq_A = tm._lq_B = tm._lq_glue = None
+    return n
+
+
+def drop_lora_dense(model):
+    """Освободить fp16-копии LoRA после постройки квантованных.
+
+    ЗАЧЕМ ОТДЕЛЬНОЙ ФУНКЦИЕЙ, А НЕ АВТОМАТОМ ВНУТРИ _build_lora_q. Пока
+    обе копии живы, A/B делается подменой ОДНОГО флага в одном процессе
+    (закон 27); автоматическое освобождение сделало бы сравнение
+    невозможным внутри процесса и загнало бы его в сравнение по
+    процессам, где разброс втрое-вчетверо больше (закон 24). Поэтому
+    цена включения (обе копии) и цена внедрения (только квантованная)
+    -- РАЗНЫЕ числа, и меряются они порознь.
+
+    После вызова fp16-путь LoRA недоступен: LORA_Q обязан остаться
+    включённым, иначе _lora упадёт на None вместо тихой подмены."""
+    n = 0
+    for b in getattr(model, "blocks", []):
+        tm = b.tmix
+        if getattr(tm, "_lq_A", None) is None:
+            raise RuntimeError("сначала _build_lora_q: нечего оставлять "
+                               "вместо плотных копий")
+        tm._lora_shapes = [(tuple(A.shape), tuple(B.shape))
+                           for _, A, B, _ in tm._lora_specs()]
+        for attr in ("w_lora_A", "w_lora_B_w", "a_lora_A", "a_lora_B_w",
+                     "v_lora_A", "v_lora_B_w", "g_lora_A", "g_lora_B_w"):
+            setattr(tm, attr, None)
+        tm._dense_lora_dropped = True
+        n += 1
+    return n
 
 
 def _mm(x, w):
@@ -279,12 +351,12 @@ class QuantTMix:
         k = self.k_proj(xk).reshape(B, T, H, S)
         v = self.v_proj(xv).reshape(B, T, H, S)
 
-        g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
+        y_w, y_a, y_v, g = self._lora(xw, xa, xv, xg, x, xx)
 
-        a = mx.sigmoid(_mm(_mm(xa, self.a_lora_A), self.a_lora_B_w) + self.a_lora_B_b)
+        a = mx.sigmoid(y_a + self.a_lora_B_b)
         a = a.reshape(B, T, H, S)
 
-        w = _mm(mx.tanh(_mm(xw, self.w_lora_A)), self.w_lora_B_w) + self.w_lora_B_b
+        w = y_w + self.w_lora_B_b
         w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
         w = w.reshape(B, T, H, S)
 
@@ -294,7 +366,7 @@ class QuantTMix:
         if self.layer_id == 0:
             v_first = v
         else:
-            vv = mx.sigmoid(_mm(_mm(xv, self.v_lora_A), self.v_lora_B_w) + self.v_lora_B_b).reshape(B, T, H, S)
+            vv = mx.sigmoid(y_v + self.v_lora_B_b).reshape(B, T, H, S)
             v = v + (v_first - v) * vv
 
         out = wkv7_train(r, w, k, v, -kk, kk * a)
@@ -306,6 +378,126 @@ class QuantTMix:
         out = (out + bonus).reshape(B, T, D)
 
         return self.o_proj(out * g), v_first
+
+    def _lora_specs(self):
+        """(имя, A [r, D], B [D, r], коэффициент лерпа) по веткам в порядке
+        w, a, v, g. Слой 0 без v -- ветка просто отсутствует в списке, а не
+        зануляется: паддинг тут ничего не экономит, а лишние строки читаются
+        как настоящие."""
+        out = [("w", self.w_lora_A, self.w_lora_B_w, self.x_w),
+               ("a", self.a_lora_A, self.a_lora_B_w, self.x_a)]
+        if self.v_lora_A is not None:
+            out.append(("v", self.v_lora_A, self.v_lora_B_w, self.x_v))
+        out.append(("g", self.g_lora_A, self.g_lora_B_w, self.x_g))
+        return out
+
+    def _build_lora_q(self):
+        """Квантованные буферы LoRA. Строятся ЛЕНИВО и живут ПОВЕРХ fp16-копий:
+        нефьюзнутый путь, префилл и гейты продолжают читать плотные веса, то
+        есть A/B делается подменой флага в ОДНОМ процессе (закон 27).
+
+        Не строим и молча остаёмся на fp16, если формы не кратны группе
+        (toy-модели): mx.quantize требует кратности, а тихо сменить группу
+        значило бы померить не ту раскладку."""
+        if getattr(self, "_lora_q_built", False):
+            return
+        self._lora_q_built = True
+        self._lq_A = self._lq_B = self._lq_glue = None
+        specs = self._lora_specs()
+        D = int(self.x_r.shape[-1])
+        bits = LORA_QBITS
+        if D % LORA_GS_DOWN or D % LORA_GS_UP:
+            return
+        if any(int(A.shape[0]) % LORA_GS_UP for _, A, _, _ in specs):
+            return
+        ev = []
+        self._lq_names = [nm for nm, _, _, _ in specs]
+        self._lq_A = [mx.quantize(A, group_size=LORA_GS_DOWN, bits=bits)
+                      for _, A, _, _ in specs]
+        self._lq_B = [mx.quantize(B, group_size=LORA_GS_UP, bits=bits)
+                      for _, _, B, _ in specs]
+        # склейка: [R, 2D] = [A | A*c], группы не пересекают границу D
+        # (gs=64 делит D), поэтому левая половина квантуется ровно так же,
+        # как в варианте "sep".
+        rows = []
+        for _, A, _, c in specs:
+            c32 = c.reshape(1, -1).astype(mx.float32)
+            rows.append(mx.concatenate(
+                [A.astype(mx.float32), A.astype(mx.float32) * c32], axis=1))
+        glue = mx.contiguous(mx.concatenate(rows, axis=0))          # [R, 2D]
+        self._lq_glue = mx.quantize(glue, group_size=LORA_GS_DOWN, bits=bits)
+        self._lq_slices = []
+        off = 0
+        for _, A, _, _ in specs:
+            r = int(A.shape[0])
+            self._lq_slices.append((off, off + r))
+            off += r
+        del glue, rows
+        for tr in (self._lq_A + self._lq_B + [self._lq_glue]):
+            ev.extend(tr)
+        mx.eval(ev)
+
+    def _lora(self, xw, xa, xv, xg, x, xx):
+        """Все LoRA-ветки слоя: возвращает (y_w, y_a, y_v, y_g) -- выходы
+        ПОСЛЕ up-проекции, ДО прибавления bias и внешних нелинейностей.
+        y_v = None на нулевом слое.
+
+        Одна реализация на все три пути (prefill __call__, forward_stateful,
+        фьюзнутый): иначе правка, внесённая в один, в остальные не переезжает
+        сама собой -- закон 23."""
+        mode = LORA_Q
+        if mode and not getattr(self, "_lora_q_built", False):
+            self._build_lora_q()
+        if mode and self._lq_A is None:
+            mode = None                      # формы не кратны -- честный fp16
+        if mode:
+            names = self._lq_names
+            specs = [(nm, None, None, None) for nm in names]
+        else:
+            if getattr(self, "_dense_lora_dropped", False):
+                raise RuntimeError(
+                    "плотные копии LoRA освобождены (drop_lora_dense), "
+                    "а LORA_Q выключен -- fp16-пути больше нет")
+            specs = self._lora_specs()
+            names = [s[0] for s in specs]
+
+        xin = {"w": xw, "a": xa, "v": xv, "g": xg}
+        if mode == "glue":
+            z = mx.concatenate([x, xx], axis=-1).astype(mx.float16)
+            wq, sc, bi = self._lq_glue
+            hcat = mx.quantized_matmul(z, wq, scales=sc, biases=bi,
+                                       transpose=True, group_size=LORA_GS_DOWN,
+                                       bits=LORA_QBITS).astype(x.dtype)
+            hs = [hcat[..., a:b] for a, b in self._lq_slices]
+        elif mode == "sep":
+            hs = []
+            for i, nm in enumerate(names):
+                wq, sc, bi = self._lq_A[i]
+                hs.append(mx.quantized_matmul(
+                    xin[nm].astype(mx.float16), wq, scales=sc, biases=bi,
+                    transpose=True, group_size=LORA_GS_DOWN,
+                    bits=LORA_QBITS).astype(x.dtype))
+        else:
+            hs = [_mm(xin[nm], A) for nm, A, _, _ in specs]
+
+        ys = []
+        for i, nm in enumerate(names):
+            B = None if mode else specs[i][2]
+            h = hs[i]
+            if nm == "w":
+                h = mx.tanh(h)
+            elif nm == "g":
+                h = mx.sigmoid(h)
+            if mode:
+                wq, sc, bi = self._lq_B[i]
+                ys.append(mx.quantized_matmul(
+                    h.astype(mx.float16), wq, scales=sc, biases=bi,
+                    transpose=True, group_size=LORA_GS_UP,
+                    bits=LORA_QBITS).astype(h.dtype))
+            else:
+                ys.append(_mm(h, B))
+        out = dict(zip(names, ys))
+        return out["w"], out["a"], out.get("v"), out["g"]
 
     def _build_fused(self):
         """Буферы decode-фьюза: [6,1,1,D]-стек лерп-коэффициентов и
@@ -330,6 +522,26 @@ class QuantTMix:
         D = self.x_r.shape[-1]
         self.xcoef = mx.stack([self.x_r, self.x_w, self.x_k,
                                self.x_v, self.x_a, self.x_g])  # [6,1,1,D]
+        self._wav_idx = mx.array([1, 4, 3])          # (xw, xa, xv) из xs
+        self._tanh_mask = mx.array([True, False, False]).reshape(3, 1, 1)
+        self._wav_built = False
+        self.wav_At = self.wav_Bt = None
+        self._wav_At_q = self._wav_Bt_q = None
+        self._g_A_q = self._g_B_q = None
+        self._build_rkv_fused()
+        mx.eval([self.xcoef])
+
+    def _build_wav(self):
+        """Батченые стеки LoRA (w,a,v) фьюзнутого пути. ОТДЕЛЬНО ОТ
+        _build_fused и лениво, потому что при LORA_Q они не читаются
+        вовсе: там ветки идут порознь квантованными, и паддинг ранга
+        v (64 -> 96), ради которого батч и заводился, стал бы чистым
+        убытком. На 1.5B это 57.8 МБ, которые иначе лежали бы мёртвым
+        грузом ровно так же, как до 15.08 лежал дубль r/k/v."""
+        if self._wav_built:
+            return
+        self._wav_built = True
+        D = self.x_r.shape[-1]
         rs = [self.w_lora_A.shape[0], self.a_lora_A.shape[0]]
         if self.v_lora_A is not None:
             rs.append(self.v_lora_A.shape[0])
@@ -373,8 +585,13 @@ class QuantTMix:
             self._wav_Bt_q = mx.quantize(self.wav_Bt, group_size=64, bits=8)
             self._g_A_q = mx.quantize(self.g_lora_A, group_size=64, bits=8)
             self._g_B_q = mx.quantize(self.g_lora_B_w, group_size=64, bits=8)
-        self._tanh_mask = mx.array([True, False, False]).reshape(3, 1, 1)
+        ev = [self.wav_At, self.wav_Bt]
+        ev += [a for pair in (self._wav_At_q, self._wav_Bt_q,
+                              self._g_A_q, self._g_B_q) if pair is not None
+               for a in pair]
+        mx.eval(ev)
 
+    def _build_rkv_fused(self):
         # r/k/v одним launch'ем: конкатенация квантованных строк трёх
         # GwQuantLinear (формат нетронут, математика строки бит-в-бит).
         # Цена: копия буферов (~8.7MB/слой) поверх оригиналов -- оригиналы
@@ -391,15 +608,6 @@ class QuantTMix:
             # раскладка sym: без этой ветки целевой пресет (proj в sym)
             # фьюза не получал ВООБЩЕ -- он молча не строился
             self._rkv_fused = SymQuantLinearFused(lins)
-        # ленивая постройка обязана оставлять буферы МАТЕРИАЛИЗОВАННЫМИ:
-        # иначе mx.compile трассирует шаг вместе с их графом и пересчитывает
-        # его на каждый вызов -- ровно то, ради чего существует
-        # QuantRWKV7._materialize (см. его докстринг).
-        ev = [self.xcoef, self.wav_At, self.wav_Bt]
-        ev += [a for pair in (self._wav_At_q, self._wav_Bt_q,
-                              self._g_A_q, self._g_B_q) if pair is not None
-               for a in pair]
-        mx.eval(ev)
 
     def _forward_stateful_fused(self, x, v_first, state):
         """forward_stateful с decode-фьюзом: 6 лерпов -> 1 broadcast-оп;
@@ -427,34 +635,46 @@ class QuantTMix:
             k = self.k_proj(xk).reshape(B, T, H, S)
             v = self.v_proj(xv).reshape(B, T, H, S)
 
-        if LORA_Q8 and self._g_A_q is not None:
-            gq = mx.quantized_matmul(
-                xg.astype(mx.float16), *self._g_A_q, transpose=True,
-                group_size=64, bits=8)
-            g = mx.quantized_matmul(
-                mx.sigmoid(gq), *self._g_B_q, transpose=True,
-                group_size=64, bits=8).astype(x.dtype)
+        if LORA_Q:
+            # квантованные ветки: батченые стеки wav не строятся и не
+            # читаются -- у них паддинг ранга v (64 -> 96), то есть лишние
+            # байты, ради которых батч и заводился, когда байты были fp16
+            y_w, y_a, y_v, g = self._lora(xs[1], xs[4], xs[3], xs[5], x, xx)
+            y_w = y_w.reshape(B, T, D)
+            y_a = y_a.reshape(B, T, D)
+            y_v = None if y_v is None else y_v.reshape(B, T, D)
         else:
-            g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
+            if LORA_Q8 and self._g_A_q is not None:
+                gq = mx.quantized_matmul(
+                    xg.astype(mx.float16), *self._g_A_q, transpose=True,
+                    group_size=64, bits=8)
+                g = mx.quantized_matmul(
+                    mx.sigmoid(gq), *self._g_B_q, transpose=True,
+                    group_size=64, bits=8).astype(x.dtype)
+            else:
+                g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
 
-        z = mx.take(xs, self._wav_idx, axis=0).reshape(3, B * T, D)
-        if LORA_Q8 and self._wav_At_q is not None:
-            h = mx.quantized_matmul(
-                z.astype(mx.float16), *self._wav_At_q, transpose=True,
-                group_size=64, bits=8).astype(x.dtype)
-            h = mx.where(self._tanh_mask, mx.tanh(h), h)
-            y = mx.quantized_matmul(
-                h.astype(mx.float16), *self._wav_Bt_q, transpose=False,
-                group_size=64, bits=8).astype(x.dtype)  # [3,BT,D]
-        else:
-            h = (z.astype(self.wav_At.dtype) @ self.wav_At).astype(x.dtype)
-            h = mx.where(self._tanh_mask, mx.tanh(h), h)
-            y = (h.astype(self.wav_Bt.dtype) @ self.wav_Bt).astype(x.dtype)  # [3,BT,D]
+            self._build_wav()
+            z = mx.take(xs, self._wav_idx, axis=0).reshape(3, B * T, D)
+            if LORA_Q8 and self._wav_At_q is not None:
+                h = mx.quantized_matmul(
+                    z.astype(mx.float16), *self._wav_At_q, transpose=True,
+                    group_size=64, bits=8).astype(x.dtype)
+                h = mx.where(self._tanh_mask, mx.tanh(h), h)
+                y = mx.quantized_matmul(
+                    h.astype(mx.float16), *self._wav_Bt_q, transpose=False,
+                    group_size=64, bits=8).astype(x.dtype)  # [3,BT,D]
+            else:
+                h = (z.astype(self.wav_At.dtype) @ self.wav_At).astype(x.dtype)
+                h = mx.where(self._tanh_mask, mx.tanh(h), h)
+                y = (h.astype(self.wav_Bt.dtype) @ self.wav_Bt).astype(x.dtype)  # [3,BT,D]
+            y_w, y_a = y[0].reshape(B, T, D), y[1].reshape(B, T, D)
+            y_v = y[2].reshape(B, T, D)
 
-        w = y[0].reshape(B, T, D) + self.w_lora_B_b
+        w = y_w + self.w_lora_B_b
         w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
         w = w.reshape(B, T, H, S)
-        a = mx.sigmoid(y[1].reshape(B, T, D) + self.a_lora_B_b).reshape(B, T, H, S)
+        a = mx.sigmoid(y_a + self.a_lora_B_b).reshape(B, T, H, S)
 
         kk = l2_norm(k * self.k_k)
         k = k * (1.0 + (a - 1.0) * self.k_a)
@@ -462,7 +682,7 @@ class QuantTMix:
         if self.layer_id == 0:
             v_first = v
         else:
-            vv = mx.sigmoid(y[2].reshape(B, T, D) + self.v_lora_B_b).reshape(B, T, H, S)
+            vv = mx.sigmoid(y_v + self.v_lora_B_b).reshape(B, T, H, S)
             v = v + (v_first - v) * vv
 
         out, new_wkv_state = _wkv_stateful(r, w, k, v, -kk, kk * a, wkv_state)
@@ -509,12 +729,12 @@ class QuantTMix:
         k = self.k_proj(xk).reshape(B, T, H, S)
         v = self.v_proj(xv).reshape(B, T, H, S)
 
-        g = (_mm(mx.sigmoid(_mm(xg, self.g_lora_A)), self.g_lora_B_w))
+        y_w, y_a, y_v, g = self._lora(xw, xa, xv, xg, x, xx)
 
-        a = mx.sigmoid(_mm(_mm(xa, self.a_lora_A), self.a_lora_B_w) + self.a_lora_B_b)
+        a = mx.sigmoid(y_a + self.a_lora_B_b)
         a = a.reshape(B, T, H, S)
 
-        w = _mm(mx.tanh(_mm(xw, self.w_lora_A)), self.w_lora_B_w) + self.w_lora_B_b
+        w = y_w + self.w_lora_B_b
         w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
         w = w.reshape(B, T, H, S)
 
@@ -524,7 +744,7 @@ class QuantTMix:
         if self.layer_id == 0:
             v_first = v
         else:
-            vv = mx.sigmoid(_mm(_mm(xv, self.v_lora_A), self.v_lora_B_w) + self.v_lora_B_b).reshape(B, T, H, S)
+            vv = mx.sigmoid(y_v + self.v_lora_B_b).reshape(B, T, H, S)
             v = v + (v_first - v) * vv
 
         out, new_wkv_state = _wkv_stateful(r, w, k, v, -kk, kk * a, wkv_state)
