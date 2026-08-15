@@ -247,7 +247,100 @@ def _get_kernel_sym6(IN, OUT, NSG, RS, NN=1, OUT_PER=0):
     return kern
 
 
+def _dq_writes(regs, scale, base):
+    """Восемь uchar4 -> 32 half по колонкам пары. ПОРЯДОК КОЛОНОК берётся
+    из того же списка _PAIR_REGS, что и в GEMV: там он задан порядком
+    dot-произведений с x4[p*8+i], здесь -- смещением записи. Перепутать
+    его местами -- получить правдоподобный, но неверный результат
+    (величины те же, порядок не тот), и ловится это только сверкой с
+    эталоном."""
+    out = []
+    for i, reg in enumerate(regs):
+        for c, comp in enumerate("xyzw"):
+            out.append(f"    o[{base + i*4 + c}] = ((half)(float){reg}.{comp}"
+                       f" - (half)32.0h) * {scale};")
+    return "\n".join(out)
+
+
+def _get_kernel_dequant(IN, OUT, bits):
+    """sym -> плотный fp16 ОДНИМ кернелем.
+
+    ЗАЧЕМ. Прежний `_dequant_w` собирал коды ЦЕПОЧКОЙ MLX-операций
+    (concatenate нибблов, две битплоскости через сдвиги), и каждая
+    рождала полноразмерный промежуточный тензор. Замер
+    (`tests/probe_gemm_split.py`, N=512): деквант 10.68 мс против 7.46 у
+    самого матмула, то есть **60% времени GEMM-префилла уходило не на
+    матмул**. По байтам ему положено прочитать 13.8 МБ и записать 33.6,
+    то есть около 0.5 мс на полосе 90 ГБ/с -- цепочка шла со скоростью
+    4.4 ГБ/с.
+
+    Отсюда же следует, ЧЕГО делать НЕ надо: наш матмул по готовой
+    плотной матрице (7.46 мс) идёт почти вровень с нативным квантованным
+    (6.78), значит тайловый GEMM с декодом в threadgroup-памяти -- это
+    следующий шаг, а не первый.
+
+    Декодер нибблов и мульт-трюк битплоскостей взяты из GEMV-кернеля
+    ТЕМ ЖЕ генератором строк (`dec`, `_plane_pair`), а не переписаны:
+    закон 23 -- параллельные реализации расходятся ровно тогда, когда
+    правку вносят в одну из них."""
+    key = ("symdq", IN, OUT, bits)
+    if key in _gw_kernel_cache:
+        return _gw_kernel_cache[key]
+    assert IN % 256 == 0
+    hdr = _hdr(IN, OUT, 1, 1, 1)
+    if bits == 8:
+        assert (OUT * (IN // 16)) % 256 == 0
+        body = """
+    uint gid = thread_position_in_grid.x;
+    uint row = gid / NB;
+    uint b   = gid % NB;
+    device const char* c  = (device const char*)qblk;
+    device const char* sc = (device const char*)qs;
+    half s = (half)((float)sc[row*NB + b] * (float)d[row*NSB + b/16]);
+    device half* o = out + row*IN_C + b*16;
+    for (uint i = 0; i < 16; i++)
+        o[i] = (half)((float)c[row*IN_C + b*16 + i]) * s;
+"""
+        names = ["qblk", "qs", "d"]
+    else:
+        assert (OUT * (IN // 32)) % 256 == 0
+        dec = """
+    uint4 qw = uint4(qb[0], qb[1], qb[2], qb[3]);
+    uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
+    uchar4 l1 = as_type<uchar4>(qw.y & 0x0F0F0F0Fu);
+    uchar4 h0 = as_type<uchar4>((qw.x >> 4) & 0x0F0F0F0Fu);
+    uchar4 h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
+    uchar4 l2 = as_type<uchar4>(qw.z & 0x0F0F0F0Fu);
+    uchar4 l3 = as_type<uchar4>(qw.w & 0x0F0F0F0Fu);
+    uchar4 h2 = as_type<uchar4>((qw.z >> 4) & 0x0F0F0F0Fu);
+    uchar4 h3 = as_type<uchar4>((qw.w >> 4) & 0x0F0F0F0Fu);
+    uint hb = qb[4];
+""" + _plane_pair("hb", 4) + "    uint hb2 = qb[5];\n" + _plane_pair("hb2", 5)
+        body = """
+    uint gid = thread_position_in_grid.x;
+    uint row = gid / NPAIR;
+    uint p   = gid % NPAIR;
+    device const uint* qb = ((device const uint*)qblk) + gid*6;
+""" + dec + """
+    device const char* sc = (device const char*)qs;
+    float dsb = (float)d[row*NSB + p/8];
+    half s0 = (half)((float)sc[row*NB + 2*p]     * dsb);
+    half s1 = (half)((float)sc[row*NB + 2*p + 1] * dsb);
+    device half* o = out + row*IN_C + p*32;
+""" + _dq_writes(_PAIR_REGS[:4], "s0", 0) + "\n" \
+   + _dq_writes(_PAIR_REGS[4:], "s1", 16) + "\n"
+        names = ["qblk", "qs", "d"]
+    kern = mx.fast.metal_kernel(
+        name=f"symdq{bits}_{IN}_{OUT}", input_names=names,
+        output_names=["out"], header=hdr, source=body)
+    _gw_kernel_cache[key] = kern
+    return kern
+
+
 NB_MAX = 4          # столько колонок за один launch в N-батчевом режиме
+
+# вернуть прежний деквант цепочкой MLX-операций (эталон гейта и «до» в A/B)
+DEQUANT_REF = __import__("os").environ.get("RWKVQ_DQ_REF") == "1"
 
 
 class SymQuantLinear:
@@ -287,8 +380,26 @@ class SymQuantLinear:
         self.cfg_override = None
 
     def _dequant_w(self):
-        """sym -> fp16 [OUT, IN] на GPU для GEMM-префилла (транзиент на
-        вызов, как у sb6)."""
+        """sym -> fp16 [OUT, IN] ОДНИМ кернелем (транзиент на вызов).
+
+        Прежняя реализация цепочкой MLX-операций осталась как
+        `_dequant_w_ref` и служит эталоном гейта
+        (tests/test_sym_dequant_kernel.py, требуется РАВЕНСТВО)."""
+        if DEQUANT_REF:      # A/B подменой ОДНОГО флага в одном процессе
+            return self._dequant_w_ref()
+        OUT, IN = self.out_features, self.in_features
+        kern = _get_kernel_dequant(IN, OUT, self.bits)
+        n = OUT * (IN // (16 if self.bits == 8 else 32))
+        return kern(
+            inputs=[self.qblk, self.qs, self.d],
+            grid=(n, 1, 1), threadgroup=(256, 1, 1),
+            output_shapes=[(OUT, IN)], output_dtypes=[mx.float16],
+        )[0]
+
+    def _dequant_w_ref(self):
+        """ЭТАЛОН: тот же деквант цепочкой MLX-операций. Медленный (60%
+        времени GEMM-префилла), но не зависящий от кернеля -- ради этого
+        и оставлен."""
         OUT, IN = self.out_features, self.in_features
         if self.bits == 8:
             q = mx.view(self.qblk, mx.int8).reshape(OUT, IN).astype(mx.float16)
