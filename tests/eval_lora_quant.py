@@ -115,6 +115,10 @@ def main():
     print(f"модель собрана, своп {sw0:.0f} -> {swap_mb():.0f} МБ", flush=True)
 
     res = {}
+    # ppl считается ПРЕФИЛЛОМ, а по умолчанию квантованные ветки живут
+    # только в декоде -- без этой строки замер сравнивал бы fp16 с fp16 и
+    # показал бы «квантование ничего не стоит» на пустом месте (закон 15).
+    qm.LORA_Q_DECODE_ONLY = False
     for name, mode, bits in CONFIGS:
         qm.LORA_Q, qm.LORA_QBITS = mode, bits
         qm.reset_lora_q(model)
