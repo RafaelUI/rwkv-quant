@@ -1,0 +1,321 @@
+"""GEMV для раскладки sym (Q6_K-подобная, gw_mode="sym"): блок 16 БЕЗ min,
+scale блока = int8-код против одной fp16 d на суперблок из 16 блоков.
+
+ЭТО УРЕЗАННЫЙ КЕРНЕЛЬ-3, А НЕ НОВАЯ МЕХАНИКА. Отличий от sb6 ровно три,
+и каждое УБИРАЕТ работу, а не добавляет:
+
+  1. Нет min. У sb6 на блок приходится `acc += s*dv + m*xbsum`; здесь
+     второго слагаемого нет вовсе, а с ним -- и второго квального
+     скаляра (qm), и второй fp16-константы суперблока (dm).
+  2. Масштаб блока -- ЦЕЛЫЙ байт (int8) против шести бит у sb6, поэтому
+     распаковывать его не нужно: `s = (half)((float)qs[b] * (float)d[b/16])`
+     читается одним лоадом. Формула та же, что в writer/reader/codec,
+     включая half-роундтрип -- иначе кернель разойдётся с файлом на
+     последнем бите мантиссы.
+  3. Блок вдвое уже (16 против 32), а суперблок тот же (256 весов).
+
+РАСКЛАДКА ЗАГРУЗЧИКА (интерлив, как K3 у sb6): коды и масштабы одного
+блока лежат рядом, чтобы блок брался тремя потоками, а не пятью.
+Дисковая раскладка при этом не меняется -- см. formats/codec.py, диск
+канонический, интерлив есть деталь загрузчика.
+
+  bits=8: qblk[row, b] = 16 байт ЗНАКОВЫХ кодов = ровно один uint4-лоад
+          на блок. Никаких битплоскостей: код -- это байт.
+  bits=6: коды лежат СО СДВИГОМ +32 в 0..63 (ровно как в block_q6_K у
+          llama.cpp), младший ниббл -- блок-локальным split'ом, биты 4 и
+          5 -- двумя битплоскостями. На ПАРУ блоков (32 колонки) это
+          16 байт нибблов + 4 байта qh + 4 байта qh2 = 6 uint, то есть
+          БАЙТ-В-БАЙТ тот же гранул, что у sb6 при xbits=2. Поэтому
+          декодер нибблов и мульт-трюк битплоскостей взяты оттуда без
+          единой правки -- меняется только порядок регистров (см. ниже)
+          и то, что на пару приходится ДВА масштаба вместо одного.
+
+ПОЧЕМУ ПОРЯДОК РЕГИСТРОВ ДРУГОЙ. Split блок-локальный, а блок теперь 16:
+байт j пары несёт колонку j (lo) и j+8 (hi) СВОЕГО блока. Значит
+колонки идут l0,l1,h0,h1 (первый блок) и l2,l3,h2,h3 (второй), тогда как
+при gs=32 они шли l0..l3,h0..h3. Перепутать это местами -- получить
+правдоподобный, но неверный результат: величины те же, порядок не тот.
+
+СДВИГ +32 СНИМАЕТСЯ В КЕРНЕЛЕ, а не в памяти: sum((q-32)*x) =
+sum(q*x) - 32*sum(x), и вторая сумма -- это тот же xbsum, что уже
+считается для sb6, только на блок 16. При bits=8 сдвига нет, и xbsum не
+нужен вовсе -- кернель его не читает.
+"""
+import numpy as np
+import mlx.core as mx
+
+from .quant_linear_gw import GEMM_MIN_BATCH_NB, _gw_kernel_cache
+
+# порядок регистров -> порядок колонок внутри ПАРЫ блоков по 16
+_PAIR_REGS = ["l0", "l1", "h0", "h1", "l2", "l3", "h2", "h3"]
+
+
+def _cfg(IN, OUT):
+    """(NSG, RS). Свипов под sym ещё не было -- взята конфигурация,
+    которую свип protoD выбрал для тех же форм у sb6; после первого
+    A/B-замера её надо пересмотреть, а не считать оптимальной."""
+    if OUT >= 32768:
+        return (4, 4)
+    return (4, 4)
+
+
+def _plane_pair(src, shift):
+    """Мульт-трюк битплоскости (ниббл -> 4 байта одним умножением),
+    порядок регистров -- парный."""
+    out = []
+    for i, reg in enumerate(_PAIR_REGS):
+        sh = i * 4
+        if sh == 0:
+            nib = f"({src} & 0xFu)"
+        elif sh == 28:
+            nib = f"({src} >> 28)"
+        else:
+            nib = f"(({src} >> {sh}) & 0xFu)"
+        out.append(f"            {reg} |= as_type<uchar4>(({nib} * 0x00204081u"
+                   f" & 0x01010101u) << {shift});")
+    return "\n".join(out) + "\n"
+
+
+def _hdr(IN, OUT, NSG, RS, NN):
+    return f"""
+constant uint IN_C  = {IN};
+constant uint OUT_C = {OUT};
+constant uint NB    = {IN // 16};
+constant uint NSB   = {IN // 256};
+constant uint NPAIR = {IN // 32};
+constant uint NSG   = {NSG};
+constant uint RS    = {RS};
+constant uint NN    = {NN};
+"""
+
+
+def _get_kernel_sym8(IN, OUT, NSG, RS, NN=1):
+    """bits=8: один uint4 = один блок из 16 знаковых кодов."""
+    key = ("sym8", IN, OUT, NSG, RS, NN)
+    if key in _gw_kernel_cache:
+        return _gw_kernel_cache[key]
+    assert IN % 256 == 0 and OUT % (NSG * RS) == 0
+    body = """
+    uint tgid = threadgroup_position_in_grid.x;
+    uint tix  = thread_position_in_threadgroup.x;
+    uint sg   = tix / 32;
+    uint lane = tix % 32;
+    uint row0 = tgid * (NSG * RS) + sg * RS;
+
+    device const uint*  qu = (device const uint*)qblk;
+    device const char*  sc = (device const char*)qs;
+    float acc[RS * NN];
+    for (uint j = 0; j < RS * NN; j++) acc[j] = 0.0f;
+
+    for (uint p = lane; p < NB; p += 32) {          // p -- блок из 16 колонок
+        for (uint j = 0; j < RS; j++) {
+            device const uint* qb = qu + ((row0+j)*NB + p) * 4;
+            char4 c0 = as_type<char4>(qb[0]);
+            char4 c1 = as_type<char4>(qb[1]);
+            char4 c2 = as_type<char4>(qb[2]);
+            char4 c3 = as_type<char4>(qb[3]);
+            float4 q0 = float4(c0.x, c0.y, c0.z, c0.w);
+            float4 q1 = float4(c1.x, c1.y, c1.z, c1.w);
+            float4 q2 = float4(c2.x, c2.y, c2.z, c2.w);
+            float4 q3 = float4(c3.x, c3.y, c3.z, c3.w);
+            half s = (half)((float)sc[(row0+j)*NB + p]
+                            * (float)d[(row0+j)*NSB + p/16]);
+            for (uint n = 0; n < NN; n++) {
+                device const float4* x4 = (device const float4*)(x + n*IN_C);
+                float dv = dot(x4[p*4+0], q0) + dot(x4[p*4+1], q1)
+                         + dot(x4[p*4+2], q2) + dot(x4[p*4+3], q3);
+                acc[n*RS + j] += (float)s * dv;
+            }
+        }
+    }
+    for (uint n = 0; n < NN; n++)
+        for (uint j = 0; j < RS; j++) {
+            float a = simd_sum(acc[n*RS + j]);
+            if (lane == 0)
+                out[n*OUT_C + row0 + j] = a;
+        }
+"""
+    kern = mx.fast.metal_kernel(
+        name=f"sym8_s{NSG}r{RS}n{NN}_{IN}_{OUT}",
+        input_names=["x", "qblk", "qs", "d"],
+        output_names=["out"],
+        header=_hdr(IN, OUT, NSG, RS, NN), source=body,
+    )
+    _gw_kernel_cache[key] = kern
+    return kern
+
+
+def _get_kernel_sym6(IN, OUT, NSG, RS, NN=1):
+    """bits=6: пара блоков за итерацию -- 6 uint, как у sb6 при xbits=2."""
+    key = ("sym6", IN, OUT, NSG, RS, NN)
+    if key in _gw_kernel_cache:
+        return _gw_kernel_cache[key]
+    assert IN % 256 == 0 and OUT % (NSG * RS) == 0
+    dec = """
+            uint4 qw = uint4(qb[0], qb[1], qb[2], qb[3]);
+            uchar4 l0 = as_type<uchar4>(qw.x & 0x0F0F0F0Fu);
+            uchar4 l1 = as_type<uchar4>(qw.y & 0x0F0F0F0Fu);
+            uchar4 h0 = as_type<uchar4>((qw.x >> 4) & 0x0F0F0F0Fu);
+            uchar4 h1 = as_type<uchar4>((qw.y >> 4) & 0x0F0F0F0Fu);
+            uchar4 l2 = as_type<uchar4>(qw.z & 0x0F0F0F0Fu);
+            uchar4 l3 = as_type<uchar4>(qw.w & 0x0F0F0F0Fu);
+            uchar4 h2 = as_type<uchar4>((qw.z >> 4) & 0x0F0F0F0Fu);
+            uchar4 h3 = as_type<uchar4>((qw.w >> 4) & 0x0F0F0F0Fu);
+            uint hb = qb[4];
+""" + _plane_pair("hb", 4) + "            uint hb2 = qb[5];\n" \
+        + _plane_pair("hb2", 5)
+    body = """
+    uint tgid = threadgroup_position_in_grid.x;
+    uint tix  = thread_position_in_threadgroup.x;
+    uint sg   = tix / 32;
+    uint lane = tix % 32;
+    uint row0 = tgid * (NSG * RS) + sg * RS;
+
+    device const uint* qu = (device const uint*)qblk;
+    device const char* sc = (device const char*)qs;
+    float acc[RS * NN];
+    for (uint j = 0; j < RS * NN; j++) acc[j] = 0.0f;
+
+    for (uint p = lane; p < NPAIR; p += 32) {   // p -- ПАРА блоков = 32 кол.
+        for (uint j = 0; j < RS; j++) {
+            device const uint* qb = qu + ((row0+j)*NPAIR + p) * 6;
+""" + dec + """
+            float4 f0 = float4(l0.x, l0.y, l0.z, l0.w);
+            float4 f1 = float4(l1.x, l1.y, l1.z, l1.w);
+            float4 f2 = float4(h0.x, h0.y, h0.z, h0.w);
+            float4 f3 = float4(h1.x, h1.y, h1.z, h1.w);
+            float4 f4 = float4(l2.x, l2.y, l2.z, l2.w);
+            float4 f5 = float4(l3.x, l3.y, l3.z, l3.w);
+            float4 f6 = float4(h2.x, h2.y, h2.z, h2.w);
+            float4 f7 = float4(h3.x, h3.y, h3.z, h3.w);
+            // суперблок из 16 блоков = 8 пар, поэтому оба масштаба пары
+            // всегда живут под ОДНОЙ d -- лоад один
+            float dsb = (float)d[(row0+j)*NSB + p/8];
+            half s0 = (half)((float)sc[(row0+j)*NB + 2*p]     * dsb);
+            half s1 = (half)((float)sc[(row0+j)*NB + 2*p + 1] * dsb);
+            for (uint n = 0; n < NN; n++) {
+                device const float4* x4 = (device const float4*)(x + n*IN_C);
+                float dv0 = dot(x4[p*8+0], f0) + dot(x4[p*8+1], f1)
+                          + dot(x4[p*8+2], f2) + dot(x4[p*8+3], f3);
+                float dv1 = dot(x4[p*8+4], f4) + dot(x4[p*8+5], f5)
+                          + dot(x4[p*8+6], f6) + dot(x4[p*8+7], f7);
+                // снятие сдвига +32: sum((q-32)*x) = sum(q*x) - 32*sum(x)
+                float b0 = xbsum[n*NB + 2*p], b1 = xbsum[n*NB + 2*p + 1];
+                acc[n*RS + j] += (float)s0 * (dv0 - 32.0f * b0)
+                               + (float)s1 * (dv1 - 32.0f * b1);
+            }
+        }
+    }
+    for (uint n = 0; n < NN; n++)
+        for (uint j = 0; j < RS; j++) {
+            float a = simd_sum(acc[n*RS + j]);
+            if (lane == 0)
+                out[n*OUT_C + row0 + j] = a;
+        }
+"""
+    kern = mx.fast.metal_kernel(
+        name=f"sym6_s{NSG}r{RS}n{NN}_{IN}_{OUT}",
+        input_names=["x", "qblk", "qs", "d", "xbsum"],
+        output_names=["out"],
+        header=_hdr(IN, OUT, NSG, RS, NN), source=body,
+    )
+    _gw_kernel_cache[key] = kern
+    return kern
+
+
+NB_MAX = 4          # столько колонок за один launch в N-батчевом режиме
+
+
+class SymQuantLinear:
+    """Linear по sym-тензору. Интерфейс как у GwQuantLinear:
+    __call__(x [..., IN]) -> [..., OUT] fp32.
+
+    Хранит ТОЛЬКО интерлив (память 1x): qblk + qs + d. Дисковые буферы
+    после конструктора не нужны никому.
+    """
+
+    def __init__(self, qt):
+        assert qt.gw_mode == "sym", qt.gw_mode
+        assert qt.gw_gs == 16 and qt.gw_sb == 16, (qt.gw_gs, qt.gw_sb)
+        OUT, IN = qt.shape
+        assert IN % 256 == 0, f"sym-кернель: IN={IN} не кратен суперблоку 256"
+        self.out_features, self.in_features = OUT, IN
+        self.bits = qt.bits
+        self.NB, self.NSB = IN // 16, IN // 256
+
+        if qt.bits == 8:
+            assert qt.codes is not None, "sym@8 хранит коды в codes"
+            blk = qt.codes.numpy().view(np.uint8)          # знаковые байты
+        else:
+            assert qt.bits == 6 and qt.codes_packed is not None
+            NP = IN // 32
+            blk = np.concatenate(
+                [qt.codes_packed.numpy().reshape(OUT, NP, 16),
+                 qt.gw_qh.numpy().reshape(OUT, NP, 4),
+                 qt.gw_qh2.numpy().reshape(OUT, NP, 4)], axis=2)
+        self.qblk = mx.array(np.ascontiguousarray(blk.reshape(OUT, -1)))
+        self.qs = mx.array(np.ascontiguousarray(
+            qt.gw_qs.numpy().view(np.uint8)))               # int8 as bytes
+        self.d = mx.array(np.ascontiguousarray(qt.gw_d.numpy()))
+        mx.eval(self.qblk, self.qs, self.d)
+        # (NSG, RS) в обход _cfg -- только для свипа. В проде None: конфиг
+        # обязан выбираться таблицей, а не тем, что кто-то забыл сбросить.
+        self.cfg_override = None
+
+    def _dequant_w(self):
+        """sym -> fp16 [OUT, IN] на GPU для GEMM-префилла (транзиент на
+        вызов, как у sb6)."""
+        OUT, IN = self.out_features, self.in_features
+        if self.bits == 8:
+            q = mx.view(self.qblk, mx.int8).reshape(OUT, IN).astype(mx.float16)
+        else:
+            NP = IN // 32
+            blk = self.qblk.reshape(OUT, NP, 24)
+            cb = blk[:, :, :16].reshape(OUT, NP * 2, 8)     # блок-локальные
+            q = mx.concatenate([cb & 0xF, cb >> 4], axis=2).astype(mx.float16)
+            sh = mx.arange(8, dtype=mx.uint8)
+            for off, w in ((16, 16.0), (20, 32.0)):
+                bits = (blk[:, :, off:off + 4].reshape(OUT, -1)[..., None]
+                        >> sh) & 1
+                q = q + bits.reshape(OUT, NP * 2, 16).astype(mx.float16) * w
+            q = q - 32.0
+        s = (mx.view(self.qs, mx.int8).astype(mx.float32).reshape(OUT, self.NSB, 16)
+             * self.d.astype(mx.float32)[..., None]).astype(mx.float16)
+        return (q.reshape(OUT, self.NB, 16) * s.reshape(OUT, self.NB, 1)) \
+            .reshape(OUT, IN)
+
+    def __call__(self, x):
+        lead_shape = x.shape[:-1]
+        x2d = x.reshape(-1, self.in_features).astype(mx.float32)
+        N = x2d.shape[0]
+        if N >= GEMM_MIN_BATCH_NB:
+            w = self._dequant_w()
+            out = mx.matmul(x2d.astype(mx.float16), w.T).astype(mx.float32)
+            return out.reshape(*lead_shape, self.out_features)
+        outs, i = [], 0
+        while i < N:
+            c = min(NB_MAX, N - i)
+            outs.append(self._gemv(x2d[i:i + c], c))
+            i += c
+        out = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
+        return out.reshape(*lead_shape, self.out_features)
+
+    def _gemv(self, x2d, c):
+        NSG, RS = self.cfg_override or _cfg(self.in_features,
+                                            self.out_features)
+        n_tg = self.out_features // (NSG * RS)
+        if self.bits == 8:
+            kern = _get_kernel_sym8(self.in_features, self.out_features,
+                                    NSG, RS, c)
+            inputs = [x2d, self.qblk, self.qs, self.d]
+        else:
+            xbsum = mx.sum(x2d.reshape(c, self.NB, 16), axis=2)
+            kern = _get_kernel_sym6(self.in_features, self.out_features,
+                                    NSG, RS, c)
+            inputs = [x2d, self.qblk, self.qs, self.d, xbsum]
+        return kern(
+            inputs=inputs,
+            grid=(n_tg * NSG * 32, 1, 1), threadgroup=(NSG * 32, 1, 1),
+            output_shapes=[(c, self.out_features)],
+            output_dtypes=[mx.float32],
+        )[0]

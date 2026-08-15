@@ -262,7 +262,13 @@ class RWKV7Ref(nn.Module):
         _rec(f"blocks.{layer_id}.ffn.value.weight", k)
         return k @ q(c.value, "cmix", cfg, f"blocks.{layer_id}.ffn.value.weight").T
 
-    def forward(self, idx: torch.Tensor, cfg: QuantConfig = None):
+    def forward(self, idx: torch.Tensor, cfg: QuantConfig = None, trace=None):
+        """trace -- список, в который дописывается residual stream ПОСЛЕ
+        каждого блока (fp32 на CPU). Нужен для локализации ошибки по
+        стеку: у RWKV ошибка входит в состояние и копится по длине, и
+        сравнение ‖Δx_l(t)‖ у bf16 и квантованной модели показывает, В
+        КАКОМ слое она рождается и растёт ли она с t. На математику не
+        влияет: только .detach() уже посчитанного x."""
         if cfg is None:
             cfg = QuantConfig()
         x = F.embedding(idx, q(self.emb_weight, "emb", cfg, "emb.weight"))
@@ -275,6 +281,8 @@ class RWKV7Ref(nn.Module):
             x = x + att
             xn2 = F.layer_norm(x.float(), (self.n_embd,), self.ln2_w[i].float(), self.ln2_b[i].float()).to(x.dtype)
             x = x + self._cmix_forward(xn2, self.cmix[i], cfg, i)
+            if trace is not None:
+                trace.append(x.detach().float().cpu())
 
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln_out_w.float(), self.ln_out_b.float()).to(x.dtype)
         _rec("head.weight", x)

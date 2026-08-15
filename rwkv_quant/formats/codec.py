@@ -31,6 +31,11 @@ MLX-потребителе). Промежуточная арифметика у�
          0-2 битплоскости старших битов, 6-битные qs/qm против fp16
          супер-scale d/dm. Это КАНОНИЧЕСКАЯ дисковая раскладка, не
          K3-интерлив -- интерлив есть деталь загрузчика Metal-бэкенда.
+  sym    Q6_K: блок gs=16 БЕЗ min, суперблок sb=16; масштаб блока --
+         один int8-код против одной fp16 d на суперблок. Коды ЗНАКОВЫЕ.
+         При bits=8 они лежат байтами в `codes`; при bits=6 -- со сдвигом
+         +32 в 0..63 и той же упаковкой, что у sb6 (ниббл + две
+         битплоскости), чтобы кернель переиспользовался как есть.
   asym   блок gs, fp32 scale/min на блок, контейнер uint8/int8. LoRA.
   rtn    per-row scale, коды int8 либо biased split-нибблы при bits<=4,
          опциональная разреженная SpQR-надстройка поверх.
@@ -49,7 +54,7 @@ __all__ = [
     "pack6", "unpack6",
     "pack_nib_block", "unpack_nib_block",
     "pack_bitplane", "unpack_bitplane",
-    "dequant_sb6", "dequant_asym", "dequant_rtn",
+    "dequant_sb6", "dequant_sym", "dequant_asym", "dequant_rtn",
     "MAGIC_ZIP", "FORMAT", "FORMAT_VERSION",
     "bf16_to_f32", "read_safetensors", "open_rwkvq", "dequant_key",
     "is_transposed", "is_raw_lora_world",
@@ -209,6 +214,47 @@ def dequant_sb6(codes_packed, qsqm, d, dm, *, shape, gs, sb, nb=None,
                        np.float32(1e-8))
     mn = (qm * dm).astype(np.float16).astype(np.float32)
     return q * np.repeat(scale, gs, axis=1) + np.repeat(mn, gs, axis=1)
+
+
+def dequant_sym(qs, d, *, shape, gs, sb, nb=None, codes=None,
+                codes_packed=None, qh=None, qh2=None) -> np.ndarray:
+    """Каноническая sym-раскладка (Q6_K) -> float32 [OUT, IN].
+
+    codes         int8   [OUT, IN]     знаковые коды, bits=8
+    codes_packed  uint8  [OUT, IN/2]   младший ниббл кода СО СДВИГОМ +32
+    qh, qh2       uint8  [OUT, IN/8]   битплоскости бита 4 и бита 5
+    qs            int8   [OUT, NB]     код масштаба блока
+    d             fp16   [OUT, NSB]    супер-scale блока масштабов
+
+    Формула ровно как в кернеле: s = half(qs * d), w = q * s. Min нет --
+    в этом вся разница с sb6, и потому нет ни второй пары квальных
+    скаляров, ни клипа scale снизу: у вырожденного блока s = 0 и коды
+    тоже нули, то есть w = 0 без деления на что бы то ни было.
+
+    Различение битности -- ПО ПРИСУТСТВИЮ БУФЕРОВ, а не по полю bits:
+    `codes` есть только при восьми битах, `codes_packed` -- только при
+    шести. Так читателю не нужно доверять числу в манифесте, чтобы
+    правильно разобрать байты."""
+    OUT, IN = shape
+    NB = IN // gs if nb is None else nb
+    assert qs.shape[-1] == NB, (
+        f"gw_qs покрывает {qs.shape[-1]} блоков, ожидалось {NB}")
+    assert np.asarray(d).shape[-1] * sb == NB, (
+        f"gw_d покрывает {np.asarray(d).shape[-1] * sb} блоков, "
+        f"ожидалось {NB}")
+    if codes is not None:
+        q = codes.astype(np.float32)
+    else:
+        q = unpack_nib_block(codes_packed, gs).astype(np.int16)
+        if qh is not None:
+            q = q + unpack_bitplane(qh, IN).astype(np.int16) * 16
+        if qh2 is not None:
+            q = q + unpack_bitplane(qh2, IN).astype(np.int16) * 32
+        q = (q - 32).astype(np.float32)          # снятие сдвига упаковки
+    dd = np.repeat(np.asarray(d, dtype=np.float32), sb, axis=1)   # [OUT, NB]
+    scale = (np.asarray(qs, dtype=np.float32) * dd).astype(np.float16) \
+        .astype(np.float32)
+    return q * np.repeat(scale, gs, axis=1)
 
 
 def dequant_asym(codes, gw_scale, gw_min, *, shape, gs, nb=None) -> np.ndarray:
@@ -506,6 +552,12 @@ def dequant_key(manifest, arrays, key) -> np.ndarray:
                            buf("gw_d"), buf("gw_dm"),
                            shape=shape, gs=m["gw_gs"], sb=m["gw_sb"],
                            nb=m.get("n_blocks"),
+                           qh=buf("gw_qh"), qh2=buf("gw_qh2"))
+    if kind == "sym":
+        return dequant_sym(buf("gw_qs"), buf("gw_d"),
+                           shape=shape, gs=m["gw_gs"], sb=m["gw_sb"],
+                           nb=m.get("n_blocks"), codes=buf("codes"),
+                           codes_packed=buf("codes_packed"),
                            qh=buf("gw_qh"), qh2=buf("gw_qh2"))
     if kind == "asym":
         return dequant_asym(buf("codes"), buf("gw_scale"), buf("gw_min"),

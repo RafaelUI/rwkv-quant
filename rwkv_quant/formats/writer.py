@@ -39,6 +39,7 @@ TENSOR_FIELDS = (
     "codes", "codes_packed", "scale", "dense",
     "outlier_indices", "outlier_values",
     "gw_d", "gw_dm", "gw_qsqm", "gw_qh", "gw_qh2", "gw_scale", "gw_min",
+    "gw_qs",
 )
 
 
@@ -73,6 +74,8 @@ def _n_blocks(qt) -> int:
         return int(qt.gw_qsqm.shape[-2]) * int(qt.gw_sb)
     if qt.gw_mode == "asym":
         return int(qt.gw_scale.shape[-1])
+    if qt.gw_mode == "sym":
+        return int(qt.gw_qs.shape[-1])
     return 0
 
 
@@ -266,6 +269,60 @@ def _make_qt_gw_sb6(key, group, bits, w, gs, ex2, search=True):
         gw_d=parts["d"], gw_dm=parts["dm"], gw_qsqm=qsqm, gw_qh=qh, gw_qh2=qh2)
 
 
+def _make_qt_gw_sym(key, group, bits, w, gs, sb, ex2, search=True):
+    """Реальная упаковка Q6_K-подобной СИММЕТРИЧНОЙ раскладки ("sym").
+
+    Раскладка ПРОЩЕ, чем sb6: min нет вовсе, а масштаб блока -- один
+    int8-код против одной fp16-константы d на суперблок, вместо пары
+    6-битных qs/qm против пары fp16 d/dm. Бюджет bits + 8/gs + 16/(gs*sb):
+      bits=8, gs=16, sb=16 -> 8.5625 бит/вес (против 9.000 у asym gw64)
+      bits=6, gs=16, sb=16 -> 6.5625 (ровно Q6_K)
+
+    ПОЧЕМУ ВОСЕМЬ БИТ СДЕЛАНЫ ПЕРВЫМИ. При bits=8 коды -- просто знаковые
+    байты, никаких битплоскостей: `q` кладётся в поле `codes` как есть.
+    Это ровно та точка, которая нужна head (см. NEXT_SESSION: рычаг для
+    head -- битность, а не раскладка; sym_aw@8 убирает деградацию целиком
+    и стоит на 9 МБ дешевле равного по качеству asym gw64@8).
+
+    ПРИ ШЕСТИ БИТАХ переиспользуется механика sb6 БЕЗ единой новой
+    операции: коды сдвигаются на +32 в диапазон 0..63, младший ниббл
+    едет блок-локальным split'ом (pack_nib_block), два старших бита --
+    двумя независимыми битплоскостями (pack_bitplane), как qh/qh2 у sb6.
+    Кернель-3 умеет ровно это, xbits 0/1/2. Сдвиг не бесплатен по смыслу,
+    но и не стоит ничего в кернеле: w = (qu - 32) * s = qu * s + m при
+    m = -32 * s, то есть та же аффинная форма, что у sb6, только `m`
+    вычисляется из `s`, а не читается из файла.
+
+    ЧЕГО ЗДЕСЬ НЕТ. outlier_frac: fake-путь умеет оставлять выбросы в
+    исходном виде, а раскладка их хранить не умеет -- писать файл, тихо
+    отличающийся от измеренного, нельзя (закон 15), поэтому падаем.
+    Паддинг: суперблок обязан быть целым, и все группы, где sym
+    применяется (cmix/proj/emb/head), имеют IN кратным 256 на всех трёх
+    чекпоинтах. Ragged-случай (`att.w1` [2048, 96]) -- это LoRA, у неё
+    своя раскладка asym.
+    """
+    assert bits in (6, 8), f"{key}: sym пока на 6 и 8 бит, не {bits}"
+    OUT, IN = w.shape
+    assert IN % (gs * sb) == 0, (
+        f"{key}: IN={IN} не кратно суперблоку gs*sb={gs * sb}")
+    parts = _groupwise_sym_fake_dequant(w, bits, gs=gs, sb=sb, ex2=ex2,
+                                        search=search, return_parts=True)
+    q = parts["q"]                                    # int8, ЗНАКОВЫЕ коды
+    codes = codes_packed = qh = qh2 = None
+    if bits == 8:
+        codes = q.contiguous()
+    else:
+        u = (q.to(torch.int16) + 32).to(torch.uint8)  # 0..63
+        qh = pack_bitplane(((u >> 4) & 1).to(torch.uint8).contiguous())
+        qh2 = pack_bitplane(((u >> 5) & 1).to(torch.uint8).contiguous())
+        codes_packed = pack_nib_block((u & 0xF).contiguous(), gs)
+    return QuantizedTensor(
+        key=key, group=group, bits=bits, shape=(OUT, IN),
+        codes=codes, codes_packed=codes_packed,
+        gw_mode="sym", gw_gs=gs, gw_sb=sb,
+        gw_qs=parts["qs"], gw_d=parts["d"], gw_qh=qh, gw_qh2=qh2)
+
+
 def _make_qt_gw_asym(key, group, bits, w, gs):
     """Реальный gw-asym (LoRA @6, gw64): int8-контейнер кодов (unsigned
     0..2^bits-1) + fp32 scale/min на блок -- бит-в-бит с fake-путём asym
@@ -337,6 +394,16 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
                 ex2 = _get_ex2(sp, key, w) if mode == "asym_sb6_aw" else None
                 return _make_qt_gw_sb6(key, group, bits, w, gs, ex2,
                                        search=(mode != "asym_sb6"))
+            if mode.startswith("sym") and bits in (6, 8):
+                if cfg.outlier_fracs.get(group, 0.0):
+                    raise NotImplementedError(
+                        f"real_gw: sym не хранит выбросы, а у группы "
+                        f"{group} outlier_frac="
+                        f"{cfg.outlier_fracs[group]} ({key})")
+                ex2 = _get_ex2(sp, key, w) if mode.endswith("_aw") else None
+                return _make_qt_gw_sym(key, group, bits, w, gs,
+                                       max(1, 256 // gs), ex2,
+                                       search=not mode.endswith("_plain"))
             if mode == "asym" and 5 <= bits <= 8:
                 return _make_qt_gw_asym(key, group, bits, w, gs)
             raise NotImplementedError(f"real_gw: mode={mode} bits={bits} ({key})")

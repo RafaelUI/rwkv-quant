@@ -34,11 +34,13 @@ import os
 import sys
 
 import mlx.core as mx
+import torch
 
-from ...formats.reader import _dequantize_one
+from ...formats.reader import _dequantize_one, dequantize_banded  # noqa: F401
 from .quant_linear import QuantLinear  # noqa: F401 (v1, референс)
 from .quant_linear_v2 import QuantLinearV2
 from .quant_linear_gw import GwQuantLinear, GwQuantLinearFused
+from .quant_linear_sym import SymQuantLinear
 
 # Реализация Linear-кернеля для всей модели. v2 (threadgroup-редукция,
 # char4-загрузки) численно эквивалентна v1 (tests/test_quant_linear_v2.py)
@@ -77,12 +79,26 @@ def _dense(qt) -> mx.array:
     2D-матрицы (LoRA A/B и т.п.) храним в fp16: они memory-bound при
     decode, половина трафика; активации остаются fp32, MLX промоутит
     при матмуле. 1D-параметры (LN/GroupNorm, token-shift миксы) — fp32:
-    трафик нулевой, точность нормализаций важнее."""
-    t = _dequantize_one(qt) if qt.bits < 16 else qt.dense
-    arr = mx.array(t.float().numpy())
-    if arr.ndim == 2 and min(arr.shape) >= 32:
-        return arr.astype(mx.float16)
-    return arr
+    трафик нулевой, точность нормализаций важнее.
+
+    КАСТ ДЕЛАЕТСЯ ДО ВЫХОДА В MLX, И ЭТО НЕ КОСМЕТИКА. Прежний путь
+    bf16 -> .float() -> .numpy() -> mx.array -> .astype(fp16) держал
+    ЧЕТЫРЕ представления одного тензора и возвращал ЛЕНИВУЮ ноду каста,
+    поэтому fp32-копия жила до _materialize(), то есть до конца сборки
+    ВСЕЙ модели. На emb 1.5B [65536, 2048] это 1.3 ГБ живых копий ради
+    268 МБ результата. Каст в torch даёт ТОТ ЖЕ БИТ (bf16 -> fp32 точен,
+    округление ровно одно, fp32 -> fp16) и снимает и копии, и ленивую ноду.
+    Деквант при этом идёт полосами строк (reader.dequantize_banded),
+    иначе транзиент самого декванта остаётся крупнее результата.
+    Гейт равенства обоих путей -- tests/test_dense_load_parity.py."""
+    if qt.bits >= 16:
+        t = qt.dense
+        dt = (torch.float16 if t.ndim == 2 and min(t.shape) >= 32
+              else torch.float32)
+        return mx.array(t.to(dt).numpy())
+    dt = (torch.float16 if len(qt.shape) == 2 and min(qt.shape) >= 32
+          else torch.float32)
+    return mx.array(dequantize_banded(qt, dt).numpy())
 
 
 def _mm(x, w):
@@ -132,16 +148,18 @@ def _linear(qt):
     if qt.bits < 16:
         if getattr(qt, "gw_mode", "") == "sb6":
             return GwQuantLinear(qt)          # формат v2 (gw32 + sb6)
+        if getattr(qt, "gw_mode", "") == "sym":
+            return SymQuantLinear(qt)         # Q6_K-раскладка, 6 и 8 бит
         if getattr(qt, "gw_mode", "") == "mlx_affine":
             return MlxAffineQuantLinear(qt)   # чужой чекпоинт, нативный MLX affine
         if getattr(qt, "gw_mode", "") == "asym":
             # gw-asym (LoRA-класс) как linear не встречается: LoRA идут
             # dense-путём (_dense -> _dequantize_one). Если попали сюда --
             # деквант в fp16-dense, чтобы не падать.
-            from ...formats.reader import _dequantize_one
-            return _DenseLinear(mx.array(_dequantize_one(qt).float().numpy()).astype(mx.float16))
+            return _DenseLinear(mx.array(
+                dequantize_banded(qt, torch.float16).numpy()))
         return _QUANT_LINEAR_IMPL(qt)
-    return _DenseLinear(mx.array(qt.dense.float().numpy()).astype(mx.float16))
+    return _DenseLinear(mx.array(qt.dense.to(torch.float16).numpy()))
 
 
 def l2_norm(x):
@@ -184,6 +202,11 @@ def _token_shift_stateful(x, prev):
 
 
 class QuantTMix:
+    # на классе, а не только в __init__: подклассы вроде MollyTMix
+    # (tests/eval_molly_real.py) собирают поля сами и зовут _build_fused
+    # напрямую, минуя наш конструктор
+    _fused_built = False
+
     def __init__(self, tensors, layer_prefix, naming, layer_id, n_head, head_size):
         self.H, self.S = n_head, head_size
         self.layer_id = layer_id
@@ -232,7 +255,7 @@ class QuantTMix:
             self.r_proj = _linear(g(ap+"receptance.weight")); self.k_proj = _linear(g(ap+"key.weight"))
             self.v_proj = _linear(g(ap+"value.weight")); self.o_proj = _linear(g(ap+"output.weight"))
             self.ln_x_w, self.ln_x_b = _dense(g(ap+"ln_x.weight")), _dense(g(ap+"ln_x.bias"))
-            self._build_fused()
+        self._fused_built = False
 
     def __call__(self, x, v_first):
         B, T, D = x.shape
@@ -283,7 +306,21 @@ class QuantTMix:
         батченые LoRA-матрицы (w,a,v): pad v-ранга (64->96) нулями --
         нулевые строки/столбцы дают точный ноль, эквивалентность полная.
         g (ранг 256) не батчится -- остаётся парой отдельных матмулов.
-        Слой 0 без v-ветки: v-слот нулевой, его выход не используется."""
+        Слой 0 без v-ветки: v-слот нулевой, его выход не используется.
+
+        СТРОИТСЯ ЛЕНИВО, ПО ПЕРВОМУ ВХОДУ В ФЬЮЗНУТЫЙ ПУТЬ. Прежде он
+        строился в конструкторе БЕЗУСЛОВНО, а FUSE по умолчанию False --
+        то есть дубль r/k/v (250 МБ на 1.5B, 425 на 2.9B) и стеки лор
+        лежали в памяти мёртвым грузом у всех, кто фьюз не включал, то
+        есть у всех замеров по умолчанию. Именно этим, а не раскладкой,
+        объяснялось «пресет с sym на 227 МБ ЛЕГЧЕ»: при proj в sym фьюз
+        просто не строился (GwQuantLinearFused требует GwQuantLinear).
+        Ленивость сохраняет семантику флага целиком -- FUSE и LORA_Q8
+        остаются переключаемыми в рантайме, просто платит за них тот,
+        кто включил."""
+        if self._fused_built:
+            return
+        self._fused_built = True
         D = self.x_r.shape[-1]
         self.xcoef = mx.stack([self.x_r, self.x_w, self.x_k,
                                self.x_v, self.x_a, self.x_g])  # [6,1,1,D]
@@ -343,11 +380,22 @@ class QuantTMix:
                 and len({(l.in_features, l.out_features, l.has_qh)
                          for l in lins}) == 1):
             self._rkv_fused = GwQuantLinearFused(lins)
+        # ленивая постройка обязана оставлять буферы МАТЕРИАЛИЗОВАННЫМИ:
+        # иначе mx.compile трассирует шаг вместе с их графом и пересчитывает
+        # его на каждый вызов -- ровно то, ради чего существует
+        # QuantRWKV7._materialize (см. его докстринг).
+        ev = [self.xcoef, self.wav_At, self.wav_Bt]
+        ev += [a for pair in (self._wav_At_q, self._wav_Bt_q,
+                              self._g_A_q, self._g_B_q) if pair is not None
+               for a in pair]
+        mx.eval(ev)
 
     def _forward_stateful_fused(self, x, v_first, state):
         """forward_stateful с decode-фьюзом: 6 лерпов -> 1 broadcast-оп;
         LoRA (w,a,v) -> 2 batched-матмула вместо 6. Математика идентична
         нефьюзнутому пути (см. _build_fused)."""
+        if not self._fused_built:
+            self._build_fused()
         wkv_state, shift_state = state
         B, T, D = x.shape
         H, S = self.H, self.S

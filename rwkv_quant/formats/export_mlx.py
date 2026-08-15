@@ -22,6 +22,9 @@ int8, одномерные нормы и token-shift миксы) приходи�
               бит/вес против канонической (qsqm как uchar2 вместо 12
               бит) -- на 2.9B это +45 МБ, платим за то, что грузится
               mmap'ом как есть, без репака.
+  "sym"    -- Q6_K: qblk (коды блоками по 16) + qs (int8 на блок) +
+              d (fp16 на суперблок). При bits=8 в qblk знаковые байты,
+              при bits=6 -- ниббл со сдвигом +32 и две битплоскости.
   "asym"   -- gw-asym (LoRA @6, gw64): codes (uint8-контейнер) +
               scale / min (fp32 на блок).
   "rtn"    -- per-row RTN: codes (int8) ЛИБО codes_packed (uint8-нибблы
@@ -47,6 +50,7 @@ import torch
 
 from .reader import load_raw
 from ..backends.metal.quant_linear_gw import GwQuantLinear
+from ..backends.metal.quant_linear_sym import SymQuantLinear
 
 _DTYPE = {
     torch.uint8: mx.uint8, torch.int8: mx.int8, torch.int32: mx.int32,
@@ -83,6 +87,18 @@ def _export_one(key, qt, tensors):
         tensors[f"{key}::ddm"] = gw.ddm
         meta.update(kind="sb6", xbits=int(gw.xbits),
                     gw_gs=int(qt.gw_gs), gw_sb=int(qt.gw_sb))
+        return meta
+
+    if qt.gw_mode == "sym":
+        # Q6_K: интерлив загрузчика (qblk) + int8-масштабы блоков + fp16 d
+        # суперблока. Без этой ветки sym-тензор проваливался бы в rtn ниже
+        # и уехал бы в сайдкар с чужим kind и без scale -- то есть молча
+        # неверным, а не сломанным (закон 15).
+        lin = SymQuantLinear(qt)
+        tensors[f"{key}::qblk"] = lin.qblk
+        tensors[f"{key}::qs"] = lin.qs
+        tensors[f"{key}::d"] = lin.d
+        meta.update(kind="sym", gw_gs=int(qt.gw_gs), gw_sb=int(qt.gw_sb))
         return meta
 
     if qt.gw_mode == "asym":

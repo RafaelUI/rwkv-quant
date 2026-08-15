@@ -382,10 +382,19 @@ def test_real(path):
     from rwkv_quant.formats.reader import load_raw
     print(f"\nдеквант на реальном чекпоинте: {path}")
     ckpt = load_raw(path)
-    seen, bad, n_el = {}, 0, 0
+    seen, bad, n_el, skipped = {}, 0, 0, 0
     for key, qt in ckpt.tensors.items():
         kind = ("dense" if qt.bits >= 16 else qt.gw_mode or
                 ("rtn_packed" if qt.codes_packed is not None else "rtn"))
+        if kind == "sym":
+            # У sym НЕТ замороженной прежней реализации: раскладка
+            # появилась 13.08, и третий путь (_ref_dequantize_one) для неё
+            # был бы копией сегодняшнего кода, то есть проверял бы код
+            # против самого себя. Паритет codec/reader и равенство
+            # упаковщика fake-пути покрыты tests/test_sym_packer_parity.py.
+            # Счётчик печатается, чтобы пропуск был ВИДЕН, а не молчал.
+            skipped += 1
+            continue
         cur = _dequantize_one(qt)
         old, new = _ref_dequantize_one(qt), codec_dequantize_one(qt)
         n = (int((cur != old).sum()) + int((cur != new).sum())
@@ -404,6 +413,9 @@ def test_real(path):
               if nb == 0 else f"{nb} из {total} разошлись")
     print(f"  всего {sum(v[0] for v in seen.values())} тензоров, "
           f"{n_el / 1e6:.1f}M элементов, расхождений {bad}")
+    if skipped:
+        print(f"  пропущено {skipped} тензоров раскладки sym -- у неё нет "
+              f"замороженного эталона; см. tests/test_sym_packer_parity.py")
 
 
 def main():

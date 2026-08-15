@@ -307,8 +307,58 @@ _SYM_FACTORS = tuple(torch.linspace(0.7, 1.15, 19).tolist())
 
 def groupwise_sym_fake_dequant(w: torch.Tensor, bits: int, gs: int = 16,
                                sb: int = 16, ex2=None, search: bool = True,
-                               outlier_frac: float = 0.0) -> torch.Tensor:
-    """ПРОТОТИП симметричного блочного кванта в раскладке block_q6_K
+                               outlier_frac: float = 0.0,
+                               return_parts: bool = False):
+    """Симметричная ветка, ПО ПОЛОСАМ СТРОК -- см. _sym_one про схему.
+
+    Разбиение здесь тождественно по той же причине, что и в
+    асимметричной ветке: блоки идут вдоль ВХОДНОЙ оси, scale и суперблок
+    считаются внутри строки, отбор выбросов -- topk по dim=1. Ни одна
+    величина не смотрит на соседние строки, поэтому полосы дают бит-в-бит
+    тот же выход.
+
+    Без этого схема неприменима к emb/head: на 2.9B это [65536, 2560],
+    168M элементов, и грид-поиск держит около полутора десятков
+    полноразмерных копий в fp32 (закон 20) -- порядка 11 ГБ на машине с
+    16, поверх уже загруженной модели. На cmix/proj пик был терпимым
+    (1.8 ГБ), поэтому до сих пор это не всплывало.
+
+    return_parts=True отдаёт сырые компоненты для РЕАЛЬНОЙ упаковки
+    (writer._make_qt_gw_sym) -- ровно как это устроено в асимметричной
+    ветке. Дискретизация от этого не меняется ни на бит: parts["deq"] --
+    тот же самый тензор, который вернулся бы без флага, а q/qs/d -- те
+    величины, из которых он собран. Именно поэтому упаковщик не может
+    разойтись с fake-путём: он не считает ничего заново.
+    """
+    if w.dim() == 2 and not (ex2 is not None and ex2.dim() > 1):
+        rows_per = max(1, _CHUNK_BYTES // max(1, int(w.shape[1]) * 4))
+        if w.shape[0] > rows_per:
+            if return_parts:
+                outs = []
+                for r0 in range(0, w.shape[0], rows_per):
+                    outs.append(_sym_one(w[r0:r0 + rows_per], bits, gs, sb,
+                                         ex2, search, outlier_frac, True))
+                return {k: torch.cat([o[k] for o in outs], dim=0)
+                        for k in outs[0]}
+            out = None
+            for r0 in range(0, w.shape[0], rows_per):
+                part = _sym_one(w[r0:r0 + rows_per], bits, gs, sb, ex2,
+                                search, outlier_frac)
+                if out is None:
+                    # device обязателен: torch.empty без него кладёт буфер
+                    # на CPU, и результат молча уезжал бы с устройства
+                    out = torch.empty((w.shape[0], part.shape[1]),
+                                      dtype=part.dtype, device=part.device)
+                out[r0:r0 + part.shape[0]] = part
+                del part
+            return out
+    return _sym_one(w, bits, gs, sb, ex2, search, outlier_frac, return_parts)
+
+
+def _sym_one(w: torch.Tensor, bits: int, gs: int = 16,
+             sb: int = 16, ex2=None, search: bool = True,
+             outlier_frac: float = 0.0, return_parts: bool = False):
+    """Симметричный блочный квант в раскладке block_q6_K
     (llama.cpp/ggml-common.h): scale на блок из gs весов БЕЗ min, сами
     scale квантуются в int8 против одной fp16-константы d на суперблок
     из sb блоков. Выход -- dense (fake-dequant).
@@ -323,7 +373,16 @@ def groupwise_sym_fake_dequant(w: torch.Tensor, bits: int, gs: int = 16,
 
     Бюджет: bits + 8/gs + 16/(gs*sb) бит на вес.
       bits=6, gs=16, sb=16 -> 6.5625 (ровно Q6_K)
+      bits=8, gs=16, sb=16 -> 8.5625 (дешевле asym gw64, который 9.000)
       наш asym_sb6 при gs=32, sb=8 -> 6.5
+
+    return_parts=True: {"deq", "q", "qs", "d"}. `q` -- ЗНАКОВЫЕ коды в
+    [-2^(bits-1), 2^(bits-1)-1] шириной NB*gs колонок, то есть ВКЛЮЧАЯ
+    паддинг до gs*sb (упаковщик обязан либо его хранить, либо требовать
+    кратности -- см. writer._make_qt_gw_sym, который требует). `qs` --
+    int8-коды масштабов на блок, `d` -- fp16 супер-scale на суперблок.
+    Пары (bits=8, gs=16, sb=16) хватает, чтобы восстановить веса точно:
+    w = q * half(qs * d), min в этой раскладке нет вовсе.
     """
     w32 = w.float()
     OUT, IN = w32.shape
@@ -398,7 +457,20 @@ def groupwise_sym_fake_dequant(w: torch.Tensor, bits: int, gs: int = 16,
     deq = (qv * scale_q).view(OUT, -1)[:, :IN]
     if omask is not None:
         deq = torch.where(omask, w32, deq)
-    return deq
+    if not return_parts:
+        return deq
+    # ВЫРОЖДЕННЫЙ СУПЕРБЛОК. При amax = 0 (нулевые строки emb -- они
+    # реально есть) d = clamp_min(1e-12) уходит под fp16-субнормаль и
+    # становится нулём, после чего qs = round(ssb/d) = nan. На deq это не
+    # влияло: nz=False зануляет и коды, и выход. Но в ФАЙЛ nan класть
+    # нельзя -- каст nan в int8 не определён и даст разный байт на разных
+    # платформах. Пишем 0: деквант тогда даёт scale = half(0*0) = 0 и
+    # w = 0, то есть ровно то, что вернул deq. Обнаружено рассуждением,
+    # а не падением, и потому закрыто гейтом равенства на реальном emb.
+    return {"deq": deq,
+            "q": qv.view(OUT, -1).to(torch.int8),
+            "qs": torch.nan_to_num(qs, 0.0).view(OUT, NB).to(torch.int8),
+            "d": d.view(OUT, -1).half()}
 
 
 # ---------------- MXFP4 ----------------

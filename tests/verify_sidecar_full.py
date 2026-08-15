@@ -87,6 +87,31 @@ def dequant_from_sidecar(arrays, key, meta) -> mx.array:
         w = q * scale.reshape(OUT, NB, 1) + mn.reshape(OUT, NB, 1)
         return w.reshape(OUT, IN).astype(mx.bfloat16)
 
+    if kind == "sym":
+        # Q6_K: min нет, поэтому нет и клипа scale снизу -- у вырожденного
+        # блока и масштаб, и коды нулевые. bits различается ПО БУФЕРАМ:
+        # при восьми битах qblk -- знаковые байты, при шести -- ниббл со
+        # сдвигом +32 плюс две битплоскости.
+        gs, sb, bits = meta["gw_gs"], meta["gw_sb"], meta["bits"]
+        NB, NSB = IN // gs, IN // (gs * sb)
+        blk = arrays[f"{key}::qblk"]
+        if bits == 8:
+            q = mx.view(blk, mx.int8).reshape(OUT, NB, gs).astype(mx.float32)
+        else:
+            NP = IN // 32
+            b = blk.reshape(OUT, NP, 24)
+            cb = b[:, :, :16].reshape(OUT, NP * 2, 8)
+            q = mx.concatenate([cb & 0xF, cb >> 4], axis=2).astype(mx.float32)
+            for i in range(2):
+                plane = b[:, :, 16 + 4 * i:20 + 4 * i].reshape(OUT, IN // 8)
+                q = q + _unpack_bits(plane, IN, i).reshape(
+                    OUT, NB, gs).astype(mx.float32) * (16.0 * (2 ** i))
+            q = q - 32.0
+        qs = mx.view(arrays[f"{key}::qs"], mx.int8).astype(mx.float32)
+        d = mx.repeat(arrays[f"{key}::d"].astype(mx.float32), NB // NSB, axis=1)
+        scale = (qs * d).astype(mx.float16).astype(mx.float32)
+        return (q * scale.reshape(OUT, NB, 1)).reshape(OUT, IN).astype(mx.bfloat16)
+
     if kind == "asym":
         gs = meta["gw_gs"]
         q = arrays[f"{key}::codes"].astype(mx.float32)

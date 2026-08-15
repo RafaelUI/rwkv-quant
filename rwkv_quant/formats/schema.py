@@ -57,9 +57,12 @@ class QuantizedTensor:
     # --- формат v2 (groupwise), поля взаимоисключающие с per-row scale ---
     # gw_mode: "" (не gw) | "sb6" (блок gs, суперблок sb, 6-бит qs/qm против
     # d/dm fp16) | "asym" (блок gs, fp32 scale/min на блок, контейнер int8)
+    # | "sym" (Q6_K: блок gs=16 БЕЗ min, int8-scale на блок против одной
+    # fp16 d на суперблок sb=16; коды ЗНАКОВЫЕ)
     gw_mode: str = ""
-    gw_gs: int = 0                # ширина блока (32 для sb6, 64 для lora-asym)
-    gw_sb: int = 0                # блоков в суперблоке (8)
+    gw_gs: int = 0                # ширина блока (32 для sb6, 64 для lora-asym,
+                                  # 16 для sym)
+    gw_sb: int = 0                # блоков в суперблоке (8 у sb6, 16 у sym)
     gw_d: torch.Tensor = None     # fp16 [OUT, NSB] -- супер-scale для qs
     gw_dm: torch.Tensor = None    # fp16 [OUT, NSB] -- супер-scale для qm
     gw_qsqm: torch.Tensor = None  # uint8 [OUT, NSB, 12] -- 8 qs + 8 qm по 6 бит
@@ -70,6 +73,12 @@ class QuantizedTensor:
                                   # (bits=6), бит c строки = 6-й бит кода c
     gw_scale: torch.Tensor = None # fp32 [OUT, NB] -- asym-режим (LoRA)
     gw_min: torch.Tensor = None   # fp32 [OUT, NB] -- asym-режим (LoRA)
+    gw_qs: torch.Tensor = None    # int8 [OUT, NB] -- sym-режим: код масштаба
+                                  # блока против gw_d[суперблок]. Отдельное
+                                  # поле, а не переиспользование gw_qsqm:
+                                  # там 6 бит и пара (scale, min), здесь
+                                  # 8 бит и только scale -- ровно та
+                                  # экономия, ради которой Q6_K и берётся
 
 
 @dataclass
