@@ -53,13 +53,16 @@ def main():
     def prefill():
         st = model.init_state(1)
         if not CHUNK:
-            logits, st = model.forward_stateful(prompt, st, last_only=True)
+            # СКОМПИЛИРОВАННЫЙ путь (model.step обслуживает и префилл):
+            # +35% скорости, см. докстринг QuantRWKV7.step. Пик памяти при
+            # этом меняется, поэтому число из этого замера сравнивать
+            # только с числами того же пути.
+            logits, st = model.step(prompt, st, True)
             mx.eval(logits)
             return logits
         logits = None
         for a in range(0, T, CHUNK):
-            logits, st = model.forward_stateful(prompt[:, a:a + CHUNK], st,
-                                                last_only=True)
+            logits, st = model.step(prompt[:, a:a + CHUNK], st, True)
             mx.eval(logits, *st)      # ОБРЫВ ГРАФА: считаем кусок целиком
         return logits
 

@@ -14,6 +14,7 @@
 import copy
 import gc
 import os
+import subprocess
 import sys
 import time
 
@@ -41,22 +42,48 @@ def cfg_of(preset):
     return c
 
 
+def swap_mb():
+    """vm.swapusage через LC_ALL=C: локаль с запятичным разделителем иначе
+    ломает разбор."""
+    env = dict(os.environ, LC_ALL="C", LANG="C")
+    out = subprocess.run(["sysctl", "-n", "vm.swapusage"], env=env,
+                         capture_output=True, text=True).stdout
+    parts = out.replace("=", " ").split()
+    try:
+        return float(parts[parts.index("used") + 1].rstrip("M").replace(",", "."))
+    except (ValueError, IndexError):
+        return float("nan")
+
+
 def bench(model):
     rng = np.random.default_rng(0)
     prompt = mx.array(rng.integers(1, 60000, size=(1, PP)).astype(np.int32))
 
-    # префилл: полный прогон PP токенов с нуля
+    # Префилл: полный прогон PP токенов с нуля, через СКОМПИЛИРОВАННЫЙ
+    # путь. До 15.08 здесь стоял сырой forward_stateful, хотя декод рядом
+    # уже шёл через model.step -- то есть половина таблицы сравнивалась с
+    # llama.cpp на компилированном пути, а половина на сыром. Цена ошибки:
+    # 344 против 533 ток/с, то есть "префилл проигрываем вдвое"
+    # превращается в 1.3x (tests/bench_compile_ab.py).
     st = model.init_state(1)
-    logits, st = model.forward_stateful(prompt, st, last_only=True)
-    mx.eval(logits)
+    logits, st = model.step(prompt, st, True)
+    mx.eval(logits)               # первый вызов = трассировка на эту форму
     st = model.init_state(1)
     t0 = time.time()
-    logits, st = model.forward_stateful(prompt, st, last_only=True)
+    logits, st = model.step(prompt, st, True)
     mx.eval(logits)
     pp = PP / (time.time() - t0)
 
+    # Своп фиксируется на ГРАНИЦЕ измерения, а не от старта процесса:
+    # сборка модели из .pth держит воркспейс грид-поиска и законно
+    # выталкивает чужие страницы. Недействительным замер делает пейджинг
+    # ВО ВРЕМЯ измерения (закон 11 и уточнение к нему в bench_sym_e2e_ab).
+    # Прежде этот скрипт своп не смотрел вовсе, из-за чего прогон 15.08
+    # пришлось отбросить задним числом и по внешним признакам.
+    sw0 = swap_mb()
+
     tok = mx.argmax(logits[:, -1], axis=-1)
-    for _ in range(WARMUP):       # прогрев mx.compile
+    for _ in range(WARMUP):       # прогрев кеша T=1
         logits, st = model.step(tok[None], st)
         tok = mx.argmax(logits[:, -1], axis=-1)
         mx.eval(tok)
@@ -66,7 +93,7 @@ def bench(model):
         tok = mx.argmax(logits[:, -1], axis=-1)
         mx.eval(tok)
     dt = time.time() - t0
-    return pp, TG / dt, dt / TG * 1000
+    return pp, TG / dt, dt / TG * 1000, sw0, swap_mb()
 
 
 def main():
@@ -82,9 +109,12 @@ def main():
         model = QuantRWKV7(ckpt)
         del ckpt
         gc.collect()
-        pp, tg, ms = bench(model)
+        pp, tg, ms, sw0, sw1 = bench(model)
+        verdict = ("своп не рос" if sw1 <= sw0 else
+                   f"СВОП ВЫРОС на {sw1-sw0:.0f} МБ -- ЗАМЕР НЕДЕЙСТВИТЕЛЕН")
         print(f"{name:<14} pp{PP}={pp:7.1f} t/s   tg{TG}={tg:6.2f} t/s "
               f"({ms:.2f} мс/ток)   [сборка {time.time()-t0:.0f}s]", flush=True)
+        print(f"{'':<14} своп {sw0:.0f} -> {sw1:.0f} МБ: {verdict}", flush=True)
         del model
         gc.collect()
         mx.clear_cache()
