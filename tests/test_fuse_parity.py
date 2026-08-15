@@ -57,22 +57,49 @@ def greedy(fuse, n=48):
 ga, gb = greedy(False), greedy(True)
 print(f"greedy fused vs unfused: {sum(x==y for x,y in zip(ga,gb))}/48")
 
-# --- 3. ppl через фьюзнутый forward_stateful (прямой прогон корпуса) ---
+# --- 3. ppl: ФЬЮЗНУТЫЙ путь против НЕФЬЮЗНУТОГО на ОДНОЙ модели ---
+#
+# Утверждение здесь ОТНОСИТЕЛЬНОЕ, и это не мелочь. Прежде сверялся
+# абсолютный якорь 11.7125, снятый на конкретном файле champion_v2. Файл
+# в /tmp живёт до ребута и пересобирается; пересобранный БЕЗ
+# /tmp/act_stats_1p5b.pt даёт 12.356, то есть якорь расходится на 5.5%,
+# и выглядит это как «фьюз испортил качество». Проверено прямым прогоном:
+# нефьюзнутый путь на том же файле даёт те же 12.356. То есть якорь
+# описывал ДРУГОЙ артефакт -- ровно та тихая подмена, о которой закон 15.
+# Инвариант, который тут вообще проверяем, -- «фьюз считает то же, что и
+# не-фьюз», и он от содержимого /tmp не зависит.
+def corpus_ppl():
+    total_nll, total_tok = 0.0, 0
+    for i in range(0, data.shape[0], 4):
+        batch = data[i:i+4]
+        idx = mx.array(batch[:, :-1]); target = batch[:, 1:]
+        logits, _ = model.forward_stateful(idx, model.init_state(batch.shape[0]))
+        mx.eval(logits)
+        logp = np.array(mx.log(mx.softmax(logits.astype(mx.float32), axis=-1) + 1e-12))
+        V = logp.shape[-1]
+        nll = -logp.reshape(-1, V)[np.arange(target.size), target.reshape(-1)]
+        total_nll += nll.sum(); total_tok += nll.size
+    return float(np.exp(total_nll / total_tok))
+
+qm.FUSE = False
+ppl_unfused = corpus_ppl()
 qm.FUSE = True
-total_nll, total_tok = 0.0, 0
-for i in range(0, data.shape[0], 4):
-    batch = data[i:i+4]
-    idx = mx.array(batch[:, :-1]); target = batch[:, 1:]
-    logits, _ = model.forward_stateful(idx, model.init_state(batch.shape[0]))
-    mx.eval(logits)
-    logp = np.array(mx.log(mx.softmax(logits.astype(mx.float32), axis=-1) + 1e-12))
-    V = logp.shape[-1]
-    nll = -logp.reshape(-1, V)[np.arange(target.size), target.reshape(-1)]
-    total_nll += nll.sum(); total_tok += nll.size
-_ppl = float(np.exp(total_nll / total_tok))
-print(f"ppl fused stateful path: {_ppl:.4f}" +
-      (f"  (референс кернельного пути {PPL_REF})" if PPL_REF else
-       "  (якоря для этой модели нет -- см. докстринг)"))
+ppl_fused = corpus_ppl()
+drift = abs(ppl_fused - ppl_unfused) / ppl_unfused
+print(f"ppl unfused {ppl_unfused:.4f} | fused {ppl_fused:.4f} | "
+      f"расхождение {drift*1e4:.2f}e-4")
+PPL_TOL = 1e-3          # relmax логитов порядка 1.3e-4, ppl обязан быть плотнее
+if drift > PPL_TOL:
+    print(f"ПРОВАЛ: фьюз двигает ppl на {drift:.2e} при пороге {PPL_TOL:.0e}")
+    sys.exit(1)
+if PPL_REF is not None:
+    off = abs(ppl_unfused - PPL_REF) / PPL_REF
+    print(f"справочно: якорь {PPL_REF} для исходного champion_v2, "
+          f"здесь {ppl_unfused:.4f} ({off*100:+.2f}%)"
+          + ("" if off < 5e-3 else
+             "  <-- ВНИМАНИЕ: файл в /tmp не тот, на котором снят якорь "
+             "(скорее всего пересобран без act_stats). На это утверждение "
+             "не влияет, но числа скорости с прежними не сравнивать."))
 
 # --- 4. A/B скорость compiled ---
 def bench(fuse, n=30, warm=8):

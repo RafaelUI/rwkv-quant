@@ -41,6 +41,7 @@ from .quant_linear import QuantLinear  # noqa: F401 (v1, референс)
 from .quant_linear_v2 import QuantLinearV2
 from .quant_linear_gw import GwQuantLinear, GwQuantLinearFused
 from .quant_linear_sym import SymQuantLinear, SymQuantLinearFused
+from .fused_tail import wkv_tail, can_fuse_tail
 
 # Реализация Linear-кернеля для всей модели. v2 (threadgroup-редукция,
 # char4-загрузки) численно эквивалентна v1 (tests/test_quant_linear_v2.py)
@@ -54,6 +55,11 @@ _QUANT_LINEAR_IMPL = QuantLinearV2
 # свежий mx.compile.
 FUSE = False
 LORA_Q8 = False  # int8-лоры в decode-фьюзе: НЕ бит-в-бит, включать после ppl-гейта
+# Хвост TMix (group_norm + bonus + gate) одним кернелем вместо ~14 примитивов.
+# Действует только внутри фьюзнутого decode-пути и только при FUSE=True;
+# редукции там древесно-simd'овые, то есть бит-в-бит не обязан -- гейт
+# tests/test_fuse_parity.py.
+FUSE_TAIL = True
 
 _RWKV_METAL_PATH = os.environ.get("RWKV_METAL_PATH", os.path.expanduser("~/Develop/rwkv-metal"))
 if _RWKV_METAL_PATH not in sys.path:
@@ -460,6 +466,12 @@ class QuantTMix:
             v = v + (v_first - v) * vv
 
         out, new_wkv_state = _wkv_stateful(r, w, k, v, -kk, kk * a, wkv_state)
+
+        if FUSE_TAIL and can_fuse_tail(H, S):
+            # group_norm + bonus + gate одним запуском вместо ~14
+            out = wkv_tail(out, r, k, v, self.r_k, self.ln_x_w, self.ln_x_b,
+                           g, H, S).reshape(B, T, D)
+            return self.o_proj(out), v_first, (new_wkv_state, new_shift_state)
 
         out2d = out.reshape(B * T, D)
         out2d = _group_norm(out2d, H, self.ln_x_w, self.ln_x_b)
