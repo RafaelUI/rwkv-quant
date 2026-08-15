@@ -48,7 +48,11 @@ from rwkv_quant.formats.reader import load_raw, dequantize_banded  # noqa: E402
 
 PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/reduction_sym_head8.rwkvq"
 ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 5
-NS = (1, 128)
+# N=512 -- то, что реально видит линейный слой на префилле pp512.
+# N=128 -- нижняя граница GEMM-пути (порог GEMM_MIN_BATCH_NB): там
+# постоянная цена _dequant_w амортизируется вчетверо хуже, поэтому
+# 128 даёт ВЕРХНЮЮ оценку проигрыша, а 512 -- ту, что в модели.
+NS = (128, 512)
 KEYS = ["blocks.0.att.receptance.weight", "blocks.3.ffn.key.weight",
         "blocks.3.ffn.value.weight", "head.weight"]
 GS = 64
