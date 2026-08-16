@@ -247,7 +247,7 @@ def _get_kernel_sym6(IN, OUT, NSG, RS, NN=1, OUT_PER=0):
     return kern
 
 
-def _dq_writes(regs, scale, base):
+def _dq_writes(regs, scale, base, T="half"):
     """Восемь uchar4 -> 32 half по колонкам пары. ПОРЯДОК КОЛОНОК берётся
     из того же списка _PAIR_REGS, что и в GEMV: там он задан порядком
     dot-произведений с x4[p*8+i], здесь -- смещением записи. Перепутать
@@ -257,13 +257,32 @@ def _dq_writes(regs, scale, base):
     out = []
     for i, reg in enumerate(regs):
         for c, comp in enumerate("xyzw"):
-            out.append(f"    o[{base + i*4 + c}] = ((half)(float){reg}.{comp}"
-                       f" - (half)32.0h) * {scale};")
+            if T == "half":
+                # ТЕКСТ ЭТОЙ ВЕТКИ НЕ ТРОГАТЬ: под ним стоит гейт равенства
+                # (test_sym_dequant_kernel), а (q-32) в half и в float дают
+                # разный последний бит.
+                out.append(f"    o[{base + i*4 + c}] = ((half)(float){reg}.{comp}"
+                           f" - (half)32.0h) * {scale};")
+            else:
+                # fp32-выход: вся арифметика во float, масштаб по-прежнему
+                # округляется через half -- ровно как codec.dequant_sym,
+                # поэтому здесь законно требовать бит-в-бит с ним.
+                out.append(f"    o[{base + i*4 + c}] = ((float){reg}.{comp}"
+                           f" - 32.0f) * (float){scale};")
     return "\n".join(out)
 
 
-def _get_kernel_dequant(IN, OUT, bits):
-    """sym -> плотный fp16 ОДНИМ кернелем.
+def _get_kernel_dequant(IN, OUT, bits, T="half"):
+    """sym -> плотная матрица ОДНИМ кернелем. T -- "half" или "float".
+
+    ДВА ВЫХОДА, И ОНИ НЕ ВЗАИМОЗАМЕНЯЕМЫ. fp16 -- путь ИНФЕРЕНСА: под ним
+    измерены все числа пресета и стоит гейт равенства против прежней
+    цепочки MLX-операций, поэтому его текст менять нельзя. fp32 нужен
+    QLoRA-базе в rwkv-metal: там веса восстанавливаются на каждый forward
+    и обязаны совпадать с нормативным `codec.dequant_sym` бит-в-бит,
+    иначе квантованная база добавит свой источник шума поверх калибровки.
+    Разница ровно в том, в какой точности берётся `(q-32)*s`; масштаб
+    округляется через half в обеих ветках, как в файле.
 
     ЗАЧЕМ. Прежний `_dequant_w` собирал коды ЦЕПОЧКОЙ MLX-операций
     (concatenate нибблов, две битплоскости через сдвиги), и каждая
@@ -283,23 +302,30 @@ def _get_kernel_dequant(IN, OUT, bits):
     ТЕМ ЖЕ генератором строк (`dec`, `_plane_pair`), а не переписаны:
     закон 23 -- параллельные реализации расходятся ровно тогда, когда
     правку вносят в одну из них."""
-    key = ("symdq", IN, OUT, bits)
+    key = ("symdq", IN, OUT, bits, T)
     if key in _gw_kernel_cache:
         return _gw_kernel_cache[key]
     assert IN % 256 == 0
     hdr = _hdr(IN, OUT, 1, 1, 1)
     if bits == 8:
         assert (OUT * (IN // 16)) % 256 == 0
-        body = """
+        head = """
     uint gid = thread_position_in_grid.x;
     uint row = gid / NB;
     uint b   = gid % NB;
     device const char* c  = (device const char*)qblk;
     device const char* sc = (device const char*)qs;
     half s = (half)((float)sc[row*NB + b] * (float)d[row*NSB + b/16]);
-    device half* o = out + row*IN_C + b*16;
+"""
+        if T == "half":
+            body = head + """    device half* o = out + row*IN_C + b*16;
     for (uint i = 0; i < 16; i++)
         o[i] = (half)((float)c[row*IN_C + b*16 + i]) * s;
+"""
+        else:
+            body = head + """    device float* o = out + row*IN_C + b*16;
+    for (uint i = 0; i < 16; i++)
+        o[i] = (float)c[row*IN_C + b*16 + i] * (float)s;
 """
         names = ["qblk", "qs", "d"]
     else:
@@ -326,12 +352,12 @@ def _get_kernel_dequant(IN, OUT, bits):
     float dsb = (float)d[row*NSB + p/8];
     half s0 = (half)((float)sc[row*NB + 2*p]     * dsb);
     half s1 = (half)((float)sc[row*NB + 2*p + 1] * dsb);
-    device half* o = out + row*IN_C + p*32;
-""" + _dq_writes(_PAIR_REGS[:4], "s0", 0) + "\n" \
-   + _dq_writes(_PAIR_REGS[4:], "s1", 16) + "\n"
+    device """ + T + """* o = out + row*IN_C + p*32;
+""" + _dq_writes(_PAIR_REGS[:4], "s0", 0, T) + "\n" \
+   + _dq_writes(_PAIR_REGS[4:], "s1", 16, T) + "\n"
         names = ["qblk", "qs", "d"]
     kern = mx.fast.metal_kernel(
-        name=f"symdq{bits}_{IN}_{OUT}", input_names=names,
+        name=f"symdq{bits}_{IN}_{OUT}_{T}", input_names=names,
         output_names=["out"], header=hdr, source=body)
     _gw_kernel_cache[key] = kern
     return kern
@@ -354,46 +380,75 @@ class SymQuantLinear:
     def __init__(self, qt):
         assert qt.gw_mode == "sym", qt.gw_mode
         assert qt.gw_gs == 16 and qt.gw_sb == 16, (qt.gw_gs, qt.gw_sb)
-        OUT, IN = qt.shape
+
+        def npy(x):
+            return None if x is None else x.numpy()
+
+        self._build(shape=qt.shape, bits=qt.bits, codes=npy(qt.codes),
+                    codes_packed=npy(qt.codes_packed), qh=npy(qt.gw_qh),
+                    qh2=npy(qt.gw_qh2), qs=qt.gw_qs.numpy(),
+                    d=qt.gw_d.numpy())
+
+    @classmethod
+    def from_buffers(cls, *, shape, bits, qs, d, codes=None,
+                     codes_packed=None, qh=None, qh2=None):
+        """То же самое из NUMPY-буферов, БЕЗ torch и без QuantizedTensor.
+
+        Нужен потребителям формата (rwkv-metal, QLoRA-база), которые
+        читают файл через `codec.open_rwkvq` и торча не имеют вовсе.
+        Отдельной реализации интерлива у них быть не должно: закон 23 --
+        параллельные реализации расходятся ровно тогда, когда правку
+        вносят в одну из них."""
+        obj = cls.__new__(cls)
+        obj._build(shape=shape, bits=bits, codes=codes,
+                   codes_packed=codes_packed, qh=qh, qh2=qh2, qs=qs, d=d)
+        return obj
+
+    def _build(self, *, shape, bits, codes, codes_packed, qh, qh2, qs, d):
+        OUT, IN = shape
         assert IN % 256 == 0, f"sym-кернель: IN={IN} не кратен суперблоку 256"
         self.out_features, self.in_features = OUT, IN
-        self.bits = qt.bits
+        self.bits = bits
         self.NB, self.NSB = IN // 16, IN // 256
 
-        if qt.bits == 8:
-            assert qt.codes is not None, "sym@8 хранит коды в codes"
-            blk = qt.codes.numpy().view(np.uint8)          # знаковые байты
+        if bits == 8:
+            assert codes is not None, "sym@8 хранит коды в codes"
+            blk = np.asarray(codes).view(np.uint8)          # знаковые байты
         else:
-            assert qt.bits == 6 and qt.codes_packed is not None
+            assert bits == 6 and codes_packed is not None
             NP = IN // 32
             blk = np.concatenate(
-                [qt.codes_packed.numpy().reshape(OUT, NP, 16),
-                 qt.gw_qh.numpy().reshape(OUT, NP, 4),
-                 qt.gw_qh2.numpy().reshape(OUT, NP, 4)], axis=2)
+                [np.asarray(codes_packed).reshape(OUT, NP, 16),
+                 np.asarray(qh).reshape(OUT, NP, 4),
+                 np.asarray(qh2).reshape(OUT, NP, 4)], axis=2)
         self.qblk = mx.array(np.ascontiguousarray(blk.reshape(OUT, -1)))
         self.qs = mx.array(np.ascontiguousarray(
-            qt.gw_qs.numpy().view(np.uint8)))               # int8 as bytes
-        self.d = mx.array(np.ascontiguousarray(qt.gw_d.numpy()))
+            np.asarray(qs).view(np.uint8)))                 # int8 as bytes
+        self.d = mx.array(np.ascontiguousarray(np.asarray(d)))
         mx.eval(self.qblk, self.qs, self.d)
         # (NSG, RS) в обход _cfg -- только для свипа. В проде None: конфиг
         # обязан выбираться таблицей, а не тем, что кто-то забыл сбросить.
         self.cfg_override = None
 
-    def _dequant_w(self):
-        """sym -> fp16 [OUT, IN] ОДНИМ кернелем (транзиент на вызов).
+    def _dequant_w(self, dtype=mx.float16):
+        """sym -> плотная [OUT, IN] ОДНИМ кернелем (транзиент на вызов).
+
+        dtype=fp16 -- умолчание и путь инференса, под ним измерен пресет.
+        dtype=fp32 -- для QLoRA-базы: бит-в-бит с `codec.dequant_sym`.
 
         Прежняя реализация цепочкой MLX-операций осталась как
         `_dequant_w_ref` и служит эталоном гейта
         (tests/test_sym_dequant_kernel.py, требуется РАВЕНСТВО)."""
-        if DEQUANT_REF:      # A/B подменой ОДНОГО флага в одном процессе
-            return self._dequant_w_ref()
+        if DEQUANT_REF and dtype == mx.float16:
+            return self._dequant_w_ref()   # A/B подменой ОДНОГО флага
         OUT, IN = self.out_features, self.in_features
-        kern = _get_kernel_dequant(IN, OUT, self.bits)
+        T = "half" if dtype == mx.float16 else "float"
+        kern = _get_kernel_dequant(IN, OUT, self.bits, T)
         n = OUT * (IN // (16 if self.bits == 8 else 32))
         return kern(
             inputs=[self.qblk, self.qs, self.d],
             grid=(n, 1, 1), threadgroup=(256, 1, 1),
-            output_shapes=[(OUT, IN)], output_dtypes=[mx.float16],
+            output_shapes=[(OUT, IN)], output_dtypes=[dtype],
         )[0]
 
     def _dequant_w_ref(self):
