@@ -11,6 +11,20 @@
 пять секунд на фоне ~270 шагов пренебрежима, но если понадобится совсем
 чистое окно -- SILENT=1.
 
+Аргументом можно дать И имя конфига (тогда модель собирается из .pth,
+~30 с), И ГОТОВЫЙ `.rwkvq` -- второе честнее, если наблюдают за тем, что
+реально отгружается, и быстрее на полминуты.
+
+ТРАФИК ЗА ТОКЕН ПЕЧАТАЕТСЯ ОБХОДОМ ЖИВЫХ БУФЕРОВ, а не формулой: только
+то, что путь декода реально читает. `emb` исключён -- это gather одной
+строки, а не таблица (закон 12); из двух копий LoRA считается ТА, что
+активна при нынешнем `LORA_Q`. Это даёт число, прямо сравнимое с
+показаниями внешнего профилировщика полосы: он видит ВЕСЬ трафик, то есть
+должен показать чуть больше нашего (активации, состояние WKV, накладные),
+и если он показывает МЕНЬШЕ -- значит часть чтений гасится кэшем и
+наша арифметика полосы завышена.
+
+    python tests/trace_decode_steady.py /tmp/reduction_new.rwkvq [секунды]
     python tests/trace_decode_steady.py reduction_sym_head8 [секунды]
     SILENT=1 python tests/trace_decode_steady.py reduction 90
 """
@@ -53,8 +67,54 @@ def swap_mb():
     return float(num) * (1024 if unit == "G" else 1)
 
 
+def decode_traffic_mb(model):
+    """Байты, которые путь ДЕКОДА читает за один токен.
+
+    Обход живых буферов, а не формула бит/вес: формула уже устаревала
+    молча (в bench_molly_ab она считала LoRA плотным fp16 у обеих
+    моделей и разъехалась с реальностью в тот день, когда LoRA
+    квантовали). `emb` исключается -- gather одной строки."""
+    import rwkv_quant.backends.metal.quant_model as _qm
+    seen, tot = set(), 0
+
+    def add(a):
+        nonlocal tot
+        if isinstance(a, mx.array) and id(a) not in seen:
+            seen.add(id(a))
+            tot += a.nbytes
+
+    def lin_bytes(l):
+        for f in ("qblk", "qs", "d", "codes", "scales", "biases", "w",
+                  "mlx_weight"):
+            add(getattr(l, f, None))
+
+    lin_bytes(model.head)
+    for b in model.blocks:
+        tm, cm = b.tmix, b.cmix
+        for l in (tm.r_proj, tm.k_proj, tm.v_proj, tm.o_proj, cm.key, cm.value):
+            lin_bytes(l)
+        if _qm.LORA_Q and getattr(tm, "_lq_A", None) is not None:
+            for tr in (tm._lq_A + tm._lq_B):     # активны квантованные
+                for a in tr:
+                    add(a)
+        else:
+            for a in (tm.w_lora_A, tm.w_lora_B_w, tm.a_lora_A, tm.a_lora_B_w,
+                      tm.v_lora_A, tm.v_lora_B_w, tm.g_lora_A, tm.g_lora_B_w):
+                add(a)
+        for a in (tm.k_k, tm.k_a, tm.r_k, tm.x_r, tm.x_w, tm.x_k, tm.x_v,
+                  tm.x_a, tm.x_g, tm.ln_x_w, tm.ln_x_b, cm.x_k,
+                  b.ln1_w, b.ln1_b, b.ln2_w, b.ln2_b):
+            add(a)
+    return tot / 1e6
+
+
 def main():
     name = sys.argv[1]
+    if name.endswith(".rwkvq"):
+        from rwkv_quant.formats.reader import load_raw
+        print(f"PID {os.getpid()}   файл {os.path.basename(name)}", flush=True)
+        model = QuantRWKV7(load_raw(name))
+        return run(model, name)
     cfg = comp.CONFIGS[name]()
     print(f"PID {os.getpid()}   конфиг {name}   чекпоинт "
           f"{os.path.basename(comp.CKPT)}", flush=True)
@@ -71,7 +131,14 @@ def main():
     del tensors, sd
     gc.collect()
     mx.clear_cache()
+    return run(model, name)
 
+
+def run(model, name):
+    import rwkv_quant.backends.metal.quant_model as _qm
+    traf = decode_traffic_mb(model)
+    print(f"трафик за токен (обход живых буферов, без emb): {traf:.1f} МБ | "
+          f"FUSE={_qm.FUSE} LORA_Q={_qm.LORA_Q}@{_qm.LORA_QBITS}", flush=True)
     st = model.init_state(1)
     tok = mx.array(np.array([1], dtype=np.int32))
     for _ in range(WARMUP):                       # прогрев mx.compile
@@ -104,6 +171,7 @@ def main():
             if not SILENT:
                 print(f"  [{now-t_start:5.1f} с] {ms:6.2f} мс/ток   "
                       f"{n_mark/(now-t_mark):5.1f} ток/с   "
+                      f"{traf/ms:5.1f} ГБ/с   "
                       f"своп {swap_mb():.1f} МБ   дрейф {drift:+5.1f}%"
                       + ("   <-- ТРОТТЛИНГ, окно отсюда уже не про кернель"
                          if drift > 10 else ""), flush=True)
