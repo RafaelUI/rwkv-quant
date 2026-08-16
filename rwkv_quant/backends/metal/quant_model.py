@@ -941,6 +941,26 @@ class QuantRWKV7:
             self._step_compiled = mx.compile(self.forward_stateful)
         return self._step_compiled
 
+    def forward_hidden(self, idx: mx.array, states):
+        """Скрытое состояние ПОСЛЕ ln_out и ДО головы: [B, T, D].
+
+        Нужно векторным моделям: у них головы может не быть вовсе (в
+        эмбеддинг-чекпоинтах её нет, и в .rwkvq лежит нулевая заглушка),
+        а эмбеддинг берётся пулингом по скрытым состояниям. Тело метода
+        -- ровно первые строки forward_stateful до головы; вынести их в
+        общую функцию нельзя без лишнего слоя вызовов в горячем пути,
+        поэтому здесь дубль на четыре строки, и он под гейтом
+        (tests/eval_retrieval_emb.py сверяет forward_hidden с
+        forward_stateful через голову на модели, у которой голова есть)."""
+        x = self.emb_weight[idx]
+        x = _layer_norm(x, self.ln0_w, self.ln0_b)
+        v_first = None
+        new_states = []
+        for block, state in zip(self.blocks, states):
+            x, v_first, new_state = block.step(x, v_first, state)
+            new_states.append(new_state)
+        return _layer_norm(x, self.ln_out_w, self.ln_out_b), new_states
+
     def forward_stateful(self, idx: mx.array, states, last_only: bool = False,
                          tail_only: int = 0):
         """idx: [B, T] -- T=1 для single-token decode, T>1 для prefill

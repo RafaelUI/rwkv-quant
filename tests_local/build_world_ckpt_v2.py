@@ -26,18 +26,18 @@ _mp = _sd_train['master_params']
 _shapes = [tuple(t.shape) for t in _mp]
 
 VOCAB, C = _shapes[0]                       # emb.weight идёт первым
-DIM_FFN = next(a for a, b in _shapes if b == C and a % C == 0 and a > C)
-# ранги лор: формы (C, r) в первом блоке, в порядке w, a, (v), g
-_ranks = [b for a, b in _shapes[:40] if a == C and b < C]
-D_DECAY_LORA, D_AAA_LORA = _ranks[0], _ranks[1]
-D_MV_LORA = _ranks[2] if len(_ranks) > 3 else _ranks[1]
-D_GATE_LORA = _ranks[3] if len(_ranks) > 3 else _ranks[2]
-H, N = next((a, b) for a, b in _shapes if a * b == C and a < b)
-# слоёв -- по числу матриц att.receptance (их ровно одна на блок)
+
+# Ранги и ffn НЕ УГАДЫВАЮТСЯ ПО ФОРМАМ, а читаются ПО ПОЗИЦИЯМ. Первая
+# редакция угадывала -- и взяла словарь за ffn (65536 кратно 1024 и
+# больше его) и ранг v из чужого слота. Инвариант здесь ровно один:
+# ПОРЯДОК named_parameters(), тот самый, ради которого этот скрипт и
+# существует. Значит из него и надо брать: сгенерировать имена с
+# неизвестными рангами, прочитать формы на нужных позициях, и только
+# потом сверять ВСЁ остальное -- перепутанный порядок эта сверка всё
+# равно поймает, потому что сотни прочих форм заданы через C и VOCAB.
+D_DECAY_LORA = D_AAA_LORA = D_MV_LORA = D_GATE_LORA = DIM_FFN = None
+H = N = None
 N_LAYER = sum(1 for sh in _shapes if sh == (C, C)) // 4
-print(f"из чекпоинта: C={C} vocab={VOCAB} n_layer={N_LAYER} ffn={DIM_FFN} "
-      f"ранги w/a/v/g = {D_DECAY_LORA}/{D_AAA_LORA}/{D_MV_LORA}/{D_GATE_LORA} "
-      f"H={H} N={N}")
 
 def expect(name):
     # (name, expected_shape or None if variable/skip strict check)
@@ -97,6 +97,22 @@ names = ["emb.weight"]
 for i in range(N_LAYER):
     names += block_names(i)
 names += ["ln_out.weight", "ln_out.bias"]
+
+def _at(suffix, layer=0):
+    return _shapes[names.index(f"blocks.{layer}.att.{suffix}")]
+
+def _ffn(suffix, layer=0):
+    return _shapes[names.index(f"blocks.{layer}.ffn.{suffix}")]
+
+D_DECAY_LORA = _at("w1")[1]
+D_AAA_LORA = _at("a1")[1]
+D_GATE_LORA = _at("g1")[1]
+D_MV_LORA = _at("v1", 1)[1]                  # v-ветки нет на нулевом слое
+DIM_FFN = _ffn("key.weight")[0]
+H, N = _at("r_k")
+print(f"из чекпоинта: C={C} vocab={VOCAB} n_layer={N_LAYER} ffn={DIM_FFN} "
+      f"ранги w/a/v/g = {D_DECAY_LORA}/{D_AAA_LORA}/{D_MV_LORA}/{D_GATE_LORA} "
+      f"H={H} N={N}")
 
 sd_train, mp = _sd_train, _mp
 print("names:", len(names), "master_params:", len(mp))
