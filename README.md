@@ -18,14 +18,14 @@ real quantized kernel. Speed on an M4 MacBook Air 16 GB, fanless.
 
 | build | size | Δppl vs bf16 | en / ru / sr | decode | prefill |
 |---|---|---|---|---|---|
-| **`reduction`** (groupwise int6) | 1255.4 MB (2.43x) | **+0.77%** | +1.04 / +0.55 / +1.00% | 17.7 ms/tok | 437 tok/s |
-| **`compression`** (groupwise int4/5) | 970.2 MB (3.15x) | **+3.63%** | +4.01 / +3.40 / +3.78% | **14.8 ms/tok** | 545 tok/s |
+| **`reduction`** (Q6_K-style sym, 8-bit proj/head/emb) | 1435.1 MB (2.13x) | **+0.108%** | +0.18 / +0.01 / +0.25% | 17.00 ms/tok | **734 tok/s** |
+| **`compression`** (groupwise int4/5) | 970.2 MB (3.15x) | **+3.63%** | +4.01 / +3.40 / +3.78% | **13.15 ms/tok** | 612 tok/s |
 
 ### 2.9B (`rwkv7-g1h-2.9b`, bf16 ppl 7.1630, 5896 MB)
 
 | build | size | Δppl vs bf16 | en / ru / sr |
 |---|---|---|---|
-| **`reduction`** | 2420.9 MB (2.44x) | **+1.37%** | +0.93 / +1.57 / +1.36% |
+| **`reduction`** | 2736.8 MB (2.15x) | **+0.157%** | +0.27 / +0.04 / +0.32% |
 | **`compression`** | 1854.7 MB (3.18x) | **+4.24%** | +5.69 / +3.05 / +5.46% |
 
 ### Against llama.cpp (1.5B, same data split)
@@ -37,33 +37,53 @@ so both are reported as Δ% against their own FP baseline.
 
 | | size | Δppl | | | size | pp512 | tg128 |
 |---|---|---|---|---|---|---|---|
-| `reduction` | 1255 MB | +0.77% | | `compression` | 970 MB | 455.7 t/s | **65.6 t/s** |
+| `reduction` | 1435 MB | **+0.108%** | | `compression` | 970 MB | 612.3 t/s | **76.1 t/s** |
 | Q6_K + imatrix | 1336 MB | +0.19% | | Q4_K_M + imatrix | 990 MB | **745.2** | 58.2 t/s |
-| `compression` | 970 MB | +3.63% | | `reduction` | 1255 MB | 353.7 t/s | **54.9 t/s** |
-| Q4_K_M + imatrix | 990 MB | +3.44% | | Q6_K + imatrix | 1336 MB | **705.5** | 48.6 t/s |
+| `compression` | 970 MB | +3.63% | | `reduction` | 1435 MB | **734.4** | **58.8 t/s** |
+| Q4_K_M + imatrix | 990 MB | +3.44% | | Q6_K + imatrix | 1336 MB | 705.5 | 48.6 t/s |
 
-**Quality is at parity, within methodological error, at both points.**
-Decode is ours by **+12.8% and +12.9%** — the same margin at both sizes,
-so not noise. **Prefill we lose roughly 2x**: llama.cpp runs GEMM through
-BLAS+Metal, we dequantize to fp16 and matmul in MLX. That is the largest
-deliberate gap in the project; for a chat application it matters less
-than decode.
+At the near-lossless point we are now **ahead on all three axes at once**:
+`reduction` is +0.108% against Q6_K+imatrix's +0.19%, decodes **21%
+faster** (58.8 vs 48.6 t/s) and prefills **4% faster** (734.4 vs 705.5
+t/s), at a 7% larger file. `compression` decodes **31% faster** than
+Q4_K_M at comparable quality, and still loses prefill by 1.22x.
+
+> **Earlier versions of this README said "prefill we lose roughly 2x".**
+> Two separate errors were hiding there. `mx.compile` was never called on
+> the prefill path (fixing that alone was +35%), and 60% of what was left
+> turned out to be the *dequantization*, not the matmul — it was written
+> as a chain of MLX ops holding full-size intermediates and ran at
+> 4.4 GB/s. One Metal kernel took it from 10.68 ms to 0.84 ms per layer.
+> Neither was a modelling insight; both were found by decomposing a
+> number instead of trusting it.
 
 Without imatrix we look like winners (Q6_K +0.41%, Q4_K_M +7.65%) — the
 entire margin was explained by us having activation-aware scale search
 and them not. Reporting only that comparison would have been dishonest.
 
-### Efficiency against memory bandwidth (95.7 GB/s achievable, not the 120 on paper)
+### Against the machine's real ceilings (both measured, neither from a datasheet)
 
-| | traffic/token | achieved | share |
-|---|---|---|---|
-| `compression` | 878 MB | 57.6 GB/s | 60% |
-| `reduction` | 1146 MB | 62.9 GB/s | 66% |
-| Q4_K_M | ~905 MB | 52.6 GB/s | 55% |
+Decode is bound by **memory bandwidth**, prefill by **arithmetic**, and
+the two ceilings are different numbers that have to be measured
+separately. The bus is advertised at 120 GB/s and the GPU at rather more
+TFLOPS than we see; both figures are arithmetic, not measurements.
+Streaming reads top out at **104 GB/s** (`tests/bench_membw.py`, two
+independent instruments) and `mx.matmul` at **2.80 TFLOP/s**
+(`tests/bench_gemm_peak.py`, cold machine).
 
-We are already more bandwidth-efficient than llama.cpp. Closing the
-remaining ~35% to a sane ceiling is heavy micro-tuning, deliberately
-deferred.
+| | bound by | work per call | achieved | share of ceiling |
+|---|---|---|---|---|
+| `compression` decode | bandwidth | 878 MB/token | 66.8 GB/s | 64% |
+| `reduction` prefill (pp512) | arithmetic | 1.426 TFLOP | 2.05 TFLOP/s | 73% |
+
+(Per-token traffic is quoted only where it has been measured directly;
+it is not the file size, because `emb` is a gather of one row and the
+in-memory layout is not the on-disk one.)
+
+Prefill's remaining 27% is no longer the matmul: it decomposes into the
+WKV scan (12.7%), the LoRA branches (5.0%) and dequantization (3.9%).
+The WKV recurrence is the largest single item left and has never been
+looked at under prefill at all.
 
 > **Earlier versions of this README reported +0.12% and +2.47%.** Those
 > numbers came from an 8-sequence x 128-token slice of short English
@@ -154,9 +174,9 @@ sample size, language mix and context length. Degradation also *grows
 with context*, which a short-context corpus cannot see at all: quantization
 error in the channel-wise modulators inside the recurrence does not spoil
 one prediction, it distorts the state update and accumulates along the
-sequence. (`reduction` is +2.36% here and +0.77% in the table above
-because the table includes the `small=16` fix; see
-[Method](#method) item 4.)
+sequence. (`reduction` is +2.36% here and +0.108% in the table above:
+that row is a later preset — the `small=16` fix, the `sym` block layout,
+and 8-bit `proj`/`head`/`emb`. Same corpus, same kernel.)
 
 Every row is scored through its own real quantized kernel end-to-end (never
 a dequant-to-dense shortcut) — `reduction`/`compression` via
@@ -171,7 +191,7 @@ row; only the linear projections differ by scheme.
 ```python
 from rwkv_quant import quantize
 
-# near-lossless: 2.4x smaller, +0.77% ppl on the 1.5B reference
+# near-lossless: 2.1x smaller, +0.11% ppl on the 1.5B reference
 quantize("model.pth", "model.rwkvq", preset="reduction")
 
 # 3.2x smaller, +3.63% ppl, fastest decode
@@ -190,7 +210,11 @@ different files on two different days. Pass an explicit
 `act_stats_path`, or set it to `None`, if you need the result to be
 reproducible.
 
-Inference (Metal / MLX):
+Inference (Metal / MLX). Use `model.step`, not the raw
+`model.forward_stateful`: `step` is the `mx.compile`-wrapped entry point
+and its cache is keyed by shape, so the same object serves both a 512-token
+prefill and single-token decode. Calling the raw function costs 35% on
+prefill and 17% on decode:
 
 ```python
 from rwkv_quant.formats.reader import load_raw
@@ -198,7 +222,7 @@ from rwkv_quant.backends.metal.quant_model import QuantRWKV7
 
 model = QuantRWKV7(load_raw("model.rwkvq"))
 state = model.init_state(1)
-logits, state = model.forward_stateful(token_ids, state)   # prefill / decode
+logits, state = model.step(token_ids, state)   # prefill AND decode
 ```
 
 Presets are calibrated on `rwkv7-g1h-1.5b` — see
@@ -208,10 +232,22 @@ by hand (per-group bits, group scale sizes, scale modes, clipping).
 
 ## Format
 
-`.rwkvq` stores group-wise asymmetric quantization ("sb6"): blocks of 32
-weights share a 6-bit scale/min pair (`qs`/`qm`), superblocks of 256 share an
-fp16 pair (`d`/`dm`) that the 6-bit pairs multiply. Codes are packed as
-nibbles; INT5/INT6 add one/two bit-planes on top. Scale search is
+`.rwkvq` stores two block layouts, chosen per parameter group.
+
+**`sym`** (Q6_K-style, what `reduction` uses for `proj`/`cmix`/`emb`/`head`):
+blocks of **16** weights share one **int8** scale, superblocks of 16 blocks
+share an fp16 `d` that those int8 scales multiply. No per-block minimum at
+all. This costs 6.5625 bits/weight at 6-bit codes and 8.5625 at 8-bit —
+against `sb6`'s 6.5 — and buys a factor of 75 on `cmix`: at six bits a
+separate min is paid for twice (six bits for the min *and* a scale
+truncated to six bits), while halving the block and giving the scale a
+whole byte spends the same budget better.
+
+**`sb6`** (group-wise asymmetric, what `compression` uses and what the LoRA
+branches use in both presets): blocks of 32 weights share a 6-bit scale/min
+pair (`qs`/`qm`), superblocks of 256 share an fp16 pair (`d`/`dm`) that the
+6-bit pairs multiply. Codes are packed as nibbles; INT5/INT6 add one/two
+bit-planes on top. Scale search is
 activation-weighted where it helps (per-group setting). The format is
 backend-independent; per-tensor bits and modes live in the file, not in code.
 
