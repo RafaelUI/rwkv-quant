@@ -97,22 +97,40 @@ def bench(model):
 
 
 def main():
-    sd = torch.load(CKPT_PTH, map_location="cpu", mmap=True)
-    for name, preset in (("COMPRESSION", COMPRESSION), ("REDUCTION", REDUCTION)):
-        cfg = cfg_of(preset)
+    # ДВА ПУТИ ПОСТРОЕНИЯ, и это не удобство.
+    # Без аргументов -- сборка из .pth, как было. У неё две записанные
+    # неприятности: ACT_STATS указывает на файл, которого нет (AW тогда
+    # вырождается в обычный поиск -- на СКОРОСТЬ не влияет, на качество
+    # влияет), и воркспейс квантования держит около 7.7 ГБ, то есть замер
+    # скорости идёт впритык к свопу (закон 11).
+    # С аргументами -- ГОТОВЫЕ .rwkvq: меряется ровно тот артефакт, который
+    # лежит на диске, ни статистики, ни воркспейса не нужно. Числа обязаны
+    # воспроизводить прежние, и это проверка, а не допущение.
+    paths = [a for a in sys.argv[1:] if a.endswith(".rwkvq")]
+    if paths:
+        from rwkv_quant.formats.reader import load_raw
+        sources = [(os.path.basename(p), p) for p in paths]
+    else:
+        sd = torch.load(CKPT_PTH, map_location="cpu", mmap=True)
+        sources = [("COMPRESSION", COMPRESSION), ("REDUCTION", REDUCTION)]
+    for name, src in sources:
         t0 = time.time()
-        ckpt = QuantizedCheckpoint(
-            naming=NAMING, n_layer=N_LAYER, n_embd=N_EMBD, head_size=HEAD_SIZE,
-            vocab_size=VOCAB, config_repr=repr(cfg),
-            tensors={k: quantize_tensor(k, w, cfg, real_gw=True)
-                     for k, w in sd.items()})
-        model = QuantRWKV7(ckpt)
-        del ckpt
+        if paths:
+            model = QuantRWKV7(load_raw(src))
+        else:
+            cfg = cfg_of(src)
+            ckpt = QuantizedCheckpoint(
+                naming=NAMING, n_layer=N_LAYER, n_embd=N_EMBD,
+                head_size=HEAD_SIZE, vocab_size=VOCAB, config_repr=repr(cfg),
+                tensors={k: quantize_tensor(k, w, cfg, real_gw=True)
+                         for k, w in sd.items()})
+            model = QuantRWKV7(ckpt)
+            del ckpt
         gc.collect()
         pp, tg, ms, sw0, sw1 = bench(model)
         verdict = ("своп не рос" if sw1 <= sw0 else
                    f"СВОП ВЫРОС на {sw1-sw0:.0f} МБ -- ЗАМЕР НЕДЕЙСТВИТЕЛЕН")
-        print(f"{name:<14} pp{PP}={pp:7.1f} t/s   tg{TG}={tg:6.2f} t/s "
+        print(f"{name:<24} pp{PP}={pp:7.1f} t/s   tg{TG}={tg:6.2f} t/s "
               f"({ms:.2f} мс/ток)   [сборка {time.time()-t0:.0f}s]", flush=True)
         print(f"{'':<14} своп {sw0:.0f} -> {sw1:.0f} МБ: {verdict}", flush=True)
         del model

@@ -37,16 +37,16 @@ so both are reported as Δ% against their own FP baseline.
 
 | | size | Δppl | | | size | pp512 | tg128 |
 |---|---|---|---|---|---|---|---|
-| `reduction` | 1435 MB | **+0.108%** | | `compression` | 970 MB | 612.3 t/s | **76.1 t/s** |
+| `reduction` | 1435 MB | **+0.108%** | | `compression` | 970 MB | 633.2 t/s | **75.3 t/s** |
 | Q6_K + imatrix | 1336 MB | +0.19% | | Q4_K_M + imatrix | 990 MB | **745.2** | 58.2 t/s |
-| `compression` | 970 MB | +3.63% | | `reduction` | 1435 MB | **734.4** | **58.8 t/s** |
+| `compression` | 970 MB | +3.63% | | `reduction` | 1435 MB | **771.4** | **58.2 t/s** |
 | Q4_K_M + imatrix | 990 MB | +3.44% | | Q6_K + imatrix | 1336 MB | 705.5 | 48.6 t/s |
 
 At the near-lossless point we are now **ahead on all three axes at once**:
-`reduction` is +0.108% against Q6_K+imatrix's +0.19%, decodes **21%
-faster** (58.8 vs 48.6 t/s) and prefills **4% faster** (734.4 vs 705.5
-t/s), at a 7% larger file. `compression` decodes **31% faster** than
-Q4_K_M at comparable quality, and still loses prefill by 1.22x.
+`reduction` is +0.108% against Q6_K+imatrix's +0.19%, decodes **20%
+faster** (58.2 vs 48.6 t/s) and prefills **9% faster** (771.4 vs 705.5
+t/s), at a 7% larger file. `compression` decodes **29% faster** than
+Q4_K_M at comparable quality, and still loses prefill by 1.18x.
 
 > **Earlier versions of this README said "prefill we lose roughly 2x".**
 > Two separate errors were hiding there. `mx.compile` was never called on
@@ -74,16 +74,29 @@ independent instruments) and `mx.matmul` at **2.80 TFLOP/s**
 | | bound by | work per call | achieved | share of ceiling |
 |---|---|---|---|---|
 | `compression` decode | bandwidth | 878 MB/token | 66.8 GB/s | 64% |
-| `reduction` prefill (pp512) | arithmetic | 1.426 TFLOP | 2.05 TFLOP/s | 73% |
+| `reduction` prefill (pp512) | arithmetic | 1.426 TFLOP | 2.15 TFLOP/s | 77% |
 
 (Per-token traffic is quoted only where it has been measured directly;
 it is not the file size, because `emb` is a gather of one row and the
 in-memory layout is not the on-disk one.)
 
-Prefill's remaining 27% is no longer the matmul: it decomposes into the
-WKV scan (12.7%), the LoRA branches (5.0%) and dequantization (3.9%).
-The WKV recurrence is the largest single item left and has never been
-looked at under prefill at all.
+Prefill's remaining 23% is no longer the matmul: it decomposes into the
+WKV scan (7.7%), dequantization (5.5%) and the LoRA branches (5.3%).
+The WKV recurrence is still the largest single item, and it is the one
+place where the arithmetic ceiling does not help at all — the scan is
+sequential by construction.
+
+> **The WKV scan used to be 12.7% of prefill and is now 7.7%**, for a
+> bit-identical output (`tests/test_wkv_infer_parity.py`: 9 shapes across
+> three model scales, `max|Δ| = 0`). The inference kernel was reading each
+> row of `a/w/k/b/r` once per thread rather than once per threadgroup —
+> 1.34 GB of loads per call against 29.4 MB of useful traffic. Staging
+> them in threadgroup memory is worth 39 ms of prefill on 1.5B and 50 ms
+> on 2.9B and costs nothing, because it changes neither the arithmetic
+> nor the summation order. The same optimization had been sitting in the
+> *training* kernel next door, with a comment saying it was worth half
+> that kernel's runtime; it simply never crossed over. Two parallel
+> implementations of one idea do not share fixes.
 
 > **Earlier versions of this README reported +0.12% and +2.47%.** Those
 > numbers came from an 8-sequence x 128-token slice of short English

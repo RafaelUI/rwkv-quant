@@ -71,21 +71,31 @@ def bench(fn):
 
 def main():
     sw0 = swap_mb()
-    cfg = comp.CONFIGS[NAME]()
-    sd = torch.load(comp.CKPT, map_location="cpu", mmap=True)
-    n_layer = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("blocks."))
-    emb = sd["emb.weight"]
-    r_k = next(v for k, v in sd.items() if k.endswith("r_k"))
-    meta = dict(naming="world", n_layer=n_layer, n_embd=int(emb.shape[1]),
-                vocab_size=int(emb.shape[0]), head_size=int(r_k.shape[-1]))
-    tensors = {k: quantize_tensor(k, w, cfg, real_gw=True) for k, w in sd.items()}
-    model = QuantRWKV7(QuantizedCheckpoint(tensors=tensors, config_repr=repr(cfg),
-                                           **meta))
-    del tensors, sd
-    gc.collect()
-    mx.clear_cache()
+    if NAME.endswith(".rwkvq"):
+        # Готовый файл вместо сборки из .pth. Так меряется РОВНО тот
+        # артефакт, который лежит на диске (а не дельта-конфиг поверх
+        # живого пресета -- закон 30), и не нужен воркспейс квантования на
+        # 7.7 ГБ. Для СКОРОСТИ это эквивалентно: раскладка и размеры те же.
+        from rwkv_quant.formats.reader import load_raw
+        model = QuantRWKV7(load_raw(NAME))
+        gc.collect()
+        mx.clear_cache()
+    else:
+        cfg = comp.CONFIGS[NAME]()
+        sd = torch.load(comp.CKPT, map_location="cpu", mmap=True)
+        n_layer = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("blocks."))
+        emb = sd["emb.weight"]
+        r_k = next(v for k, v in sd.items() if k.endswith("r_k"))
+        meta = dict(naming="world", n_layer=n_layer, n_embd=int(emb.shape[1]),
+                    vocab_size=int(emb.shape[0]), head_size=int(r_k.shape[-1]))
+        tensors = {k: quantize_tensor(k, w, cfg, real_gw=True) for k, w in sd.items()}
+        model = QuantRWKV7(QuantizedCheckpoint(
+            tensors=tensors, config_repr=repr(cfg), **meta))
+        del tensors, sd
+        gc.collect()
+        mx.clear_cache()
 
-    D = meta["n_embd"]
+    D = int(model.emb_weight.shape[1])
     x = mx.array(np.random.randn(1, D).astype(np.float32))
     st = model.init_state(1)
     tok = mx.array(np.array([1], dtype=np.int32))
@@ -121,7 +131,8 @@ def main():
             acc[k].append(bench(fn))
 
     sw1 = swap_mb()
-    print(f"=== {NAME} на {os.path.basename(comp.CKPT)} ===")
+    src = NAME if NAME.endswith(".rwkvq") else os.path.basename(comp.CKPT)
+    print(f"=== {NAME} на {src} ===")
     print(f"своп: старт {sw0:.1f} -> вход в замер {sw_bench:.1f} -> "
           f"конец {sw1:.1f} МБ"
           + ("   *** НЕДЕЙСТВИТЕЛЕН: рос ВО ВРЕМЯ замера (закон 11) ***"
@@ -138,6 +149,25 @@ def main():
           f"запуски): {rest:.3f} мс = {100*rest/med['full']:.0f}%")
     print(f"голова отдельно: {med['gemv+head']-med['gemv']:.3f} мс")
     print(f"пол диспетчеризации (одна операция): {med['empty']:.3f} мс")
+
+    # ГБ/с В ФАЗЕ САМИХ ЧТЕНИЙ -- то, ради чего этот замер и ставится на
+    # двух пресетах. Внешний счётчик 16.08 дал 80 ГБ/с на REDUCTION и не
+    # выше 73 на COMPRESSION, и две версии («распаковка на 4-5 битах
+    # дороже» против «постоянная часть та же в мс, а шаг короче») тут
+    # разделяются: если полоса в GEMV-фазе у пресетов ОДИНАКОВА -- виновата
+    # постоянная часть и лечится оп-каунтом; если у COMPRESSION ниже --
+    # виновата распаковка и лечится кернелем.
+    try:
+        from trace_decode_steady import decode_traffic_mb
+        traf = decode_traffic_mb(model)
+        print(f"\nтрафик за токен (обход живых буферов): {traf:.1f} МБ")
+        print(f"полоса в GEMV-фазе:  {traf / med['gemv+head']:.1f} ГБ/с")
+        print(f"полоса по шагу целиком: {traf / med['full']:.1f} ГБ/с "
+              f"(так её видит внешний счётчик)")
+        print(f"постоянная часть (не-GEMV): {rest:.3f} мс = "
+              f"{100*rest/med['full']:.0f}% шага")
+    except Exception as e:  # noqa: BLE001
+        print(f"\nтрафик не посчитан: {type(e).__name__}: {e}")
     print(f"\nЕсли «остальное» -- это фьюзабельная мелочь, то его сокращение "
           f"вдвое даёт {med['full']-rest/2:.2f} мс/ток = "
           f"{1000/(med['full']-rest/2):.1f} ток/с против "
