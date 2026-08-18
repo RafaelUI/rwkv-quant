@@ -90,6 +90,20 @@ def main():
         pass
 
     def p_wkv():
+        """ВАЖНО: dtype заглушки обязан совпадать с dtype ЯДРА (fp32).
+
+        Инференсное ядро отдаёт fp32, а `r` -- fp16, поэтому прежняя
+        `mx.zeros_like(r)` снимала не только рекуррентность: весь хвост
+        блока (ln_x, bonus, gate) переезжал с fp32 на fp16, и разность
+        приписывала WKV чужую статью. На тренировочном пути ровно эта
+        ошибка раздула записанные «WKV 321 мс» -- скана там было 16 мс
+        (rwkv-metal/tests/probe_wkv_train_surround.py).
+        """
+        qm._wkv_stateful = lambda r, w, k, v, a, b, st: (
+            mx.zeros(r.shape, dtype=mx.float32), st)
+
+    def p_wkv16():
+        """ПРЕЖНЯЯ заглушка. Разность с p_wkv и есть цена fp32-хвоста."""
         qm._wkv_stateful = lambda r, w, k, v, a, b, st: (
             mx.zeros_like(r), st)
 
@@ -106,12 +120,13 @@ def main():
             (self.out_features, self.in_features), dtype=mx.float16)
 
     sw0 = swap_mb()
-    full, deltas = [], {"WKV": [], "LoRA": [], "деквант": []}
+    full, deltas = [], {"WKV": [], "WKV+хвост": [], "LoRA": [],
+                       "деквант": []}
     for r in range(ROUNDS):
         t_full = ab(p_none)
         full.append(t_full)
-        for name, patch in (("WKV", p_wkv), ("LoRA", p_lora),
-                            ("деквант", p_dq)):
+        for name, patch in (("WKV", p_wkv), ("WKV+хвост", p_wkv16),
+                            ("LoRA", p_lora), ("деквант", p_dq)):
             deltas[name].append(t_full - ab(patch))
         print(f"  раунд {r}: полный {t_full:.0f} мс | "
               + "  ".join(f"{k} {v[-1]:+.0f}" for k, v in deltas.items())
