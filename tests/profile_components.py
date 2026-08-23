@@ -133,9 +133,20 @@ def main():
             sys.exit(1)
 
     # --- рекуррентность
+    # ЗАКОН 34: ядро WKV отдаёт fp32 (И out, И state, см. wkv7_infer),
+    # а прежняя заглушка возвращала v -- dtype входа. Разность прежней
+    # аблации включала и цену перевода хвоста блока в другой dtype.
+    # Обе заглушки печатаются рядом; их разность -- цена dtype.
     _wkv = qm._wkv_stateful
-    ab("WKV-скан -> проброс",
-       lambda: setattr(qm, "_wkv_stateful", lambda r, w, k, v, a, b, st: (v, st)),
+    ab("WKV -> проброс fp32 (dtype-верная)",
+       lambda: setattr(qm, "_wkv_stateful",
+                       lambda r, w, k, v, a, b, st: (
+                           v.astype(mx.float32),
+                           st.astype(mx.float32))),
+       lambda: setattr(qm, "_wkv_stateful", _wkv))
+    ab("WKV -> проброс (ПРЕЖНЯЯ, dtype входа)",
+       lambda: setattr(qm, "_wkv_stateful",
+                       lambda r, w, k, v, a, b, st: (v, st)),
        lambda: setattr(qm, "_wkv_stateful", _wkv))
 
     # --- нормировки
