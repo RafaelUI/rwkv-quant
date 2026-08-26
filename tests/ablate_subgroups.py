@@ -88,7 +88,13 @@ SEQLEN = int(os.environ.get("RWKVQ_SEQLEN", 512))
 # точки. Файл с именем одного чекпоинта и содержимым другого в этом
 # проекте уже случался (закон 15), поэтому имя берётся целиком.
 TAG = os.path.splitext(os.path.basename(CKPT))[0].replace(".", "p")
-REF = os.environ.get("RWKVQ_KL_REF", f"/tmp/kl_ref_{TAG}_{NSEQ}x{SEQLEN}.npy")
+# КОРПУС -- ЧАСТЬ ИМЕНИ ЭТАЛОНА. Раньше имя зависело только от
+# чекпоинта, и смена RWKVQ_CORPUS молча переиспользовала эталон,
+# снятый на ДРУГОМ тексте: KL считался бы между логитами разных
+# последовательностей. Поймано при замере zh/code-корпуса.
+CTAG = os.path.splitext(os.path.basename(CORPUS))[0].replace(".", "p")
+REF = os.environ.get("RWKVQ_KL_REF",
+                     f"/tmp/kl_ref_{TAG}_{CTAG}_{NSEQ}x{SEQLEN}.npy")
 OUT = os.environ.get("RWKVQ_KL_OUT", f"/tmp/kl_subgroups_{TAG}.json")
 BUCKETS = [(0, 64), (64, 128), (128, 256), (256, 512)]
 

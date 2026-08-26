@@ -18,7 +18,7 @@ real quantized kernel. Speed on an M4 MacBook Air 16 GB, fanless.
 
 | build | size | Δppl vs bf16 | en / ru / sr | decode | prefill |
 |---|---|---|---|---|---|
-| **`reduction`** (Q6_K-style sym, 8-bit proj/head/emb) | 1435.1 MB (2.13x) | **+0.108%** | +0.18 / +0.01 / +0.25% | 17.00 ms/tok | **734 tok/s** |
+| **`reduction`** (Q6_K-style sym, 8-bit proj/head/emb) | 1435.1 MB (2.13x) | **+0.108%** | +0.18 / +0.01 / +0.25% | 15.78 ms/tok | **745 tok/s** |
 | **`compression`** (groupwise int4/5) | 970.2 MB (3.15x) | **+3.63%** | +4.01 / +3.40 / +3.78% | **13.15 ms/tok** | 612 tok/s |
 
 ### 2.9B (`rwkv7-g1h-2.9b`, bf16 ppl 7.1630, 5896 MB)
@@ -205,23 +205,46 @@ row; only the linear projections differ by scheme.
 from rwkv_quant import quantize
 
 # near-lossless: 2.1x smaller, +0.11% ppl on the 1.5B reference
-quantize("model.pth", "model.rwkvq", preset="reduction")
+quantize("model.pth", "model.rwkvq", preset="reduction", tokenizer=tok)
 
 # 3.2x smaller, +3.63% ppl, fastest decode
-quantize("model.pth", "model.rwkvq", preset="compression")
+quantize("model.pth", "model.rwkvq", preset="compression", tokenizer=tok)
 ```
 
-Both presets use activation-weighted (AW) scale search and expect activation
-statistics at the path set in `QuantConfig.act_stats_path`
-(`tests/collect_act_stats.py` produces them in ~30 s).
+`tokenizer` is required, and not for metadata. Both presets use
+activation-weighted (AW) scale search: the scale for each group is chosen
+by an error weighted with the mean square activation of the input
+channels. Collecting that statistic means running the model over some
+text, and the text has to be split with the same vocabulary the
+checkpoint was trained on — which is a property of your model, not of
+this library. Pass anything with an `.encode` method, a callable, or a
+path to a vocabulary file.
 
-**If that file is missing, the AW modes silently degrade to their
-non-weighted variants** — you still get a valid checkpoint of the same
-format, just quantized slightly differently. The default path lives in
-`/tmp` and does not survive a reboot, so the same call can produce two
-different files on two different days. Pass an explicit
-`act_stats_path`, or set it to `None`, if you need the result to be
-reproducible.
+Everything else is automatic: `quantize()` tokenizes the calibration
+corpus shipped in `rwkv_quant/data/calib_corpus.txt`, collects the
+statistics itself and caches them under `~/.cache/rwkv-quant`. Budget
+about six minutes for a 1.5B checkpoint on the first call and nothing on
+later ones. The collection pass needs the dense model in memory (~3 GB
+for 1.5B, ~6 GB for 2.9B); it runs before quantization and frees the
+model afterwards, so the process peak is the larger of the two steps, not
+their sum.
+
+Why this is not optional. Without the statistics, AW degrades to an
+unweighted search, and measured on the 1.5B reference that costs 38% in
+KL divergence from the bf16 model (0.004021 vs 0.002908 nats/token) and
+0.78 points of top-1 agreement. You can still ask for it explicitly with
+`act_stats=None`, and you can supply your own file with
+`act_stats="/path/to/stats.pt"`.
+
+The calibration corpus is small on purpose but wide on purpose too. The
+statistic saturates at about a thousand tokens — 2, 4 and 17 sequences
+give the same result within 2% — so size is not the lever. Coverage of
+writing systems is: calibrating on Russian, English and Serbian and then
+running Chinese or source code measures 0.004096 KL, which is no better
+than having no statistics at all (0.003783). Adding Chinese and code to
+the calibration brings that to 0.002888 and costs the original languages
+nothing. If your models will see a script the shipped corpus does not
+cover, extend it.
 
 Inference (Metal / MLX). Use `model.step`, not the raw
 `model.forward_stateful`: `step` is the `mx.compile`-wrapped entry point

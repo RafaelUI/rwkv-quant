@@ -154,6 +154,89 @@ def _dense(qt) -> mx.array:
     return mx.array(dequantize_banded(qt, dt).numpy())
 
 
+# ── ТАБЛИЦА ЭМБЕДДИНГА: GATHER ВМЕСТО ПЛОТНОГО fp16 ────────────────────
+#
+# ЗАЧЕМ. Плотная таблица -- крупнейшая одиночная статья памяти инференса.
+# Измерено (tests/probe_emb_article.py, 1.5B, T=512, прогретый кеш):
+# аллокаторный пик 1607 -> 1339 МБ (-268, ровно таблица), а footprint
+# процесса 3687 -> 3003 МБ (-684). Расхождение не шум: `_dense` строит
+# fp16-таблицу в торче (268 МБ), копирует её в mx.array (ещё 268) и
+# читает страницы упакованного тензора (144); 268+268+144 = 680 при
+# измеренных 684. Gather снимает всё это разом -- плотной таблицы не
+# существует ни в торче, ни в MLX, резидентны только коды (143.7 МБ).
+#
+# ПОЧЕМУ ОПЕРАЦИЯМИ MLX, А НЕ ТОРЧЕМ НА CPU. Декод идёт через
+# mx.compile(forward_stateful), а emb-gather -- первая строка этой
+# функции. Выход в питон под compile падает с "[eval] Attempting to eval
+# an array during function transformations" (проверено). Значит буферы
+# обязаны жить в MLX целиком.
+#
+# ТОЖДЕСТВО. Плотный путь считает в fp32, округляет в BFLOAT16
+# (reader._dequantize_gw_sym) и лишь потом кладёт результат в fp16
+# (dequantize_banded). То есть таблица несёт точность bf16 в fp16-
+# контейнере. Здесь повторены ОБА округления: пропустить bf16 значило бы
+# сделать gather ТОЧНЕЕ эталона, а это смена чисел, требующая ppl-гейта,
+# а не оптимизация памяти. Гейт равенства -- tests/test_emb_gather_parity.py.
+#
+# RWKVQ_EMB_GATHER=1 (или qm.EMB_GATHER = True) включает; переключение
+# рантайм-флагом в ОДНОМ процессе -- закон 27.
+EMB_GATHER = os.environ.get("RWKVQ_EMB_GATHER") == "1"
+
+
+class SymGatherEmb:
+    """Вид на sym-таблицу: строки деквантуются по требованию.
+
+    Только раскладка `sym` при восьми битах (codes -- знаковые байты) и
+    только при IN, кратном группе. Всё остальное -- COMPRESSION (sb6,
+    отложен владельцем) и ragged-формы -- сюда не попадает: фабрика
+    ниже отдаёт для них плотный путь. Списка раскладок здесь СОЗНАТЕЛЬНО
+    нет (закон 23: седьмое место, перечисляющее раскладки, -- это седьмое
+    место, где правка может не переехать), вместо него узкая проверка
+    применимости и явный отказ."""
+
+    def __init__(self, qt):
+        OUT, IN = qt.shape
+        self.shape = (OUT, IN)
+        self.dtype = mx.float16
+        self.gs = qt.gw_gs
+        self.sb = qt.gw_sb
+        self.nb = IN // self.gs
+        self.codes = mx.array(qt.codes.numpy())                  # int8 [V, IN]
+        self.qs = mx.array(qt.gw_qs.numpy())                     # int8 [V, NB]
+        self.d = mx.array(qt.gw_d.float().numpy())               # fp32 [V, NSB]
+
+    def __getitem__(self, idx):
+        c = self.codes[idx].astype(mx.float32)                   # [..., IN]
+        qs = self.qs[idx].astype(mx.float32)                     # [..., NB]
+        d = mx.repeat(self.d[idx], self.sb, axis=-1)             # [..., NB]
+        # s = half(qs * d) -- ровно как в кернеле и в codec.dequant_sym
+        scale = (qs * d).astype(mx.float16).astype(mx.float32)
+        w = c.reshape(c.shape[:-1] + (self.nb, self.gs)) * scale[..., None]
+        w = w.reshape(c.shape)
+        return w.astype(mx.bfloat16).astype(mx.float16)
+
+
+def _emb_table(qt):
+    """Плотный fp16 или gather -- по флагу И по применимости раскладки."""
+    if not EMB_GATHER:
+        return _dense(qt)
+    OUT, IN = qt.shape
+    ok = (getattr(qt, "gw_mode", "") == "sym"
+          and getattr(qt, "codes", None) is not None
+          and getattr(qt, "gw_gs", 0) > 0 and IN % qt.gw_gs == 0
+          and getattr(qt, "gw_qs", None) is not None
+          and getattr(qt, "gw_d", None) is not None)
+    if not ok:
+        # ОТКАЗ ГРОМКИЙ: молчаливый откат к плотному пути читался бы как
+        # "gather включён и ничего не дал" -- ровно та неразличимость,
+        # на которой горели мутационные крышки.
+        print("emb-gather НЕ применим (mode=%s, bits=%s, IN=%d, gs=%s) -- "
+              "плотный путь" % (getattr(qt, "gw_mode", "?"), qt.bits, IN,
+                                getattr(qt, "gw_gs", "?")))
+        return _dense(qt)
+    return SymGatherEmb(qt)
+
+
 def reset_lora_q(model):
     """Сбросить квантованные LoRA-буферы во всех слоях.
 
@@ -850,7 +933,7 @@ class QuantRWKV7:
         self.vocab_size = ckpt.vocab_size
         tensors = ckpt.tensors
 
-        self.emb_weight = _dense(tensors["emb.weight"])   # gather, всегда dense
+        self.emb_weight = _emb_table(tensors["emb.weight"])
         self.head = _linear(tensors["head.weight"])
 
         if self.naming == "custom":

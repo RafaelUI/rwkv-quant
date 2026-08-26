@@ -8,6 +8,8 @@
                                           квантованию НЕ переносится между
                                           масштабами модели)
 """
+import copy
+import os
 import time
 
 import torch
@@ -19,25 +21,78 @@ from .calibration.outlier_scan import GROUP_KEY_PATTERNS
 from .calibration import schema_space as _ss
 from .models.rwkv7_ref import RWKV7Ref
 from .formats import save, quantize_file  # noqa: F401 (save -- публичный API)
-
-
+from .calibration import act_stats as act_stats_mod
 def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
              config: QuantConfig = None, real_gw: bool = True,
-             verbose: bool = True, tokenizer: str = None):
+             verbose: bool = True, tokenizer=None, act_stats="auto"):
     """
-    Quick-start: quantize(ckpt, out, preset="compression")
-    Advanced:    quantize(ckpt, out, config=QuantConfig(proj=4, ...))
+    Quick-start: quantize(ckpt, out, tokenizer=tok, preset="compression")
+    Advanced:    quantize(ckpt, out, tokenizer=tok, config=QuantConfig(proj=4, ...))
 
     preset игнорируется, если передан config.
 
     real_gw=True (по умолчанию) -- реальная упаковка sb6, файл сжимается.
     real_gw=False -- fake-quant для измерения ppl: та же математика ошибки,
     но веса остаются плотными bf16 и файл НЕ уменьшается.
+
+    tokenizer -- объект с .encode, callable или путь к словарю. Нужен не
+    для метаданных, а для КАЛИБРОВКИ: пресеты взвешивают ошибку по
+    активности входных каналов, а чтобы её измерить, репозиторный корпус
+    (rwkv_quant/data/calib_corpus.txt) надо разобрать ТЕМ ЖЕ словарём, что
+    у чекпоинта. Своего токенизатора библиотека не везёт -- он привязан к
+    модели, а не к нам.
+
+    act_stats:
+      "auto" (умолчание) -- снять статистику самим и закешировать в
+        ~/.cache/rwkv-quant; занимает секунды, но требует прямого прохода
+        по ПЛОТНОЙ модели (~3 ГБ на 1.5B, ~6 ГБ на 2.9B). Шаг идёт ДО
+        квантования и память освобождается, поэтому пик процесса --
+        максимум из двух, а не сумма;
+      путь -- взять готовый файл (проверка принадлежности чекпоинту
+        остаётся на вызывающем);
+      None -- ОСОЗНАННО без AW. Измеренная цена: KL(bf16 || квант) хуже на
+        38%, top-1 на 0.78 п.п. (NEXT_SESSION, раздел 9).
     """
     if config is None:
         if preset not in PRESETS:
             raise ValueError(f"unknown preset {preset!r}, choose from {list(PRESETS)}")
-        config = PRESETS[preset]
+        # КОПИЯ, а не сам пресет: ниже проставляется act_stats_path, а
+        # PRESETS -- разделяемые объекты уровня модуля. Мутация утекла бы
+        # в следующий вызов quantize() в том же процессе.
+        config = copy.deepcopy(PRESETS[preset])
+    else:
+        config = copy.deepcopy(config)
+
+    calib_sig = None
+    needs_aw = any(str(m).endswith("_aw")
+                   for m in (config.group_scale_mode or {}).values())
+    if act_stats == "auto":
+        if needs_aw:
+            stats, calib_sig = act_stats_mod.collect(
+                checkpoint_path, tokenizer, verbose=verbose)
+            config.act_stats_path = os.path.join(
+                act_stats_mod.CACHE_DIR, "act_%s.pt" % calib_sig)
+            del stats
+        else:
+            config.act_stats_path = None
+    elif act_stats is None:
+        # Отказ ОСОЗНАННЫЙ и видимый: тихое вырождение AW -- это ровно та
+        # ошибка, из-за которой сбор и переехал в библиотеку.
+        if needs_aw and verbose:
+            print("[act_stats] ОТКЛЮЧЕНО вызывающим: AW-режимы вырождаются "
+                  "в невзвешенный поиск (измеренная цена: KL +38%)")
+        config.act_stats_path = None
+    else:
+        if not os.path.exists(act_stats):
+            raise FileNotFoundError("act_stats=%r не существует" % act_stats)
+        config.act_stats_path = act_stats
+
+    # В манифест едет ОПИСАНИЕ калибровки, а не только имя словаря: файл
+    # должен сам отвечать на вопрос "чем это калибровалось".
+    tok_label = tokenizer if isinstance(tokenizer, str) else (
+        type(tokenizer).__name__ if tokenizer is not None else None)
+    if calib_sig:
+        tok_label = "%s (calib %s)" % (tok_label or "?", calib_sig)
 
     # Потоковый путь: mmap + потензорное квантование с немедленным
     # освобождением, метаданные -- из форм тензоров. Прежняя версия
@@ -45,7 +100,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     # всю модель в bf16, 5.9 ГБ на 2.9B), потом грузила state_dict ЕЩЁ
     # РАЗ целиком -- на 16 ГБ это давало пик 9-12 ГБ и своп.
     return quantize_file(checkpoint_path, output_path, config,
-                         real_gw=real_gw, verbose=verbose, tokenizer=tokenizer)
+                         real_gw=real_gw, verbose=verbose, tokenizer=tok_label)
 
 
 def _load_corpus(path, device, n_seq=None, seq_len=None):

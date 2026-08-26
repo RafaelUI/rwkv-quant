@@ -115,6 +115,22 @@ def preset_cfg():
     return cfg
 
 
+def preset_noaw_cfg():
+    """НЫНЕШНИЙ пресет БЕЗ act_stats -- то есть ровно то, что получает
+    разработчик, у которого статистики нет (а её нет ни у кого, кроме
+    этой машины: `presets.py` указывает на /tmp, который не переживает
+    перезагрузку).
+
+    Сейчас такой вызов НЕ падает и НЕ предупреждает: AW-режимы молча
+    вырождаются в свои `_search`-варианты, артефакт остаётся корректным,
+    но ОТЛИЧАЕТСЯ от того, на чём сняты все записанные числа. Это плечо
+    измеряет ЦЕНУ такого вырождения -- то есть отвечает на вопрос, можно
+    ли зависимость от статистики просто убрать."""
+    cfg = copy.deepcopy(REDUCTION)
+    cfg.act_stats_path = None
+    return cfg
+
+
 def with_sym(cfg, *groups):
     """Перевести группы на Q6_K-раскладку: блок 16 вместо 32, режим sym_aw."""
     cfg = copy.deepcopy(cfg)
@@ -142,6 +158,7 @@ CONFIGS = {
     # нынешний пресет как он есть в presets.py -- отдельным именем, чтобы
     # дельта-конфиги ниже остались привязаны к своей исторической базе
     "preset": preset_cfg,
+    "preset_noaw": preset_noaw_cfg,
     "reduction": base_cfg,
     "reduction_sym_cmix": lambda: with_sym(base_cfg(), "cmix"),
     "reduction_sym_cmix_proj": lambda: with_sym(base_cfg(), "cmix", "proj"),

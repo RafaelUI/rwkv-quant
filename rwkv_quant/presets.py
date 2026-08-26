@@ -102,7 +102,7 @@ REDUCTION = QuantConfig(
                  "w_lora": 64, "a_lora": 64, "v_lora": 64},
     group_scale_mode={"proj": "sym_aw", "cmix": "sym_aw",
                       "emb": "sym_aw", "head": "sym_aw"},
-    act_stats_path="/tmp/act_stats_1p5b.pt",
+    act_stats_path=None  # проставляется quantize(): см. ниже,
 )
 
 # COMPRESSION: "чемпион" из сессий 17.07-18.07. ЧИСЛА (мультиязычный
@@ -129,7 +129,17 @@ COMPRESSION = QuantConfig(
                  "w_lora": 64, "a_lora": 64, "v_lora": 64},
     group_scale_mode={"proj": "asym_sb6_aw", "cmix": "asym_sb6_aw",
                       "emb_head": "asym_sb6_aw"},
-    act_stats_path="/tmp/act_stats_1p5b.pt",
+    act_stats_path=None  # проставляется quantize(): см. ниже,
 )
+
+# ПУТЬ К СТАТИСТИКЕ ЗДЕСЬ БОЛЬШЕ НЕ ЖИВЁТ. Раньше пресеты указывали на
+# /tmp/act_stats_1p5b.pt, и это было неверно дважды: /tmp не переживает
+# перезагрузку, а на любом чекпоинте, кроме 1.5B, число входных каналов не
+# совпадало -- get_ex2 молча возвращал None, и AW вырождался в невзвешенный
+# поиск. Измеренная цена такого молчания: KL(bf16 || квант) хуже на 38%
+# (0.004021 против 0.002908 нат/токен), top-1 на 0.78 п.п.
+# Теперь статистику снимает quantize() по репозиторному корпусу
+# (rwkv_quant/data/calib_corpus.txt) тем токенизатором, который передал
+# вызывающий, и кладёт в ~/.cache/rwkv-quant.
 
 PRESETS = {"reduction": REDUCTION, "compression": COMPRESSION}

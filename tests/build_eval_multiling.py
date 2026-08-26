@@ -36,8 +36,15 @@ sys.path.insert(0, os.path.expanduser("~/Develop/rwkv-metal"))
 from rwkv_metal.tokenizer.world_tokenizer import WorldTokenizer  # noqa: E402
 
 SRC = os.path.expanduser("~/Develop/test.txt")
-OUT = os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt")
-OUT_CALIB = os.path.expanduser("~/Develop/WKV-kvant/act_calib_multiling.pt")
+# ВЫХОД ПО УМОЛЧАНИЮ -- НОВЫЕ ИМЕНА, старые файлы не трогаются. Прежний
+# eval_corpus_multiling.pt -- база всех записанных чисел (закон 27:
+# "база" в A/B обязана быть замороженной копией), а этот прогон добавляет
+# в корпус два новых языка и потому даёт ДРУГОЙ файл. Перезаписать
+# старое имя значило бы задним числом сменить базу у всех таблиц.
+OUT = os.environ.get("RWKVQ_OUT_EVAL", os.path.expanduser(
+    "~/Develop/WKV-kvant/eval_corpus_multiling_v2.pt"))
+OUT_CALIB = os.environ.get("RWKVQ_OUT_CALIB", os.path.expanduser(
+    "~/Develop/WKV-kvant/act_calib_multiling_v2.pt"))
 SEQ_LEN = 512
 CALIB_TOKENS = 2000   # на язык; E[x^2] по каналам сходится быстро
 
@@ -45,9 +52,35 @@ CALIB_TOKENS = 2000   # на язык; E[x^2] по каналам сходитс
 # а специфические буквы ј/љ/њ/ћ/џ/ђ, которых в русском нет вовсе.
 _SR = re.compile(r"[јљњћџђЈЉЊЋЏЂ]")
 _CYR = re.compile(r"[Ѐ-ӿ]")
+_CJK = re.compile(r"[\u3400-\u9fff]")
+_BRACKETS = "{};()="
 
 
 def detect_lang(text: str) -> str:
+    """ru / en / sr / zh / code.
+
+    ЗАЧЕМ ДОБАВЛЕНЫ zh И code. Прежняя версия знала три языка, и любой
+    текст без кириллицы уходил в "en" -- то есть и китайский (cyr=0,
+    lat=0), и исходники (латиницы много). Оба попали бы в английское
+    ведро: ppl по языкам перестал бы что-либо значить, а отбор
+    калибровочных чанков (CALIB_TOKENS на ЯЗЫК) молча выдал бы английскому
+    втрое больше квоты.
+
+    Порядок проверок обязателен: сначала иероглифы (у них нет ни
+    кириллицы, ни латиницы), потом код (в нём латиницы много, но и скобок
+    вчетверо больше, чем в самой технической прозе), и только потом
+    кириллица против латиницы.
+
+    Порог по скобкам ИЗМЕРЕН на этом корпусе, а не выбран: у трёх
+    исходников плотность `{};()=` -- 6.4%, 3.9%, 4.6% на символ, у самой
+    скобочной прозы (сербская статья про ОС) -- 1.1%, у остальной прозы
+    ниже 0.6%. Порог 2% лежит посередине в логарифме. Раскладка чанков по
+    языкам печатается ниже -- ошибка классификации обязана быть видна
+    глазом, а не всплыть в разбивке ppl."""
+    if len(_CJK.findall(text)) > 0.2 * max(len(text), 1):
+        return "zh"
+    if sum(text.count(c) for c in _BRACKETS) > 0.02 * max(len(text), 1):
+        return "code"
     cyr = len(_CYR.findall(text))
     lat = sum(1 for c in text if c.isascii() and c.isalpha())
     if cyr <= lat:
