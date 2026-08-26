@@ -93,8 +93,18 @@ TAG = os.path.splitext(os.path.basename(CKPT))[0].replace(".", "p")
 # снятый на ДРУГОМ тексте: KL считался бы между логитами разных
 # последовательностей. Поймано при замере zh/code-корпуса.
 CTAG = os.path.splitext(os.path.basename(CORPUS))[0].replace(".", "p")
+# ТИП ЭТАЛОНА -- ЧАСТЬ ИМЕНИ И ПО УМОЛЧАНИЮ fp32 (26.08, закон 38).
+# Прежний эталон снимался в bf16, то есть В ТОМ ЖЕ ТИПЕ, что и одно из
+# сравниваемых плеч, и вносил СВОЮ ошибку: измерено, что MLX-путь БЕЗ
+# квантования отстоит от bf16-эталона на 0.000575 нат/токен, а от fp32 --
+# на 0.000002. То есть линейка была грубее измеряемого. Записанные под
+# bf16-эталоном числа завышены: композит 1.5B на 5% (fake-путь) и на 17%
+# (реальный). Они НЕ пересчитаны задним числом -- вместо этого тип едет
+# в имя файла, чтобы старое и новое не смешались молча (закон 30).
+# RWKVQ_REF_DTYPE=bf16 возвращает прежнее поведение.
+REF_DTYPE = os.environ.get("RWKVQ_REF_DTYPE", "fp32")
 REF = os.environ.get("RWKVQ_KL_REF",
-                     f"/tmp/kl_ref_{TAG}_{CTAG}_{NSEQ}x{SEQLEN}.npy")
+                     f"/tmp/kl_ref_{TAG}_{CTAG}_{NSEQ}x{SEQLEN}_{REF_DTYPE}.npy")
 OUT = os.environ.get("RWKVQ_KL_OUT", f"/tmp/kl_subgroups_{TAG}.json")
 BUCKETS = [(0, 64), (64, 128), (128, 256), (256, 512)]
 
@@ -194,7 +204,14 @@ def build_ref():
     print(f"эталон bf16 -> {REF}  [{NSEQ}, {T}, {V}] float32 = "
           f"{NSEQ*T*V*4/1e9:.2f} ГБ", flush=True)
     mem("старт")
-    model = RWKV7Ref(CKPT, device="mps", dtype=torch.bfloat16)
+    # fp32 считается на CPU: у MPS нет гарантии, что внутренние редукции
+    # не срежутся, а вопрос здесь как раз о точности. Цена -- 34 с на
+    # 1.5B и 9 с на 0.1B, то есть дешевле любого прогона, ради которого
+    # эталон делается.
+    dev, dt = (("cpu", torch.float32) if REF_DTYPE == "fp32"
+               else ("mps", torch.bfloat16))
+    print(f"  эталон в {REF_DTYPE} на {dev}", flush=True)
+    model = RWKV7Ref(CKPT, device=dev, dtype=dt)
     mm = np.lib.format.open_memmap(REF, mode="w+", dtype=np.float32,
                                    shape=(NSEQ, T, V))
     for i, lg in enumerate(logits_of(model, data)):

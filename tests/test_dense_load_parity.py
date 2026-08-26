@@ -174,13 +174,20 @@ def check_file(path, band_mb=1.0):
 
 
 def main():
-    paths = sys.argv[1:] or ["/tmp/reduction.rwkvq",
-                             "/tmp/reduction_sym_head8.rwkvq"]
+    # Умолчания -- ФАЙЛЫ, КОТОРЫЕ СОЗДАЁТ tests/restore_tmp.sh. Прежние
+    # два имени (reduction.rwkvq, reduction_sym_head8.rwkvq) он не
+    # восстанавливает, поэтому гейт пропускал ОБА случая и всё равно
+    # печатал зелёный -- закон 31 в чистом виде: гейт был зелен, ничего
+    # не проверив. Ниже добавлена проверка на ноль исполненных случаев.
+    paths = sys.argv[1:] or ["/tmp/reduction_new.rwkvq",
+                             "/tmp/reduction_2p9b_new.rwkvq"]
     bad = 0
+    ran = 0
     for path in paths:
         if not os.path.exists(path):
             print(f"ПРОПУЩЕН (нет файла): {path}")
             continue
+        ran += 1
         n, n_banded, max_bands, fails = check_file(path)
         comp = " ".join(f"{k}={v}" for k, v in n.items() if v)
         print(f"\n{os.path.basename(path)}: {comp}")
@@ -200,10 +207,16 @@ def main():
             print("  равенство: ЗЕЛЁНЫЙ (деквант, полосы, _dense)")
 
     print()
+    if not ran:
+        print("ГЕЙТ КРАСНЫЙ: не исполнено НИ ОДНОГО случая -- ни один из "
+              "файлов не найден. Зелёный статус здесь означал бы только "
+              "то, что проверять было нечего (закон 31). "
+              "Запустите tests/restore_tmp.sh.")
+        sys.exit(1)
     if bad:
         print(f"ГЕЙТ КРАСНЫЙ: {bad} расхождений")
         sys.exit(1)
-    print("ГЕЙТ ЗЕЛЁНЫЙ")
+    print(f"ГЕЙТ ЗЕЛЁНЫЙ ({ran} файлов проверено)")
 
 
 if __name__ == "__main__":
