@@ -43,8 +43,8 @@ from rwkv_quant.backends.metal.quant_model import QuantRWKV7  # noqa: E402
 
 CKPT_PTH = os.path.expanduser("~/Develop/rwkv7-g1h-2.9b-ctx10240.pth")
 CORPUS = os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt")
-OUT_JSON = os.path.expanduser("~/Develop/WKV-kvant/eval_2p9b.json")
-ACT_STATS = "/tmp/act_stats_2p9b_multiling.pt"
+OUT_JSON = os.environ.get("RWKVQ_EVAL_JSON", os.path.expanduser("~/Develop/WKV-kvant/eval_2p9b.json"))
+ACT_STATS = os.environ.get("RWKVQ_ACT_STATS", "/tmp/act_stats_2p9b_multiling.pt")
 NAMING, N_LAYER, N_EMBD, HEAD_SIZE, VOCAB = "world", 32, 2560, 64, 65536
 
 

@@ -50,7 +50,10 @@ class QuantizedTensor:
     shape: tuple
     # ориентация хранения: True = сырая LoRA [in,out], потребитель обязан
     # транспонировать после декванта (см. codec.is_transposed)
-    transposed: bool = False
+    # None = вывести из имени ключа (единственная таблица -- в codec).
+    # Ручные сборки QuantizedTensor не знают про ориентацию, и умолчание
+    # False для сырой LoRA молча давало [in,out] под видом [out,in].
+    transposed: bool = None
     codes: torch.Tensor = None    # int8 [out,in], только если 5 <= bits < 16
     codes_packed: torch.Tensor = None  # uint8 [out,ceil(in/2)], только если bits <= 4
     scale: torch.Tensor = None    # fp16, per-row [n_rows, 1], только если bits < 16
@@ -83,6 +86,11 @@ class QuantizedTensor:
                                   # 8 бит и только scale -- ровно та
                                   # экономия, ради которой Q6_K и берётся
 
+
+    def __post_init__(self):
+        if self.transposed is None:
+            from . import codec
+            self.transposed = codec.is_raw_lora_world(self.key)
 
 @dataclass
 class QuantizedCheckpoint:

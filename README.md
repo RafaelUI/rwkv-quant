@@ -14,21 +14,83 @@ Quality on a **multilingual held-out corpus** (38 x 512 tokens = 19 456
 predictions; Russian / English / Serbian), scored end-to-end through the
 real quantized kernel. Speed on an M4 MacBook Air 16 GB, fanless.
 
-### 1.5B (`rwkv7-g1h-1.5b`, bf16 ppl 8.1980, 3055 MB)
+### Quality across four scales
 
-| build | size | Δppl vs bf16 | en / ru / sr | decode | prefill |
+Same corpus, same tokenizer, same harness for every row. `reduction` is the
+near-lossless preset, `compression` trades quality for size. Sizes are the
+actual `.rwkvq` files on disk.
+
+| model | bf16 ppl | build | size | Δppl (all) | en / ru / sr |
 |---|---|---|---|---|---|
-| **`reduction`** (Q6_K-style sym, 8-bit proj/head/emb) | 1435.1 MB (2.13x) | **+0.108%** | +0.18 / +0.01 / +0.25% | 15.78 ms/tok | **745 tok/s** |
-| **`compression`** (groupwise int4/5) | 970.2 MB (3.15x) | **+3.63%** | +4.01 / +3.40 / +3.78% | **13.15 ms/tok** | 612 tok/s |
+| **0.1B** (`rwkv7-g1d-0.1b`) | 15.183 | `reduction` | 190.7 MB (2.00x) | **+0.33%** | +0.21 / +0.22 / +0.69% |
+| | | `compression` | 126.8 MB (3.01x) | **+10.59%** | +6.70 / +8.73 / +19.02% |
+| **0.4B** (`rwkv7-g1d-0.4b`) | 10.994 | `reduction` | 433.1 MB (2.08x) | **+0.33%** | +0.16 / +0.36 / +0.42% |
+| | | `compression` | 291.3 MB (3.10x) | **+5.37%** | +4.32 / +5.08 / +7.10% |
+| **1.5B** (`rwkv7-g1h-1.5b`) | 8.198 | `reduction` | 1435.1 MB (2.13x) | **+0.15%** | +0.36 / -0.05 / +0.40% |
+| | | `compression` | 970.6 MB (3.15x) | **+4.03%** | +4.57 / +3.28 / +5.19% |
+| **2.9B** (`rwkv7-g1h-2.9b`) | 7.163 | `reduction` | 2737.3 MB (2.15x) | **+0.24%** | +0.37 / +0.11 / +0.38% |
+| | | `compression` | 1855.2 MB (3.18x) | **+5.10%** | +6.09 / +4.12 / +6.31% |
 
-### 2.9B (`rwkv7-g1h-2.9b`, bf16 ppl 7.1630, 5896 MB)
+Perplexity is a coarse instrument at these margins, so `reduction` is also
+scored by **KL divergence against an fp32 reference** — same weights, same
+inputs, activations in fp32 — on 8 x 512 tokens through the real quantized
+kernel. This separates rows that ppl cannot:
 
-| build | size | Δppl vs bf16 | en / ru / sr |
+| model | KL vs fp32 (nats/token) | 95% CI | top-1 agreement |
 |---|---|---|---|
-| **`reduction`** | 2736.8 MB (2.15x) | **+0.157%** | +0.27 / +0.04 / +0.32% |
-| **`compression`** | 1854.7 MB (3.18x) | **+4.24%** | +5.69 / +3.05 / +5.46% |
+| 0.1B | 0.006301 | [0.005889; 0.006746] | 94.84% |
+| 0.4B | 0.003637 | [0.003397; 0.003937] | 95.99% |
+| 1.5B | 0.002274 | [0.002043; 0.002538] | 97.31% |
+| 2.9B | 0.001661 | [0.001496; 0.001854] | 97.80% |
+
+KL falls monotonically with scale: bigger models absorb the same quantization
+scheme better. Δppl does **not** follow that order (0.33 / 0.33 / 0.15 /
+0.24%), which is a fair warning about reading too much into a tenth of a
+percent of perplexity on 19 456 predictions. The two metrics agree on the
+big picture and disagree on the fine ordering; where they disagree, KL is
+the more sensitive of the two.
+
+`compression` degrades far faster on small models than `reduction` does:
++10.59% at 0.1B against +0.33%. Presets in this repo were tuned on the 1.5B
+checkpoint, and the numbers above are the measured cost of assuming they
+transfer.
+
+#### These numbers replace earlier ones
+
+Two things changed on 2026-08-28, and both moved every row:
+
+1. **LoRA is now quantized along the reduction axis.** The writer used to
+   quantize the LoRA matrices in the checkpoint's raw `[in, out]` layout,
+   which put the quantization groups along the *output* axis of the matmul.
+   Grouping along the reduction axis instead is worth **KL 0.003303 ->
+   0.002101** and **Δppl +0.24% -> +0.15%** at 1.5B, for 192 extra bytes.
+2. **Activation statistics are now collected on a corpus disjoint from the
+   evaluation corpus.** They previously were not, despite what this file
+   claimed. Calibrating on the text the perplexity is measured on flattered
+   `reduction` by about 0.13 points and `compression` by about 0.5 points at
+   1.5B.
+
+Measured at 1.5B, all four corners, so neither effect has to be taken on
+trust:
+
+| LoRA layout | calibration | `reduction` Δppl | `compression` Δppl |
+|---|---|---|---|
+| output axis (old) | eval corpus (leaked) | +0.11% | +3.63% |
+| reduction axis (new) | eval corpus (leaked) | +0.02% | +3.52% |
+| output axis (old) | held-out (honest) | +0.24% | +4.16% |
+| reduction axis (new) | held-out (honest) | **+0.15%** | **+4.03%** |
+
+The gain from the layout change is the same (-0.09 points) under either
+calibration, so it is real and not an artifact of the statistics. The
+previously published headline of `+0.108%` for `reduction` at 1.5B was the
+top-left cell of that table: correct arithmetic on a leaky experiment.
 
 ### Against llama.cpp (1.5B, same data split)
+
+**These rows predate the 2026-08-28 changes** and use the old LoRA layout
+and the old calibration, on both sides of the comparison. They are left
+as measured rather than silently restated; re-running the comparison is
+an open item.
 
 Calibration data (our activation stats / their imatrix) and evaluation
 data are split identically for both systems. Absolute ppl is not
@@ -165,8 +227,10 @@ Quality numbers come from `eval_corpus_multiling.pt`: 38 sequences x 512
 tokens = 19 456 scored predictions, split 20 Russian / 9 English / 9
 Serbian, tokenized once with the standard RWKV World tokenizer
 (byte-level trie, greedy longest match) and reused unchanged across every
-row. Activation statistics for the AW modes are collected on **held-out
-chunks** — never on the text the perplexity is measured on. **This is not
+row. Activation statistics for the AW modes are collected on a **held-out
+corpus** — never on the text the perplexity is measured on. Numbers
+published before 2026-08-28 did not honour that rule; see the note under
+Results for the measured size of the difference. **This is not
 a published benchmark** — not WikiText, not LAMBADA — so absolute ppl is
 meaningful only *relative to other rows here*, on this exact corpus, with
 this exact tokenizer.
@@ -187,7 +251,8 @@ sample size, language mix and context length. Degradation also *grows
 with context*, which a short-context corpus cannot see at all: quantization
 error in the channel-wise modulators inside the recurrence does not spoil
 one prediction, it distorts the state update and accumulates along the
-sequence. (`reduction` is +2.36% here and +0.108% in the table above:
+sequence. (`reduction` is +2.36% here and +0.108% on the multilingual corpus, both
+under the pre-2026-08-28 setup:
 that row is a later preset — the `small=16` fix, the `sym` block layout,
 and 8-bit `proj`/`head`/`emb`. Same corpus, same kernel.)
 
@@ -204,10 +269,10 @@ row; only the linear projections differ by scheme.
 ```python
 from rwkv_quant import quantize
 
-# near-lossless: 2.1x smaller, +0.11% ppl on the 1.5B reference
+# near-lossless: 2.1x smaller, +0.15% ppl on the 1.5B reference
 quantize("model.pth", "model.rwkvq", preset="reduction", tokenizer=tok)
 
-# 3.2x smaller, +3.63% ppl, fastest decode
+# 3.2x smaller, +4.03% ppl, fastest decode
 quantize("model.pth", "model.rwkvq", preset="compression", tokenizer=tok)
 ```
 

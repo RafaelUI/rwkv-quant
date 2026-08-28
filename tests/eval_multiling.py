@@ -38,9 +38,9 @@ from rwkv_quant.formats.writer import quantize_tensor  # noqa: E402
 from rwkv_quant.formats.schema import QuantizedCheckpoint  # noqa: E402
 from rwkv_quant.backends.metal.quant_model import QuantRWKV7  # noqa: E402
 
-CKPT_PTH = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
+CKPT_PTH = os.environ.get("RWKVQ_CKPT", os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth"))
 CORPUS = os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt")
-OUT_JSON = os.path.expanduser("~/Develop/WKV-kvant/eval_multiling_1p5b.json")
+OUT_JSON = os.environ.get("RWKVQ_EVAL_JSON", os.path.expanduser("~/Develop/WKV-kvant/eval_multiling_1p5b.json"))
 NAMING, N_LAYER, N_EMBD, HEAD_SIZE, VOCAB = "world", 24, 2048, 64, 65536
 
 ACT_STATS = (sys.argv[1] if len(sys.argv) > 1
@@ -90,8 +90,10 @@ def build_in_memory(sd, cfg):
     tensors = {}
     for key, w in sd.items():
         tensors[key] = quantize_tensor(key, w, cfg, real_gw=True)
-    return QuantizedCheckpoint(naming=NAMING, n_layer=N_LAYER, n_embd=N_EMBD,
-                               head_size=HEAD_SIZE, vocab_size=VOCAB,
+    nl = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("blocks."))
+    vo, ne = sd["emb.weight"].shape
+    return QuantizedCheckpoint(naming=NAMING, n_layer=nl, n_embd=ne,
+                               head_size=HEAD_SIZE, vocab_size=vo,
                                tensors=tensors, config_repr=repr(cfg))
 
 

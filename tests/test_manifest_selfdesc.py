@@ -58,28 +58,35 @@ def transposed_keys_from_ref():
 
 
 def test_transposed(manifest):
-    print("ориентация: манифест против rwkv7_ref.py")
-    suffixes = transposed_keys_from_ref()
-    check("ref действительно что-то транспонирует", bool(suffixes),
-          f"{sorted(suffixes)}")
-    if manifest.get("naming") != "world":
-        print("  (чекпоинт не world -- транспозиций быть не должно)")
-
-    bad, n_true = [], 0
+    print("ориентация: флаг манифеста против ФОРМ, записанных в нём же")
+    # Прежняя редакция сверяла флаг с таблицей имён из rwkv7_ref.py. Эта
+    # таблица описывает ЧЕКПОИНТ (.pth), а не контейнер, и держалась только
+    # пока writer квантовал LoRA в сырой раскладке. С 28.08 LoRA может
+    # лежать уже транспонированной, и тогда прежняя сверка краснела на
+    # исправном файле, а на порче -- зеленела. Сверяем флаг с данными.
+    ne = int(manifest["n_embd"])
+    lora = ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
+    bad, seen, n_true = [], 0, 0
     for key, m in manifest["tensors"].items():
         parts = key.split(".")
-        suffix = parts[-1] if len(parts) == 4 and parts[2] == "att" else None
-        want = (manifest.get("naming") == "world" and suffix in suffixes)
+        if not (len(parts) == 4 and parts[2] == "att" and parts[3] in lora):
+            continue
+        seen += 1
+        shape = tuple(int(x) for x in m["shape"])
         got = codec.is_transposed(manifest, key)
         n_true += bool(got)
-        if got != want:
-            bad.append(f"{key}: манифест {got}, ref {want}")
-    check(f"флаги совпали с ref ({n_true} транспонированных)", not bad,
-          "; ".join(bad[:3]))
-    # у world-чекпоинта транспонированных обязано быть много: 8 матриц на
-    # слой минус v1/v2 нулевого слоя. Ноль означал бы, что регулярка мимо
-    if manifest.get("naming") == "world":
-        check("транспонированные найдены", n_true > 0)
+        res = shape[::-1] if got else shape
+        # после разрешения флага потребитель обязан получить [out, in]:
+        # у A-матриц (суффикс 1) редукция идёт по n_embd, значит n_embd --
+        # последняя ось; у B-матриц (суффикс 2) n_embd -- ось выхода.
+        ok = len(res) == 2 and (res[-1] == ne if parts[3].endswith("1")
+                                else res[0] == ne)
+        if not ok:
+            bad.append("%s: хранится %s, флаг %s, после разрешения %s, "
+                       "n_embd=%d" % (key, shape, got, res, ne))
+    check("LoRA-матрицы найдены", seen > 0, "их %d" % seen)
+    check("флаг согласован с формами (%d транспонированных из %d)"
+          % (n_true, seen), not bad, "; ".join(bad[:3]))
 
 
 def test_n_blocks(manifest, arrays):
@@ -169,8 +176,13 @@ def test_v1_compat(path_v1, ref_manifest):
             bad.append(key)
     check(f"деквант v1 == деквант v2 ({n} тензоров)", not bad,
           ", ".join(bad[:3]))
-    tbad = [k for k in common
+    raw_layout = all(codec.is_transposed(m2, k) for k in common
+                     if codec.is_raw_lora_world(k))
+    tbad = [] if not raw_layout else [k for k in common
             if codec.is_transposed(m1, k) != codec.is_transposed(m2, k)]
+    if not raw_layout:
+        print("  (файл в новой раскладке LoRA -- v1 её выразить не может, "
+              "сверка выводимости неприменима)")
     check("transposed выводится для v1 так же, как записан в v2", not tbad,
           ", ".join(tbad[:3]))
 

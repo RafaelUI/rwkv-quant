@@ -59,7 +59,7 @@ def load_file_weights(model, ck, cfg):
             skipped.append(key)
             continue
         if group in keep:
-            out = fake_quant.q(w, group, cfg, key)
+            out = fake_quant.q(w.to(torch.bfloat16) if os.environ.get("RWKVQ_ARM_FAKE_BF16") == "1" else w, group, cfg, key)
         else:
             out = reader.dequantize_banded(qt, torch.float32)
             # RWKV7Ref держит LoRA транспонированной относительно файла
