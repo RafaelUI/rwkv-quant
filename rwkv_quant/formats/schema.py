@@ -48,6 +48,9 @@ class QuantizedTensor:
     group: str                    # к какой квантуемой группе относится
     bits: int                     # 16 = не квантован, хранится as-is
     shape: tuple
+    # ориентация хранения: True = сырая LoRA [in,out], потребитель обязан
+    # транспонировать после декванта (см. codec.is_transposed)
+    transposed: bool = False
     codes: torch.Tensor = None    # int8 [out,in], только если 5 <= bits < 16
     codes_packed: torch.Tensor = None  # uint8 [out,ceil(in/2)], только если bits <= 4
     scale: torch.Tensor = None    # fp16, per-row [n_rows, 1], только если bits < 16

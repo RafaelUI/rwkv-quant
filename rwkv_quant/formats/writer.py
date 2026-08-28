@@ -119,7 +119,7 @@ def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str,
             # ориентация: см. codec.is_transposed. Пишем факт, а не
             # оставляем потребителю таблицу имён и надежду на внимание
             "transposed": (ckpt.naming == "world"
-                           and codec.is_raw_lora_world(key)),
+                           and qt.transposed),
             "fields": fields,
         }
 
@@ -369,7 +369,7 @@ def _make_qt(key, group, bits, shape, codes, scale, oi=None, ov=None):
                            outlier_indices=oi, outlier_values=ov)
 
 
-def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
+def _quantize_impl(key: str, w: torch.Tensor, cfg: QuantConfig,
                     real_gw: bool = False) -> QuantizedTensor:
     group = _match_group(key)
     if group is None or w.dim() < 2 or key.endswith(_LORA_BIAS_SUFFIXES):
@@ -563,3 +563,27 @@ def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
         print(f"-> {output_path} "
               f"({os.path.getsize(output_path)/1e6:.1f} МБ)", flush=True)
     return ckpt
+
+
+def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
+                    real_gw: bool = False) -> QuantizedTensor:
+    """Квантует тензор и ПРОСТАВЛЯЕТ ОРИЕНТАЦИЮ на самом тензоре.
+
+    Раньше ориентация выводилась в save по таблице имён, то есть факт жил
+    отдельно от данных и пересохранение молча возвращало прежний ответ.
+    Теперь это поле QuantizedTensor: оно едет вместе с тензором через
+    save/load и через in-memory путь, где манифеста нет вовсе.
+
+    С 28.08 LoRA квантуется вдоль оси РЕДУКЦИИ (после
+    транспонирования), а не вдоль выходной. RWKVQ_LORA_TRANSPOSE=0 возвращает
+    прежнюю раскладку -- нужна, чтобы воспроизвести файлы до 28.08. Замер 1.5B:
+    KL 0.003303 -> 0.002101, top-1 96.649 -> 97.309%, +192 байта.
+    """
+    raw = codec.is_raw_lora_world(key)
+    if (os.environ.get("RWKVQ_LORA_TRANSPOSE", "1") != "0"
+            and raw and w.dim() == 2):
+        w = w.T.contiguous()
+        raw = False
+    qt = _quantize_impl(key, w, cfg, real_gw)
+    qt.transposed = raw
+    return qt

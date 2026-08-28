@@ -82,6 +82,7 @@ def _load_safetensors(path: str) -> QuantizedCheckpoint:
                 gw_gs=t["gw_gs"], gw_sb=t["gw_sb"])
             for field in t["fields"]:
                 setattr(qt, field, f.get_tensor(f"{key}::{field}"))
+            qt.transposed = codec.is_transposed(m, key)
             tensors[key] = qt
 
     return QuantizedCheckpoint(

@@ -436,16 +436,16 @@ class QuantTMix:
             ap = "att."
             self.x_r, self.x_w, self.x_k = _dense(g(ap+"x_r")), _dense(g(ap+"x_w")), _dense(g(ap+"x_k"))
             self.x_v, self.x_a, self.x_g = _dense(g(ap+"x_v")), _dense(g(ap+"x_a")), _dense(g(ap+"x_g"))
-            self.w_lora_A = _dense(g(ap+"w1")).T
-            self.w_lora_B_w = _dense(g(ap+"w2")).T; self.w_lora_B_b = _dense(g(ap+"w0")).reshape(-1)
-            self.a_lora_A = _dense(g(ap+"a1")).T
-            self.a_lora_B_w = _dense(g(ap+"a2")).T; self.a_lora_B_b = _dense(g(ap+"a0")).reshape(-1)
+            self.w_lora_A = _lora(g(ap+"w1"))
+            self.w_lora_B_w = _lora(g(ap+"w2")); self.w_lora_B_b = _dense(g(ap+"w0")).reshape(-1)
+            self.a_lora_A = _lora(g(ap+"a1"))
+            self.a_lora_B_w = _lora(g(ap+"a2")); self.a_lora_B_b = _dense(g(ap+"a0")).reshape(-1)
             self.v_lora_A = self.v_lora_B_w = self.v_lora_B_b = None
             if layer_id > 0:
-                self.v_lora_A = _dense(g(ap+"v1")).T
-                self.v_lora_B_w = _dense(g(ap+"v2")).T; self.v_lora_B_b = _dense(g(ap+"v0")).reshape(-1)
-            self.g_lora_A = _dense(g(ap+"g1")).T
-            self.g_lora_B_w = _dense(g(ap+"g2")).T
+                self.v_lora_A = _lora(g(ap+"v1"))
+                self.v_lora_B_w = _lora(g(ap+"v2")); self.v_lora_B_b = _dense(g(ap+"v0")).reshape(-1)
+            self.g_lora_A = _lora(g(ap+"g1"))
+            self.g_lora_B_w = _lora(g(ap+"g2"))
             self.k_k = _dense(g(ap+"k_k")).reshape(self.H, self.S)
             self.k_a = _dense(g(ap+"k_a")).reshape(self.H, self.S)
             self.r_k = _dense(g(ap+"r_k")).reshape(self.H, self.S)
@@ -1085,3 +1085,9 @@ class QuantRWKV7:
             # двигает state, но head по нему не считается (19.07-15, п.1)
             x = x[:, -tail_only:]
         return self.head(x), new_states
+
+
+# ЭКСПЕРИМЕНТ 28.08: ориентация LoRA берётся из манифеста (поле transposed,
+# см. codec.is_transposed), а не из таблицы имён. Умолчание True = прежнее
+# поведение для файлов v1, где поля нет.
+def _lora(qt): a = _dense(qt); return a.T if getattr(qt, "transposed", True) else a
