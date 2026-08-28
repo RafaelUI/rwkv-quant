@@ -42,6 +42,7 @@ MLX-потребителе). Промежуточная арифметика у�
 """
 import json
 import mmap as _mmap
+import os
 import re
 
 import numpy as np
@@ -56,7 +57,7 @@ __all__ = [
     "pack_bitplane", "unpack_bitplane",
     "dequant_sb6", "dequant_sym", "dequant_asym", "dequant_rtn",
     "MAGIC_ZIP", "FORMAT", "FORMAT_VERSION",
-    "bf16_to_f32", "read_safetensors", "open_rwkvq", "dequant_key",
+    "bf16_to_f32", "read_safetensors", "open_rwkvq", "dequant_key", "dequant_key_bands", "can_band", "dequant_chunk_mb",
     "is_transposed", "is_raw_lora_world",
     "pack_mlx_affine", "unpack_mlx_affine", "sb6_to_mlx_affine",
     "sb6_to_k3",
@@ -535,15 +536,67 @@ def is_raw_lora_world(key: str) -> bool:
     return _RAW_LORA_WORLD.match(key) is not None
 
 
-def dequant_key(manifest, arrays, key) -> np.ndarray:
-    """Один тензор из открытого .rwkvq -> float32 в ТОМ ЖЕ виде, в каком
-    он лежал в исходном state_dict. Каст в bf16 и транспозицию (см.
-    is_transposed) делает вызывающая сторона."""
-    m = manifest["tensors"][key]
-    kind, shape = m["kind"], tuple(m["shape"])
+# --- деквант полосами строк -------------------------------------------------
+#
+# ТА ЖЕ СТАТЬЯ, ЧТО В reader.dequantize_banded, ТОЛЬКО БЕЗ torch. Деквант
+# держит несколько полноразмерных fp32-копий тензора разом (коды,
+# битплоскости, развёрнутые scale/min, произведение), поэтому emb 1.5B
+# [65536, 2048] стоил 1662 МБ транзиента ради 512 МБ результата.
+#
+# Почему это важно именно здесь, а не только в torch-пути: QLoRA-загрузчик
+# rwkv-metal идёт через dequant_key (model/convert.py:220), emb.weight
+# квантованным модулем НЕ подменяется никогда, и потому платил полный
+# ненарезанный транзиент КАЖДУЮ загрузку. Замерено 27.08 изолированно:
+# sym@8 654 МБ полосами против 1662 целиком, sb6@6 839 против 3540.
+#
+# Строка независима: вся математика построчная вдоль ВЫХОДНОЙ оси и
+# поблочная вдоль ВХОДНОЙ. Значит полоса бит-в-бит равна своей части
+# декванта целого. Это закон 20 (нарезка квантователя) на обратном пути, и,
+# как там, на слово не принимается: гейт tests/test_dequant_band_parity.py
+# требует ПОБИТОВОГО равенства на реальных формах обоих чекпоинтов.
+#
+# Выключатель для A/B: RWKVQ_DEQUANT_CHUNK_MB=0 возвращает прежний путь.
 
-    def buf(field):
-        return arrays.get(f"{key}::{field}")
+_ROW_FIELDS = ("dense", "codes", "codes_packed", "scale", "gw_qh", "gw_qh2",
+               "gw_qsqm", "gw_qs", "gw_d", "gw_dm", "gw_scale", "gw_min")
+
+_BANDABLE_KINDS = ("dense", "sym", "sb6", "asym")
+
+
+def dequant_chunk_mb() -> int:
+    """Полоса строк в МЕГАБАЙТАХ одной fp32-копии полосы. Имя переменной и
+    умолчание -- те же, что у torch-пути (reader.DEQUANT_CHUNK_MB), чтобы
+    A/B гонялось ОДНОЙ ручкой на обеих реализациях, а не двумя."""
+    return int(os.environ.get("RWKVQ_DEQUANT_CHUNK_MB", "64"))
+
+
+def can_band(manifest, key) -> bool:
+    """Режется ли тензор полосами. Нужна ровно двумерная форма и раскладка,
+    у которой строки независимы. `rtn` исключён: у per-row RTN с
+    `outlier_indices` строки перестают быть независимыми по индексации
+    (индексы абсолютные), а выигрыш там нулевой -- такие тензоры мелкие и
+    статьи в памяти не делают. Условие ровно то же, что в reader.can_band."""
+    m = manifest["tensors"][key]
+    return m["kind"] in _BANDABLE_KINDS and len(m["shape"]) == 2
+
+
+def _band_view(buf, a, b):
+    """Тот же доступ к буферам, но видом на полосу строк [a, b). Поля вне
+    _ROW_FIELDS отдаются целиком: они либо скаляры манифеста, либо
+    outlier_* -- а те встречаются только у нережущихся раскладок."""
+    def one(field):
+        v = buf(field)
+        if v is None or field not in _ROW_FIELDS:
+            return v
+        return v[a:b]
+    return one
+
+
+def _dequant_from(m, buf, shape) -> np.ndarray:
+    """Разбор буферов в float32. `shape` передаётся ОТДЕЛЬНО от манифеста:
+    при нарезке это форма полосы, а не всего тензора. Всё остальное --
+    прежнее тело dequant_key, слово в слово."""
+    kind = m["kind"]
 
     if kind == "dense":
         return bf16_to_f32(buf("dense"))
@@ -568,4 +621,69 @@ def dequant_key(manifest, arrays, key) -> np.ndarray:
                            codes=buf("codes"), codes_packed=buf("codes_packed"),
                            outlier_indices=buf("outlier_indices"),
                            outlier_values=None if ov is None else bf16_to_f32(ov))
-    raise ValueError(f"{key}: неизвестная раскладка {kind!r}")
+    raise ValueError(f"неизвестная раскладка {kind!r}")
+
+
+def dequant_key(manifest, arrays, key, *, chunk_mb=None) -> np.ndarray:
+    """Один тензор из открытого .rwkvq -> float32 в ТОМ ЖЕ виде, в каком
+    он лежал в исходном state_dict. Каст в bf16 и транспозицию (см.
+    is_transposed) делает вызывающая сторона.
+
+    Крупные тензоры собираются ПОЛОСАМИ СТРОК: результат побитово тот же,
+    но пик равен результату плюс одна полоса, а не нескольким
+    полноразмерным fp32-копиям (см. примечание выше). chunk_mb=0 --
+    прежний нерезаный путь, нужен для A/B."""
+    m = manifest["tensors"][key]
+    shape = tuple(m["shape"])
+
+    def buf(field):
+        return arrays.get(f"{key}::{field}")
+
+    try:
+        mb = dequant_chunk_mb() if chunk_mb is None else int(chunk_mb)
+    except ValueError:
+        mb = 64
+    if mb <= 0 or not can_band(manifest, key):
+        return _dequant_from(m, buf, shape)
+
+    OUT, IN = shape
+    rows = max(1, int(mb * (1 << 20)) // max(1, IN * 4))
+    if rows >= OUT:
+        return _dequant_from(m, buf, shape)
+
+    out = np.empty((OUT, IN), dtype=np.float32)
+    for a in range(0, OUT, rows):
+        b = min(a + rows, OUT)
+        out[a:b] = _dequant_from(m, _band_view(buf, a, b), (b - a, IN))
+    return out
+
+
+def dequant_key_bands(manifest, arrays, key, *, chunk_mb=None):
+    """То же, что dequant_key, но ПОТОКОМ полос: yield (a, b, полоса fp32).
+
+    Нужно потребителю, который сразу роняет результат в свой тип: тогда
+    полноразмерная fp32-копия не материализуется вовсе, и пик равен
+    результату в целевом типе плюс одна полоса. Ровно этим пользуется
+    QLoRA-загрузчик rwkv-metal (model/convert.py).
+
+    Нережущиеся тензоры (см. can_band) отдаются одной полосой во всю
+    высоту -- потребителю не нужно знать, режется тензор или нет."""
+    m = manifest["tensors"][key]
+    shape = tuple(m["shape"])
+
+    def buf(field):
+        return arrays.get(f"{key}::{field}")
+
+    try:
+        mb = dequant_chunk_mb() if chunk_mb is None else int(chunk_mb)
+    except ValueError:
+        mb = 64
+    if mb <= 0 or not can_band(manifest, key):
+        yield 0, shape[0] if shape else 0, _dequant_from(m, buf, shape)
+        return
+
+    OUT, IN = shape
+    rows = max(1, int(mb * (1 << 20)) // max(1, IN * 4))
+    for a in range(0, OUT, rows):
+        b = min(a + rows, OUT)
+        yield a, b, _dequant_from(m, _band_view(buf, a, b), (b - a, IN))
