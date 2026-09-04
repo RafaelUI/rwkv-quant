@@ -60,9 +60,12 @@ def _encoder(tokenizer):
             "(измеренная цена: KL хуже на 38%)")
     if callable(tokenizer) and not hasattr(tokenizer, "encode"):
         return tokenizer
-    if hasattr(tokenizer, "encode"):
-        return tokenizer.encode
-    if isinstance(tokenizer, str):
+    # ПОРЯДОК ПРИНЦИПИАЛЕН: у str метод .encode ЕСТЬ (это кодирование
+    # текста в байты), поэтому путь к словарю обязан разбираться ДО
+    # проверки "объект с .encode". Иначе строка уходит в str.encode, а
+    # чанк корпуса попадает туда как ИМЯ КОДИРОВКИ, и наружу приходит
+    # LookupError с текстом чанка вместо внятного отказа.
+    if isinstance(tokenizer, (str, os.PathLike)):
         # Путь к словарю. Своего токенизатора у rwkv-quant НЕТ и заводить
         # его -- значит держать вторую копию чужой реализации (закон 23);
         # поэтому пробуем соседний пакет и, если его нет, честно говорим.
@@ -73,7 +76,9 @@ def _encoder(tokenizer):
                 "передан путь к словарю (%s), но разобрать его нечем: "
                 "rwkv-quant не везёт своего токенизатора. Передайте готовый "
                 "объект с .encode." % tokenizer) from e
-        return WorldTokenizer(tokenizer).encode
+        return WorldTokenizer(os.fspath(tokenizer)).encode
+    if hasattr(tokenizer, "encode"):
+        return tokenizer.encode
     raise TokenizerRequired("не понимаю tokenizer=%r" % (tokenizer,))
 
 
