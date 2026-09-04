@@ -1,6 +1,6 @@
 """ГЕЙТ: автосбор калибровки внутри quantize() -- работает и ОТКАЗЫВАЕТ ГРОМКО.
 
-Проверяются четыре вещи, каждая из которых уже была источником тихой
+Проверяются пять вещей, каждая из которых уже была источником тихой
 ошибки в этом проекте:
 
   1. Без токенизатора -- ПАДЕНИЕ с внятным текстом, а не тихая сборка без
@@ -12,10 +12,14 @@
      попадёт вовсе, а это стоит всего выигрыша AW на нём.
   4. Пресеты больше не указывают на /tmp, а quantize() не мутирует
      разделяемый объект пресета между вызовами.
+  5. Токенизатор, переданный ПУТЁМ К СЛОВАРЮ, разбирается. Форма
+     документирована в quick-start api.quantize, но была недостижима: у
+     str метод .encode есть, и hasattr стоял выше isinstance(..., str).
 
     python tests/test_act_stats_auto.py
 """
 import os
+import pathlib
 import re
 import sys
 
@@ -25,6 +29,7 @@ sys.path.insert(0, os.path.expanduser("~/Develop/rwkv-metal"))
 from rwkv_quant.calibration import act_stats as A  # noqa: E402
 from rwkv_quant.presets import PRESETS  # noqa: E402
 from rwkv_metal.tokenizer.world_tokenizer import WorldTokenizer  # noqa: E402
+from rwkv_metal.tokenizer import world_tokenizer as wt_mod  # noqa: E402
 
 
 def main():
@@ -48,6 +53,31 @@ def main():
     except A.TokenizerRequired as e:
         check("без токенизатора падает", "act_stats=None" in str(e),
               "подсказка про осознанный отказ на месте")
+
+    # 5. ПУТЬ К СЛОВАРЮ СТРОКОЙ. Эта форма уходила в str.encode -- у str
+    # метод .encode есть, это кодирование текста в байты, -- и чанк корпуса
+    # попадал туда как ИМЯ КОДИРОВКИ: LookupError с текстом чанка вместо
+    # токенизации. Гейт при этом был зелёным, потому что звал _encoder(None)
+    # и _encoder(объект): две ветки из трёх, а сломана была третья (закон 31).
+    vocab = os.path.join(os.path.dirname(wt_mod.__file__),
+                         "rwkv_vocab_v20230424.txt")
+    check("словарь rwkv_metal на месте", os.path.exists(vocab), vocab)
+    ids_obj = WorldTokenizer(vocab).encode("привет мир")
+
+    def _enc(arg):
+        # Отказ печатается как ПРОВАЛ, а не роняет гейт: иначе одна
+        # сломанная ветка прячет все проверки ниже неё.
+        try:
+            return A._encoder(arg)("привет мир")
+        except Exception as e:
+            return repr(e)
+
+    ids_str = _enc(vocab)
+    ids_path = _enc(pathlib.Path(vocab))
+    check("путь к словарю строкой", ids_str == ids_obj and len(ids_obj) > 0,
+          ids_str if isinstance(ids_str, str) else "%d id" % len(ids_str))
+    check("путь к словарю PathLike", ids_path == ids_obj,
+          ids_path if isinstance(ids_path, str) else "")
 
     # 3. круговой обход доносит все письменности
     tok = WorldTokenizer()
