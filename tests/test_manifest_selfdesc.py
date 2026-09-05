@@ -89,6 +89,56 @@ def test_transposed(manifest):
           % (n_true, seen), not bad, "; ".join(bad[:3]))
 
 
+def test_sidecar_transposed(ckpt, manifest):
+    """Сайдкар MLX ДОНОСИТ ориентацию, а не роняет её."""
+    # До 05.09 export_mlx поля transposed не писал вовсе: манифест .rwkvq
+    # ориентацию знает, а потребитель сайдкара мог узнать её только из
+    # зашитой у себя таблицы имён. Ровно этим болел rwkv-metal до 1bf09d6
+    # и болеет RwkvqFullConvert.swift:79-93.
+    from rwkv_quant.formats.export_mlx import _export_one
+    keys = [k for k in manifest["tensors"]
+            if k.endswith(("att.w1", "att.a1", "att.key.weight",
+                           "ffn.key.weight"))][:8]
+    check("ключи для проверки сайдкара нашлись", len(keys) > 0, str(len(keys)))
+    bad = []
+    for k in keys:
+        meta = _export_one(k, ckpt.tensors[k], {})
+        if "transposed" not in meta:
+            bad.append(k + ": поля нет")
+        elif bool(meta["transposed"]) != codec.is_transposed(manifest, k):
+            bad.append(k)
+    check("сайдкар повторяет ориентацию источника", not bad, "; ".join(bad[:3]))
+    if not keys:
+        return
+
+    # МУТАЦИЯ. Без неё гейт был бы зелёным и на захардкоженном False:
+    # в файлах новой раскладки ВСЕ ключи не транспонированы, так что
+    # совпадение значений само по себе ничего не доказывает.
+    k = keys[0]
+    qt = ckpt.tensors[k]
+    was = qt.transposed
+    try:
+        qt.transposed = not bool(was)
+        got = _export_one(k, qt, {}).get("transposed")
+    finally:
+        qt.transposed = was
+    check("флаг следует за источником (мутация)",
+          got is not None and bool(got) == (not bool(was)),
+          "%s: было %s, после переворота %s" % (k, was, got))
+
+    # Неизвестная ориентация обязана падать ГРОМКО: сайдкар, выгруженный
+    # без неё, у потребителя ошибётся тихо (закон 15).
+    try:
+        qt.transposed = None
+        _export_one(k, qt, {})
+        loud = False
+    except ValueError:
+        loud = True
+    finally:
+        qt.transposed = was
+    check("неизвестная ориентация падает громко", loud)
+
+
 def test_n_blocks(manifest, arrays):
     print("\nn_blocks: манифест против форм буферов")
     bad, interesting = [], []
@@ -208,6 +258,7 @@ def main():
           f"токенайзер {manifest.get('tokenizer')!r}\n")
 
     test_transposed(manifest)
+    test_sidecar_transposed(ckpt, manifest)
     test_n_blocks(manifest, arrays)
     test_config(manifest, load_raw(out))
 
