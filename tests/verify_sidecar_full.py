@@ -7,6 +7,15 @@ rwkv-metal и SwiftRWKV: функция dequant_from_sidecar ниже покры
 четыре раскладки (sb6 / asym / rtn / dense) и не импортирует torch.
 Torch здесь нужен только эталону, с которым сверяемся.
 
+Ориентацию `dequant_from_sidecar` НЕ применяет и применять не должна:
+деквант идёт по тем осям, вдоль которых считались блоки и scale.
+Потребителю нужен `linear_weight_from_sidecar` -- он же показывает,
+ОТКУДА берётся ориентация: поле `transposed` в манифесте, а при его
+отсутствии (сайдкары старше 05.09) -- `codec.is_transposed`, то есть
+таблица имён. Порт на другой язык обязан повторить ОБЕ ветки: без первой
+он зашьёт таблицу имён у себя, без второй перестанет читать уже
+выкаченные файлы.
+
 Порог: сравниваем в bf16. Пути арифметически одинаковы, но порядок
 операций у MLX и torch различается, поэтому гейт -- не бит-в-бит, а
 "расхождение не больше одного ulp bf16 на элемент". Доля точных
@@ -26,6 +35,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from rwkv_quant.formats.reader import load_raw, _dequantize_one  # noqa: E402
+from rwkv_quant.formats import codec  # noqa: E402
 
 # сколько тензоров каждой раскладки проверять (emb/head крупные, полный
 # перебор 1062 тензоров занял бы минуты без прибавки к доверию)
@@ -140,6 +150,85 @@ def dequant_from_sidecar(arrays, key, meta) -> mx.array:
     raise ValueError(f"{key}: неизвестная раскладка {kind}")
 
 
+def linear_weight_from_sidecar(arrays, manifest, key) -> mx.array:
+    """Вес в конвенции nn.Linear [out, in] -- то, что нужно ПОТРЕБИТЕЛЮ."""
+    # dequant_from_sidecar возвращает вес в той раскладке, в какой он ЛЕЖИТ,
+    # и это правильно: деквант обязан идти по тем осям, вдоль которых
+    # считались блоки и scale. Ориентация применяется ПОСЛЕ, и берётся ИЗ
+    # МАНИФЕСТА, а не из зашитой у себя таблицы имён: её зашитость стоила
+    # rwkv-metal падения на композиции весов (0.3.2) и до сих пор живёт
+    # восемью .transposed() в RwkvqFullConvert.swift.
+    #
+    # Отсутствие поля transposed -- не ошибка, а сайдкар старше 05.09:
+    # codec.is_transposed падает в таблицу имён и даёт прежнее поведение.
+    # ПОРТ НА ДРУГОЙ ЯЗЫК ОБЯЗАН СОХРАНИТЬ этот запасной путь, иначе уже
+    # выкаченные сайдкары перестанут читаться.
+    w = dequant_from_sidecar(arrays, key, manifest["tensors"][key])
+    if not codec.is_transposed(manifest, key):
+        return w
+    assert w.ndim == 2, "%s: transposed на тензоре ndim=%d" % (key, w.ndim)
+    return w.T
+
+
+LORA_SUF = ("w1", "w2", "a1", "a2", "v1", "v2", "g1", "g2")
+
+
+def check_orientation(manifest, arrays, ckpt) -> int:
+    """Ориентация доехала, совпала с источником и складывается по формам."""
+    bad = 0
+    tt = manifest["tensors"]
+    nof = [k for k, m in tt.items() if "transposed" not in m]
+    if nof:
+        print("  !! поля transposed нет у %d тензоров (сайдкар старше 05.09, "
+              "переэкспортировать): %s" % (len(nof), nof[:3]))
+        bad += 1
+    else:
+        print("поле transposed есть у всех %d тензоров" % len(tt))
+
+    diff = [k for k, m in tt.items() if "transposed" in m
+            and bool(m["transposed"]) != bool(ckpt.tensors[k].transposed)]
+    if diff:
+        print("  !! ориентация расходится с .rwkvq у %d: %s" % (len(diff), diff[:3]))
+        bad += 1
+    else:
+        # Сравнивать можно только там, где поле есть. Печатать
+        # «совпадает» по пустому множеству -- то самое зелёное утверждение
+        # ни о чём, из-за которого написан закон 31.
+        have = [k for k, m in tt.items() if "transposed" in m]
+        n_tr = sum(1 for m in tt.values() if m.get("transposed"))
+        if have:
+            print("ориентация совпадает с .rwkvq на %d ключах с полем из %d "
+                  "(транспонированных %d)" % (len(have), len(tt), n_tr))
+        else:
+            print("  сверка значений НЕ ПРОВОДИЛАСЬ: поля нет ни у одного ключа")
+
+    # КОМПОЗИЦИЯ. Низкоранговые в Linear-конвенции обязаны встать к n_embd
+    # нужной стороной: *1 это [rank, D], *2 это [D, rank]. Ранги (96/64/256)
+    # не равны D, поэтому неверный флаг ставит D не на ту ось и ловится,
+    # а не проходит незаметно. Это та же проверка, на которой падал
+    # rwkv-metal, только сделанная заранее и на формах.
+    D = manifest["n_embd"]
+    checked = 0
+    for key in tt:
+        base = key.rsplit(".", 1)[-1]
+        if base not in LORA_SUF or not key.startswith("blocks.0."):
+            continue
+        w = linear_weight_from_sidecar(arrays, manifest, key)
+        want = 1 if base.endswith("1") else 0
+        checked += 1
+        if w.shape[want] != D:
+            print("  !! %s: Linear-форма %s, n_embd=%d ожидался на оси %d"
+                  % (key, tuple(w.shape), D, want))
+            bad += 1
+    if checked == 0:
+        print("  !! низкоранговых ключей не нашлось -- проверка композиции "
+              "ничего не значит")
+        bad += 1
+    else:
+        print("композиция Linear-формы сошлась на %d низкоранговых" % checked)
+    return bad
+
+
 def main():
     sidecar, rwkvq = sys.argv[1], sys.argv[2]
     manifest = json.load(open(sidecar + ".json"))
@@ -154,7 +243,7 @@ def main():
         assert manifest[f] == getattr(ckpt, f), f"метаданные: {f}"
     print("состав и метаданные совпадают")
 
-    seen, bad = {}, 0
+    seen, bad = {}, check_orientation(manifest, arrays, ckpt)
     for key, meta in manifest["tensors"].items():
         kind = meta["kind"]
         seen.setdefault(kind, [])
