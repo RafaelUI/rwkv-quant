@@ -71,8 +71,20 @@ def _to_mx(t: torch.Tensor) -> mx.array:
 
 def _export_one(key, qt, tensors):
     """Один QuantizedTensor -> буферы в tensors + метаданные."""
+    # ОРИЕНТАЦИЯ ЕДЕТ В САЙДКАР ЯВНО. До 05.09 её здесь не было вовсе:
+    # манифест .rwkvq её знает (writer пишет поле, reader кладёт в
+    # qt.transposed), а экспортёр её РОНЯЛ -- и потребитель сайдкара мог
+    # узнать ориентацию только из зашитой у себя таблицы имён. Ровно этим
+    # болел rwkv-metal до 1bf09d6, и ровно это до сих пор зашито восемью
+    # .transposed() в RwkvqFullConvert.swift:79-93.
+    tr = getattr(qt, "transposed", None)
+    if tr is None:
+        raise ValueError(
+            "%s: ориентация неизвестна (qt.transposed is None). Выгрузить "
+            "сайдкар без неё нельзя: потребитель угадает её по таблице "
+            "имён и ошибётся ТИХО, а не сломается громко (закон 15)." % key)
     meta = {"shape": list(qt.shape), "bits": int(qt.bits),
-            "group": qt.group or "other"}
+            "group": qt.group or "other", "transposed": bool(tr)}
 
     if qt.bits >= 16:
         tensors[f"{key}::dense"] = _to_mx(qt.dense)
