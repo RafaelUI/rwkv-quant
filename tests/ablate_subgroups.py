@@ -212,13 +212,22 @@ def build_ref():
                else ("mps", torch.bfloat16))
     print(f"  эталон в {REF_DTYPE} на {dev}", flush=True)
     model = RWKV7Ref(CKPT, device=dev, dtype=dt)
-    mm = np.lib.format.open_memmap(REF, mode="w+", dtype=np.float32,
+    # load_data() кладёт токены на mps, а fp32-эталон считается на cpu:
+    # без переноса torch.embedding падает на несовпадении устройств.
+    data = data.to(dev)
+    # Пишем во временное имя и переименовываем в конце: иначе оборванная
+    # сборка оставляет НУЛЕВОЙ файл под настоящим именем, а проверка выше
+    # смотрит только на существование -- и следующий прогон молча считает
+    # KL против нулей.
+    part = REF + ".part"
+    mm = np.lib.format.open_memmap(part, mode="w+", dtype=np.float32,
                                    shape=(NSEQ, T, V))
     for i, lg in enumerate(logits_of(model, data)):
         mm[i] = lg
         print(f"  {i+1}/{NSEQ}", flush=True)
     mm.flush()
     del mm, model
+    os.replace(part, REF)
     mem("финиш")
 
 

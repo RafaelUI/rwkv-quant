@@ -31,6 +31,15 @@ actual `.rwkvq` files on disk.
 | **2.9B** (`rwkv7-g1h-2.9b`) | 7.163 | `reduction` | 2737.3 MB (2.15x) | **+0.24%** | +0.37 / +0.11 / +0.38% |
 | | | `compression` | 1855.2 MB (3.18x) | **+5.10%** | +6.09 / +4.12 / +6.31% |
 
+> **`compression` rows are stale as of 09.09.** The preset's bit allocation was
+> changed (`proj` 5→4, `cmix.key` 4→5) after per-matrix sensitivity turned out
+> to diverge several-fold *inside* the old groups. Re-measured on 1.5B only:
+> same 970.5 MB, Δppl +2.850% instead of +3.390%, KL 0.0360 vs 0.0386 (paired
+> 95% CI [+0.00169; +0.00352]). The 0.1B / 0.4B / 2.9B rows above were measured
+> with the previous allocation and have **not** been recomputed; sensitivity
+> does not transfer across scale, so they cannot simply be scaled. `reduction`
+> rows are unaffected.
+
 Perplexity is a coarse instrument at these margins, so `reduction` is also
 scored by **KL divergence against an fp32 reference** — same weights, same
 inputs, activations in fp32 — on 8 x 512 tokens through the real quantized
