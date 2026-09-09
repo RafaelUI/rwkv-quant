@@ -1035,9 +1035,9 @@ KL против нулей и промолчал. Починено в `tests/abl
 
 ### Состояние на конец 09.09
 
-`rwkv-quant`: изменены `rwkv_quant/presets.py`, `README.md`,
-`tests/ablate_subgroups.py`; новые `tests/_sess/ablate2.py`,
-`tests/_sess/ablate_compression_fine.py`. НЕ ЗАКОММИЧЕНО.
+`rwkv-quant`: `eaebc62`, дерево чистое. В коммите -- `presets.py`,
+`README.md`, `tests/ablate_subgroups.py`, новые `tests/_sess/ablate2.py` и
+`tests/_sess/ablate_compression_fine.py`.
 `rwkv-metal`: `0bdfbe7` (шапка 05.09 говорила `297ff2f` -- отстала на один
 коммит), дерево чистое, main на 14 коммитов впереди origin.
 `SwiftRWKV` не трогался.
