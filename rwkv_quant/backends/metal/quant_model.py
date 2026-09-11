@@ -42,6 +42,8 @@ from .quant_linear_v2 import QuantLinearV2
 from .quant_linear_gw import GwQuantLinear, GwQuantLinearFused
 from .quant_linear_sym import SymQuantLinear, SymQuantLinearFused
 from .fused_tail import wkv_tail, can_fuse_tail
+from .fused_prewkv import (l2_norm, prewkv_ref, prewkv_kernel,
+                           can_fuse_prewkv)
 
 # Реализация Linear-кернеля для всей модели. v2 (threadgroup-редукция,
 # char4-загрузки) численно эквивалентна v1 (tests/test_quant_linear_v2.py)
@@ -65,6 +67,12 @@ LORA_Q8 = False  # int8-лоры в decode-фьюзе: НЕ бит-в-бит, в
 # редукции там древесно-simd'овые, то есть бит-в-бит не обязан -- гейт
 # tests/test_fuse_parity.py.
 FUSE_TAIL = True
+
+# Пред-WKV блок (w, a, kk, обновление k и v) одним кернелем вместо
+# примерно пяти примитивов. Имя флага заведено 10.09 в отпечатке
+# конфигурации kl_real_path ДО появления кода; умолчание False до
+# замера. Гейт -- tests/test_prewkv_parity.py.
+FUSE_PREWKV = False
 
 # ---------------------------------------------------------------------------
 # LoRA-ветки под нативный mx.quantized_matmul. ЭТО НОВОЕ КВАНТОВАНИЕ, А НЕ
@@ -359,8 +367,8 @@ def _linear(qt):
     return _DenseLinear(mx.array(qt.dense.to(torch.float16).numpy()))
 
 
-def l2_norm(x):
-    return x / mx.sqrt((x * x).sum(axis=-1, keepdims=True) + 1e-12)
+# l2_norm переехал в fused_prewkv -- одна реализация на оба пути;
+# имя остаётся доступным как qm.l2_norm благодаря импорту в шапке.
 
 
 def _group_norm(x, H, weight, bias, eps=64e-5):
@@ -622,6 +630,19 @@ class QuantTMix:
         out = dict(zip(names, ys))
         return out["w"], out["a"], out.get("v"), out["g"]
 
+    def _prewkv(self, y_w, y_a, y_v, k, v, v_first, B, T, dtype):
+        # Пред-WKV: эталон или ядро, по флагу FUSE_PREWKV.
+        # Ядро включается только на декоде (N = B*T == 1) и при S,
+        # кратном ширине simdgroup: на префилле тензоры крупные,
+        # накладные запуска амортизируются, а лишняя реализация на
+        # горячем пути стоит дороже, чем экономит (закон 23).
+        args = (y_w, y_a, y_v, k, v, v_first, self.w_lora_B_b,
+                self.a_lora_B_b, self.v_lora_B_b, self.k_k, self.k_a,
+                self.layer_id, B, T, self.H, self.S, dtype)
+        if FUSE_PREWKV and can_fuse_prewkv(self.H, self.S, B * T, dtype):
+            return prewkv_kernel(*args)
+        return prewkv_ref(*args)
+
     def _build_fused(self):
         """Буферы decode-фьюза: [6,1,1,D]-стек лерп-коэффициентов и
         батченые LoRA-матрицы (w,a,v): pad v-ранга (64->96) нулями --
@@ -794,21 +815,11 @@ class QuantTMix:
             y_w, y_a = y[0].reshape(B, T, D), y[1].reshape(B, T, D)
             y_v = y[2].reshape(B, T, D)
 
-        w = y_w + self.w_lora_B_b
-        w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
-        w = w.reshape(B, T, H, S)
-        a = mx.sigmoid(y_a + self.a_lora_B_b).reshape(B, T, H, S)
+        w, k, v, nkk, kka, v_first = self._prewkv(
+            y_w, y_a, y_v, k, v, v_first, B, T, x.dtype)
 
-        kk = l2_norm(k * self.k_k)
-        k = k * (1.0 + (a - 1.0) * self.k_a)
-
-        if self.layer_id == 0:
-            v_first = v
-        else:
-            vv = mx.sigmoid(y_v + self.v_lora_B_b).reshape(B, T, H, S)
-            v = v + (v_first - v) * vv
-
-        out, new_wkv_state = _wkv_stateful(r, w, k, v, -kk, kk * a, wkv_state)
+        out, new_wkv_state = _wkv_stateful(
+            r, w, k, v, nkk, kka, wkv_state)
 
         if FUSE_TAIL and can_fuse_tail(H, S):
             # group_norm + bonus + gate одним запуском вместо ~14
@@ -854,23 +865,11 @@ class QuantTMix:
 
         y_w, y_a, y_v, g = self._lora(xw, xa, xv, xg, x, xx)
 
-        a = mx.sigmoid(y_a + self.a_lora_B_b)
-        a = a.reshape(B, T, H, S)
+        w, k, v, nkk, kka, v_first = self._prewkv(
+            y_w, y_a, y_v, k, v, v_first, B, T, x.dtype)
 
-        w = y_w + self.w_lora_B_b
-        w = mx.exp(-0.606531 * mx.sigmoid(w.astype(mx.float32))).astype(x.dtype)
-        w = w.reshape(B, T, H, S)
-
-        kk = l2_norm(k * self.k_k)
-        k = k * (1.0 + (a - 1.0) * self.k_a)
-
-        if self.layer_id == 0:
-            v_first = v
-        else:
-            vv = mx.sigmoid(y_v + self.v_lora_B_b).reshape(B, T, H, S)
-            v = v + (v_first - v) * vv
-
-        out, new_wkv_state = _wkv_stateful(r, w, k, v, -kk, kk * a, wkv_state)
+        out, new_wkv_state = _wkv_stateful(
+            r, w, k, v, nkk, kka, wkv_state)
 
         out2d = out.reshape(B * T, D)
         out2d = _group_norm(out2d, H, self.ln_x_w, self.ln_x_b)
