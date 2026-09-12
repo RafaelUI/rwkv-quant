@@ -117,6 +117,9 @@ def run(path, name, nobf16):
         raise RuntimeError("отпечаток emb вырожден (%r): контроль включения "
                            "не работает, замер недействителен" % fp)
     print("  отпечаток emb: %r" % (fp,), flush=True)
+    wfp, cfp = _weights_fp(model), _config_fp()
+    print("  отпечаток весов (%d тензоров): %r" % (len(wfp), wfp), flush=True)
+    print("  отпечаток конфигурации: %r" % (cfp,), flush=True)
 
     per_seq, tops = [], []
     for i in range(NSEQ):
@@ -137,10 +140,58 @@ def run(path, name, nobf16):
     doc["ref"] = ref_path; doc["langs"] = langs
     doc["rows"][name] = {"kl": kl, "ci": [lo, hi], "per_seq": per_seq,
                          "top1": float(np.mean(tops)), "file": path,
-                         "emb_fp": fp, "nobf16": bool(nobf16)}
+                         "emb_fp": fp, "weights_fp": wfp, "cfg_fp": cfp, "nobf16": bool(nobf16)}
     json.dump(doc, open(OUT, "w"), indent=1, ensure_ascii=False)
     print("KL = %.6f нат/токен  95%% CI [%.6f; %.6f]   top-1 %.3f%%"
           % (kl, lo, hi, 100 * np.mean(tops)), flush=True)
+
+
+def _weights_fp(model):
+    """Отпечаток ВЕСОВ плеча: несколько представительных тензоров.
+
+    Долг 3 записки, закрыт 09.09. Контроль по одному emb ложно объявляет
+    неразличимыми плечи, законно совпадающие в emb -- в частности два
+    прогона ОДНОГО файла с разным значением рантайм-флага, где веса
+    обязаны совпасть. Берём срезы из разных групп и раскладок, чтобы
+    отличие в любой из них было видно.
+    """
+    import mlx.core as mx  # mx локален в run(), на уровне модуля его нет
+
+    vals = []
+
+    def take(a):
+        if a is None:
+            return
+        f = float(mx.sum(mx.abs(a.reshape(-1)[:4096].astype(mx.float32))).item())
+        if not (f == f and abs(f) != float("inf")):
+            raise RuntimeError("отпечаток вырожден (%r), замер недействителен" % f)
+        vals.append(round(f, 6))
+
+    emb = model.emb_weight if not hasattr(model.emb_weight, "codes") else None
+    take(emb)
+    nb = len(model.blocks)
+    for lin in (model.head, model.blocks[0].tmix.r_proj,
+                model.blocks[nb // 2].tmix.o_proj,
+                model.blocks[-1].cmix.key, model.blocks[-1].cmix.value):
+        for v in vars(lin).values():
+            if isinstance(v, mx.array):
+                take(v)
+                break
+    take(getattr(model.blocks[0].tmix, "w_lora_A", None))
+    return vals
+
+
+def _config_fp():
+    """Отпечаток КОНФИГУРАЦИИ: флаги, определяющие семантику декода.
+
+    Плечи, различающиеся только флагом, имеют одинаковые веса. Без этого
+    отпечатка их нечем отличить от случая, когда плечо просто не
+    переключилось.
+    """
+    import rwkv_quant.backends.metal.quant_model as qm
+    keys = ("FUSE", "FUSE_TAIL", "LORA_Q", "LORA_QBITS", "LORA_GS_DOWN",
+            "LORA_GS_UP", "LORA_Q_DECODE_ONLY", "EMB_GATHER", "FUSE_PREWKV")
+    return {k: repr(getattr(qm, k, None)) for k in keys}
 
 
 def report():
@@ -156,8 +207,16 @@ def report():
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
             a, b = rows[names[i]], rows[names[j]]
-            if a.get("emb_fp") is not None and a["emb_fp"] == b.get("emb_fp"):
-                print("\n! ОТПЕЧАТКИ emb СОВПАЛИ у %s и %s -- плечи не различаются, "
+            same_w = (a.get("weights_fp") is not None
+                      and a.get("weights_fp") == b.get("weights_fp"))
+            same_c = (a.get("cfg_fp") == b.get("cfg_fp"))
+            legacy = (a.get("weights_fp") is None
+                      and a.get("emb_fp") is not None
+                      and a["emb_fp"] == b.get("emb_fp"))
+            if same_w and not same_c:
+                print("  веса совпали, конфигурации разошлись -- законная пара")
+            if (same_w and same_c) or legacy:
+                print("\n! ВЕСА И КОНФИГУРАЦИЯ СОВПАЛИ у %s и %s -- плечи не различаются, "
                       "сравнивать нечего" % (names[i], names[j]))
                 continue
             d = np.array(a["per_seq"]) - np.array(b["per_seq"])

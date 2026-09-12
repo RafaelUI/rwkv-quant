@@ -47,7 +47,11 @@ from rwkv_quant.formats.writer import quantize_tensor  # noqa: E402
 
 import ablate_sym_composite as comp  # noqa: E402
 
-SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 90.0
+# argv разбирается ТОЛЬКО при прямом запуске. Модуль импортируют ради
+# decode_traffic_mb (bench_step_decompose, bench_gemv_presets_ab), и у
+# импортёра в argv[2] лежит ЕГО аргумент: разбор на уровне модуля ронял
+# импорт с ValueError на пути к файлу. Найдено 09.09.
+SECONDS = float(sys.argv[2]) if __name__ == "__main__" and len(sys.argv) > 2 else 90.0
 SILENT = os.environ.get("SILENT") == "1"
 WARMUP = 32
 
@@ -75,18 +79,27 @@ def decode_traffic_mb(model):
     моделей и разъехалась с реальностью в тот день, когда LoRA
     квантовали). `emb` исключается -- gather одной строки."""
     import rwkv_quant.backends.metal.quant_model as _qm
-    seen, tot = set(), 0
+    # УДЕРЖАНИЕ ССЫЛОК ОБЯЗАТЕЛЬНО (найдено 09.09). Дедуп идёт по id(), а
+    # освобождённый временный массив отдаёт свой id следующему -- и тот
+    # молча объявляется посчитанным. Из 1154 тензоров так терялось 432, и
+    # ответ плавал 851.0 -> 915.8 МБ на ОДНОМ файле в ОДНОМ процессе
+    # (tests/_sess/probe_traffic_stability.py).
+    seen, keep, tot = set(), [], 0
 
     def add(a):
         nonlocal tot
         if isinstance(a, mx.array) and id(a) not in seen:
             seen.add(id(a))
+            keep.append(a)
             tot += a.nbytes
 
     def lin_bytes(l):
-        for f in ("qblk", "qs", "d", "codes", "scales", "biases", "w",
-                  "mlx_weight"):
-            add(getattr(l, f, None))
+        # Только РЕАЛЬНО ХРАНИМЫЕ буферы, а не список имён: qs, d и codes
+        # -- свойства, отдающие свежий массив на каждый доступ, причём
+        # codes есть то же хранилище, что qblk, то есть список имён ещё и
+        # двоил байты. vars() даёт ровно то, что слой держит.
+        for v in vars(l).values():
+            add(v)
 
     lin_bytes(model.head)
     for b in model.blocks:
@@ -105,6 +118,14 @@ def decode_traffic_mb(model):
                   tm.x_a, tm.x_g, tm.ln_x_w, tm.ln_x_b, cm.x_k,
                   b.ln1_w, b.ln1_b, b.ln2_w, b.ln2_b):
             add(a)
+    # ЛЕНИВОСТЬ КОПИЙ LoRA (найдено 09.09). При LORA_Q копии строятся не
+    # при загрузке, а на первом шаге декода (quant_model.py:574). Счётчик,
+    # вызванный до шага, их не находит и молча считает ПЛОТНУЮ LoRA:
+    # +100.1 вместо +32 МБ на 1.5B, то есть ошибка в 8% трафика.
+    if _qm.LORA_Q and getattr(model.blocks[0].tmix, "_lq_A", None) is None:
+        print("ВНИМАНИЕ: LORA_Q=%r, а квантованных копий LoRA ещё нет --"
+              " в трафик попала ПЛОТНАЯ LoRA. Считать ПОСЛЕ шага декода."
+              % (_qm.LORA_Q,), flush=True)
     return tot / 1e6
 
 
