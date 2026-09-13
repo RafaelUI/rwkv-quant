@@ -383,7 +383,34 @@ def _group_norm(x, H, weight, bias, eps=64e-5):
     return xg
 
 
-FAST_LN = False
+FAST_LN = False   # умолчание процесса; модель может решить иначе, см. ниже
+
+
+def preset_of(ckpt):
+    """Имя пресета файла ПО СТРОГОМУ совпадению конфига, или None.
+
+    Имени пресета в формате нет -- в манифесте лежит только структура
+    QuantConfig. Решать по битности (proj<=5 -- значит compression) было
+    бы молчаливой эвристикой, а этот проект уже ловил файл с именем
+    одного чекпоинта и содержимым другого (закон 15). Поэтому здесь
+    ТОЛЬКО равенство каноническому пресету: совпало -- имя, не совпало --
+    None, и никаких догадок посередине.
+
+    ОТКАЗ В БЕЗОПАСНУЮ СТОРОНУ И ЕГО ЦЕНА. Любая правка presets.py
+    (а 09.09 она была: proj 5->4, cmix.key 4->5) обнуляет совпадение для
+    файлов, собранных ДО неё: compression_v1_ref сегодня не совпадает ни
+    с чем и получает None. Это правильное поведение -- умолчание тогда
+    берётся консервативное, -- но если файл собран своим config, пресет
+    надо передавать руками: QuantRWKV7(ckpt, fast_ln=True).
+    Сверено 12.09: три файла compression и reduction_1p5b_0709 совпадают
+    строго и однозначно.
+    """
+    cfg = getattr(ckpt, "config", None)
+    if cfg is None:
+        return None
+    from rwkv_quant.presets import PRESETS
+    hits = [n for n, p in PRESETS.items() if repr(p) == repr(cfg)]
+    return hits[0] if len(hits) == 1 else None
 
 
 def _layer_norm_ref(x, weight, bias, eps=1e-5):
@@ -392,7 +419,7 @@ def _layer_norm_ref(x, weight, bias, eps=1e-5):
     return (x - mean) / mx.sqrt(var + eps) * weight + bias
 
 
-def _layer_norm(x, weight, bias, eps=1e-5):
+def _layer_norm(x, weight, bias, eps=1e-5, fast=None):
     """Норма слоя. FAST_LN=True переводит её на штатный mx.fast.layer_norm.
 
     ЗАЧЕМ. Статья бюджета 10.09 "нормы + сдвиги + лерпы" = 0.726 мс при дне
@@ -420,7 +447,7 @@ def _layer_norm(x, weight, bias, eps=1e-5):
     FAST_LN после этого не меняет ничего -- в A/B сбрасывать
     del m._step_compiled перед каждым плечом (закон 11.09).
     """
-    if FAST_LN:
+    if FAST_LN if fast is None else fast:
         return mx.fast.layer_norm(x, weight, bias, eps)
     return _layer_norm_ref(x, weight, bias, eps)
 
@@ -942,28 +969,30 @@ class QuantCMix:
 
 
 class QuantBlock:
-    def __init__(self, tensors, layer_prefix, naming, layer_id, n_head, head_size):
+    def __init__(self, tensors, layer_prefix, naming, layer_id, n_head,
+                 head_size, fast_ln=None):
         def g(suffix):
             return tensors[layer_prefix + suffix]
+        self.fast_ln = fast_ln
         self.ln1_w, self.ln1_b = _dense(g("ln1.weight")), _dense(g("ln1.bias"))
         self.ln2_w, self.ln2_b = _dense(g("ln2.weight")), _dense(g("ln2.bias"))
         self.tmix = QuantTMix(tensors, layer_prefix, naming, layer_id, n_head, head_size)
         self.cmix = QuantCMix(tensors, layer_prefix, naming)
 
     def __call__(self, x, v_first):
-        h, v_first = self.tmix(_layer_norm(x, self.ln1_w, self.ln1_b), v_first)
+        h, v_first = self.tmix(_layer_norm(x, self.ln1_w, self.ln1_b, fast=self.fast_ln), v_first)
         x = x + h
-        x = x + self.cmix(_layer_norm(x, self.ln2_w, self.ln2_b))
+        x = x + self.cmix(_layer_norm(x, self.ln2_w, self.ln2_b, fast=self.fast_ln))
         return x, v_first
 
     def step(self, x, v_first, state):
         # state = (wkv_state, tmix_shift, cmix_shift)
         wkv_state, tmix_shift, cmix_shift = state
         h, v_first, (new_wkv_state, new_tmix_shift) = self.tmix.forward_stateful(
-            _layer_norm(x, self.ln1_w, self.ln1_b), v_first, (wkv_state, tmix_shift))
+            _layer_norm(x, self.ln1_w, self.ln1_b, fast=self.fast_ln), v_first, (wkv_state, tmix_shift))
         x = x + h
         cmix_out, new_cmix_shift = self.cmix.forward_stateful(
-            _layer_norm(x, self.ln2_w, self.ln2_b), cmix_shift)
+            _layer_norm(x, self.ln2_w, self.ln2_b, fast=self.fast_ln), cmix_shift)
         x = x + cmix_out
         return x, v_first, (new_wkv_state, new_tmix_shift, new_cmix_shift)
 
@@ -972,8 +1001,27 @@ class QuantRWKV7:
     """RWKV-7 x070 forward (prefill, T произвольный) на .rwkvq через MLX.
     Строится напрямую из QuantizedCheckpoint (formats.reader.load_raw)."""
 
-    def __init__(self, ckpt):
+    def __init__(self, ckpt, fast_ln=None):
         # ckpt: rwkv_quant.formats.schema.QuantizedCheckpoint
+        #
+        # FAST_LN РЕШАЕТСЯ НА МОДЕЛИ, А НЕ НА ПРОЦЕССЕ. Порядок:
+        # явный аргумент -> пресет файла -> модульное умолчание FAST_LN.
+        # Почему не глобальный флаг: в одном процессе живут ДВА плеча
+        # (все наши A/B, гейты, bench_gemv_presets_ab), и глобал они
+        # затирали бы друг другу.
+        # ПОЧЕМУ compression -- ДА, А reduction -- НЕТ (решение владельца
+        # 12.09, числа в разделе 12.09). Функции полезности у пресетов
+        # разные: COMPRESSION -- максимум скорости при минимальных
+        # потерях качества, и там +3.2% декода за KL 4.3e-07 (запас
+        # 83766x против KL самого квантования) -- та же сделка, которую
+        # пресет уже заключил. REDUCTION -- база под QAT/QLoRA и
+        # векторные модели, где ценится сравнимость с записанным
+        # бит-в-бит, поэтому там остаётся рукописная норма.
+        self.preset = preset_of(ckpt)
+        if fast_ln is None:
+            fast_ln = True if self.preset == "compression" else (
+                False if self.preset == "reduction" else None)
+        self.fast_ln = fast_ln
         self.naming = ckpt.naming
         self.n_layer = ckpt.n_layer
         self.n_embd = ckpt.n_embd
@@ -992,7 +1040,8 @@ class QuantRWKV7:
         self.ln_out_w, self.ln_out_b = _dense(tensors["ln_out.weight"]), _dense(tensors["ln_out.bias"])
 
         self.blocks = [
-            QuantBlock(tensors, f"blocks.{i}.", self.naming, i, self.n_head, self.head_size)
+            QuantBlock(tensors, f"blocks.{i}.", self.naming, i, self.n_head,
+                                 self.head_size, fast_ln=self.fast_ln)
             for i in range(self.n_layer)
         ]
         self._materialize()
@@ -1024,11 +1073,11 @@ class QuantRWKV7:
 
     def __call__(self, idx: mx.array) -> mx.array:
         x = self.emb_weight[idx]
-        x = _layer_norm(x, self.ln0_w, self.ln0_b)
+        x = _layer_norm(x, self.ln0_w, self.ln0_b, fast=self.fast_ln)
         v_first = None
         for block in self.blocks:
             x, v_first = block(x, v_first)
-        x = _layer_norm(x, self.ln_out_w, self.ln_out_b)
+        x = _layer_norm(x, self.ln_out_w, self.ln_out_b, fast=self.fast_ln)
         return self.head(x)
 
     def init_state(self, batch_size: int = 1):
@@ -1085,13 +1134,13 @@ class QuantRWKV7:
         (tests/eval_retrieval_emb.py сверяет forward_hidden с
         forward_stateful через голову на модели, у которой голова есть)."""
         x = self.emb_weight[idx]
-        x = _layer_norm(x, self.ln0_w, self.ln0_b)
+        x = _layer_norm(x, self.ln0_w, self.ln0_b, fast=self.fast_ln)
         v_first = None
         new_states = []
         for block, state in zip(self.blocks, states):
             x, v_first, new_state = block.step(x, v_first, state)
             new_states.append(new_state)
-        return _layer_norm(x, self.ln_out_w, self.ln_out_b), new_states
+        return _layer_norm(x, self.ln_out_w, self.ln_out_b, fast=self.fast_ln), new_states
 
     def forward_stateful(self, idx: mx.array, states, last_only: bool = False,
                          tail_only: int = 0):
@@ -1105,13 +1154,13 @@ class QuantRWKV7:
         следующий токен, это убирает (T-1)/T работы head'а (65536x2048 на
         1.5B). Дефолт False сохраняет полные логиты (ppl, тесты)."""
         x = self.emb_weight[idx]
-        x = _layer_norm(x, self.ln0_w, self.ln0_b)
+        x = _layer_norm(x, self.ln0_w, self.ln0_b, fast=self.fast_ln)
         v_first = None
         new_states = []
         for block, state in zip(self.blocks, states):
             x, v_first, new_state = block.step(x, v_first, state)
             new_states.append(new_state)
-        x = _layer_norm(x, self.ln_out_w, self.ln_out_b)
+        x = _layer_norm(x, self.ln_out_w, self.ln_out_b, fast=self.fast_ln)
         if last_only and x.shape[1] > 1:
             x = x[:, -1:]
         elif tail_only and x.shape[1] > tail_only:

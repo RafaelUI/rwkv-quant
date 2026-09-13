@@ -39,11 +39,11 @@ def swap_mb():
     return float(num) * (1024 if unit == "G" else 1)
 
 
-def _ln_fast(x, weight, bias, eps=1e-5):
+def _ln_fast(x, weight, bias, eps=1e-5, fast=None):
     return mx.fast.layer_norm(x, weight, bias, eps)
 
 
-def _ln_aff(x, weight, bias, eps=1e-5):
+def _ln_aff(x, weight, bias, eps=1e-5, fast=None):
     return x * weight + bias
 
 

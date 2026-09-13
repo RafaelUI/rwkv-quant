@@ -132,7 +132,7 @@ def ulp_rel(dtype):
                           else np.float32).eps)
 
 
-def _ln1p(x, weight, bias, eps=1e-5):
+def _ln1p(x, weight, bias, eps=1e-5, fast=None):
     # ПОЛ СЕМЕЙСТВА: та же норма через E[x^2]-E[x]^2, В ТОМ ЖЕ ТИПЕ.
     # Математически то же, другой порядок накопления, поэтому её
     # расхождение с off есть измеренная цена ОДНОГО ЛИШЬ ПОРЯДКА.
@@ -141,21 +141,35 @@ def _ln1p(x, weight, bias, eps=1e-5):
     return (x - m1) / mx.sqrt(m2 - m1 * m1 + eps) * weight + bias
 
 
-def _prod_mut(x, weight, bias, eps=1e-5):
-    y = _PROD(x, weight, bias, eps)
+def _prod_mut(x, weight, bias, eps=1e-5, fast=None):
+    y = _PROD(x, weight, bias, eps, fast)
     if qm.FAST_LN and MUT:
         y = (y.astype(mx.float32) * (1.0 + MUT)).astype(y.dtype)
     return y
 
 
 def arm(name):
-    """Переключить плечо. off и fast идут ПРОИЗВОДСТВЕННЫМ кодом."""
+    """Переключить плечо. off и fast идут ПРОИЗВОДСТВЕННЫМ кодом.
+
+    ФЛАГ СТАВИТСЯ И НА МОДЕЛИ, А НЕ ТОЛЬКО НА МОДУЛЕ. С 12.09 QuantRWKV7
+    решает fast_ln сам по пресету файла, и у compression он True. Если
+    трогать только модульный FAST_LN, плечо off у compression-файла
+    молча осталось бы плечом fast, и гейт мерил бы fast против fast --
+    то есть всегда зелёным. Модель здесь глобальная и создаётся ниже,
+    поэтому ставим по факту наличия.
+    """
+    on = (name == "fast") and not ALIAS
     if name == "1pass":
         qm._layer_norm = _ln1p
-        qm.FAST_LN = False
+        on = False
     else:
         qm._layer_norm = _prod_mut if MUT else _PROD
-        qm.FAST_LN = (name == "fast") and not ALIAS
+    qm.FAST_LN = on
+    m = globals().get("model")
+    if m is not None:
+        m.fast_ln = on
+        for b in m.blocks:
+            b.fast_ln = on
 
 
 say("модель: %s" % MODEL)
@@ -181,7 +195,7 @@ say("флаги: FUSE=%s FUSE_TAIL=%s LORA_Q=%r EMB_GATHER=%s FAST_LN=%s" % (
 if "comp" not in SKIP:
     CAP = []
 
-    def _cap(x, weight, bias, eps=1e-5):
+    def _cap(x, weight, bias, eps=1e-5, fast=None):
         CAP.append((x, weight, bias, eps))
         return _REF(x, weight, bias, eps)
 
