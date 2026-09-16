@@ -24,7 +24,7 @@ else:
     T, seconds = 1, (float(sys.argv[2]) if len(sys.argv) > 2 else 40.0)
 
 print(f"PID {os.getpid()}  mode={mode} T={T} steady={seconds:.0f}s", flush=True)
-model = QuantRWKV7(load_raw("/tmp/compression_packed.rwkvq"))
+model = QuantRWKV7(load_raw(os.environ.get("RWKVQ_MODEL", "/Users/s/Develop/WKV-kvant/compression_v2_cand.rwkvq")))
 
 def _flat(st): return [s for x in st for s in x if s is not None]
 
