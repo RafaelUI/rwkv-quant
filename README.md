@@ -132,6 +132,44 @@ Without imatrix we look like winners (Q6_K +0.41%, Q4_K_M +7.65%) — the
 entire margin was explained by us having activation-aware scale search
 and them not. Reporting only that comparison would have been dishonest.
 
+### Re-measured against llama.cpp, 2026-09-16 (prefill and decode only)
+
+Same machine, same GGUF artifacts and imatrix as the table above,
+llama.cpp from Homebrew (ggml 0.17.0, Metal + BLAS backends, 4 threads),
+`llama-bench -p 512 -n 128 -r 3`. Our side: prefill is a single
+`forward_stateful` call at T=512 with logits for the last position only,
+which is what llama.cpp also computes during prompt processing; median of
+7 rounds with the first call discarded. Quality columns are deliberately
+not restated here — nothing in this row changed the numerics, the dequant
+kernel is bit-exact.
+
+| | size | pp512 | tg128 |
+|---|---|---|---|
+| `compression` + dequant kernel | 970 MB | **754.5-778.7** | **76.6** |
+| Q4_K_M + imatrix | 943 MiB | 750.8 ± 1.9 | 60.9 ± 3.0 |
+| `reduction` | 1435 MB | **764.1** | 58.2 |
+| Q6_K | 1.24 GiB | 729.0 ± 12.3 | 50.4 ± 1.8 |
+
+The prefill loss is gone: `compression` used to trail Q4_K_M by 1.18x and
+now brackets it. The range 754.5-778.7 is not a spread of one measurement —
+it is the same benchmark run on a cold machine and on a machine warmed by
+the llama.cpp run that preceded it, and llama.cpp got the cold machine.
+Since their number falls inside our range, the honest claim is parity on
+prefill, not a win. Decode is a win by a margin well outside the noise:
++26 % against Q4_K_M at a smaller file, and `reduction` is +15 % against
+Q6_K.
+
+One byproduct worth recording, from a single pair of runs rather than a
+sweep: under thermal load the dequant article grew 47.4 → 66.0 ms (+39 %)
+while the floor with dequant removed barely moved (610.1 → 612.6 ms). On
+this fanless machine the memory-bound part of prefill degrades first and
+the GEMM does not, so benchmarks that mix the two are worth running cold.
+
+Note on whose implementation this is: RWKV-7 support in llama.cpp is
+MollySophia work, so this table is already a comparison against it. The
+backends not covered here are `rwkv-mobile` (same author, Apple-targeted)
+and `web-rwkv` (wgpu); neither is installed on this machine.
+
 ### Against the machine's real ceilings (both measured, neither from a datasheet)
 
 Decode is bound by **memory bandwidth**, prefill by **arithmetic**, and
