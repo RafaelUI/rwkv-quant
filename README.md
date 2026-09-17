@@ -94,30 +94,56 @@ calibration, so it is real and not an artifact of the statistics. The
 previously published headline of `+0.108%` for `reduction` at 1.5B was the
 top-left cell of that table: correct arithmetic on a leaky experiment.
 
-### Against llama.cpp (1.5B, same data split)
+### Against llama.cpp (1.5B)
 
-**These rows predate the 2026-08-28 changes** and use the old LoRA layout
-and the old calibration, on both sides of the comparison. They are left
-as measured rather than silently restated; re-running the comparison is
-an open item.
+RWKV-7 support in llama.cpp is MollySophia work, so these tables compare
+against it. llama.cpp comes from Homebrew (Metal + BLAS backends, 4 threads)
+and runs on the same machine. Its GGUF files are converted from the same
+`.pth`, with an imatrix taken from calibration text disjoint from the
+evaluation corpus. Absolute ppl is not comparable across the two (the
+streams are tokenized differently), so quality is reported as a delta
+against each side FP baseline. Backends not covered: `rwkv-mobile` (same
+author, Apple-targeted) and `web-rwkv` (wgpu); neither is installed here.
 
-Calibration data (our activation stats / their imatrix) and evaluation
-data are split identically for both systems. Absolute ppl is not
-comparable across the two (llama.cpp tokenizes the stream differently),
-so both are reported as Δ% against their own FP baseline.
+#### Quality (2026-09-09, disjoint calibration on both sides)
 
-| | size | Δppl | | | size | pp512 | tg128 |
-|---|---|---|---|---|---|---|---|
-| `reduction` | 1435 MB | **+0.108%** | | `compression` | 970 MB | 633.2 t/s | **75.3 t/s** |
-| Q6_K + imatrix | 1336 MB | +0.19% | | Q4_K_M + imatrix | 990 MB | **745.2** | 58.2 t/s |
-| `compression` | 970 MB | +3.63% | | `reduction` | 1435 MB | **771.4** | **58.2 t/s** |
-| Q4_K_M + imatrix | 990 MB | +3.44% | | Q6_K + imatrix | 1336 MB | 705.5 | 48.6 t/s |
+Evaluation on 38 x 512 tokens; the llama.cpp deltas are paired
+(`--kl-divergence-base`) and the interval is on the ppl ratio. Sizes are
+decimal MB on both sides.
 
-At the near-lossless point we are now **ahead on all three axes at once**:
-`reduction` is +0.108% against Q6_K+imatrix's +0.19%, decodes **20%
-faster** (58.2 vs 48.6 t/s) and prefills **9% faster** (771.4 vs 705.5
-t/s), at a 7% larger file. `compression` decodes **29% faster** than
-Q4_K_M at comparable quality, and still loses prefill by 1.18x.
+| | size | Δppl |
+|---|---|---|
+| `reduction` | 1435.1 MB | +0.153% |
+| Q6_K + imatrix | 1336.1 MB | +0.235% ± 0.096 |
+| `compression` | 970.2 MB | +2.850% |
+| Q4_K_M + imatrix | 990.1 MB | +3.147% ± 0.317 |
+
+At the near-lossless point the two are indistinguishable (our delta is
+inside one of their sigmas) and our file is 7.4% larger. At the compression
+point `compression` is smaller and 0.3 points better, also inside their
+interval. Across the size range between the two, our Pareto front lies
+above theirs: at 1062.5 MB we measure +1.657% where interpolating Q4_K_M
+and Q6_K gives about +2.54%.
+
+#### Prefill, pp2048 (2026-09-17)
+
+`llama-bench -p 2048 -n 0 -ngl 99 -r 5 -b 2048` (build 10150) with ubatch
+512, its default, and 2048, the whole prompt in one graph as on our side.
+Ours: one compiled `forward_stateful` call at T=2048, logits for the last
+position only, median of 5 rounds, dequant kernel on. Runs were strictly
+alternated and the first pair was repeated at the end; on battery, low-power
+mode off, no swap.
+
+| pair (by size) | ours, t/s | llama.cpp ubatch 512 / 2048, t/s | ours ahead |
+|---|---|---|---|
+| `compression` / Q4_K_M | 783.6 | 755.8 / 754.6 | +3.7% |
+| `reduction` / Q6_K | 775.7 | 731.4 / 709.2 | +6.1% |
+| `compression` / Q4_K_M, repeat | 787.0 | 714.3 / 719.2 | +9.4% |
+
+The machine warmed up during the run: llama.cpp lost 5% on the repeat while
+our number did not move, so the honest reading is ahead by 4-9%,
+conservatively 4%. Our throughput does not drop from T=512 to T=2048
+(780 to 784 t/s), and a larger ubatch does not help llama.cpp.
 
 > **Earlier versions of this README said "prefill we lose roughly 2x".**
 > Two separate errors were hiding there. `mx.compile` was never called on
@@ -128,13 +154,9 @@ Q4_K_M at comparable quality, and still loses prefill by 1.18x.
 > Neither was a modelling insight; both were found by decomposing a
 > number instead of trusting it.
 
-Without imatrix we look like winners (Q6_K +0.41%, Q4_K_M +7.65%) — the
-entire margin was explained by us having activation-aware scale search
-and them not. Reporting only that comparison would have been dishonest.
+#### Decode and pp512 (2026-09-16)
 
-### Re-measured against llama.cpp, 2026-09-16 (prefill and decode only)
-
-Same machine, same GGUF artifacts and imatrix as the table above,
+Same machine and GGUF artifacts as above,
 llama.cpp from Homebrew (ggml 0.17.0, Metal + BLAS backends, 4 threads),
 `llama-bench -p 512 -n 128 -r 3`. Our side: prefill is a single
 `forward_stateful` call at T=512 with logits for the last position only,
@@ -150,25 +172,20 @@ kernel is bit-exact.
 | `reduction` | 1435 MB | **764.1** | 58.2 |
 | Q6_K | 1.24 GiB | 729.0 ± 12.3 | 50.4 ± 1.8 |
 
-The prefill loss is gone: `compression` used to trail Q4_K_M by 1.18x and
-now brackets it. The range 754.5-778.7 is not a spread of one measurement —
-it is the same benchmark run on a cold machine and on a machine warmed by
-the llama.cpp run that preceded it, and llama.cpp got the cold machine.
-Since their number falls inside our range, the honest claim is parity on
-prefill, not a win. Decode is a win by a margin well outside the noise:
-+26 % against Q4_K_M at a smaller file, and `reduction` is +15 % against
-Q6_K.
+At pp512 `compression` used to trail Q4_K_M by 1.18x and now brackets it.
+The range 754.5-778.7 is not a spread of one measurement: it is the same
+benchmark on a cold machine and on a machine warmed by the llama.cpp run
+before it, and llama.cpp got the cold machine, so this run alone supports
+parity on prefill, not a win. The strictly alternated pp2048 run above is
+the better-controlled prefill comparison. Decode is a win by a margin well
+outside the noise: +26 % against Q4_K_M at a smaller file, and `reduction`
+is +15 % against Q6_K.
 
 One byproduct worth recording, from a single pair of runs rather than a
 sweep: under thermal load the dequant article grew 47.4 → 66.0 ms (+39 %)
 while the floor with dequant removed barely moved (610.1 → 612.6 ms). On
 this fanless machine the memory-bound part of prefill degrades first and
 the GEMM does not, so benchmarks that mix the two are worth running cold.
-
-Note on whose implementation this is: RWKV-7 support in llama.cpp is
-MollySophia work, so this table is already a comparison against it. The
-backends not covered here are `rwkv-mobile` (same author, Apple-targeted)
-and `web-rwkv` (wgpu); neither is installed on this machine.
 
 ### Against the machine's real ceilings (both measured, neither from a datasheet)
 
@@ -189,11 +206,21 @@ independent instruments) and `mx.matmul` at **2.80 TFLOP/s**
 it is not the file size, because `emb` is a gather of one row and the
 in-memory layout is not the on-disk one.)
 
-Prefill's remaining 23% is no longer the matmul: it decomposes into the
-WKV scan (7.7%), dequantization (5.5%) and the LoRA branches (5.3%).
-The WKV recurrence is still the largest single item, and it is the one
-place where the arithmetic ceiling does not help at all — the scan is
-sequential by construction.
+What is left of prefill above the GEMM floor was decomposed for `compression`
+in one process on 2026-09-17 (`tests/_sess/bench_prefill_rest_ab.py`, T=512,
+657 ms): dequantization 47.9 ms (7.3%), WKV scan 31.2 ms (4.7%), LoRA
+branches 28.7 ms (4.4%), norms and the fused WKV tail about 9 ms, lerps,
+channel-mix activation, embedding and casts about 30 ms, and about 29 ms of
+interaction between items. No single item is worth more than about 2.4% of
+prefill if halved. Two structural levers were measured and rejected:
+batching the LoRA branches is 12 ms slower and costs 57 MB, and a chunked
+DPLR form of the scan, prototyped for training, lost on this GPU (the scan
+already runs 2048 threads per step, so parallelism over the sequence adds
+nothing). Every ablation stub in that tool reads all inputs of what it
+replaces: MLX does not compute outputs nothing depends on, and a stub that
+ignores its inputs silently removes the projections feeding it too. An older
+decomposition of `reduction` (August, a different instrument) gave WKV 7.7%,
+dequantization 5.5% and LoRA 5.3%.
 
 > **The WKV scan used to be 12.7% of prefill and is now 7.7%**, for a
 > bit-identical output (`tests/test_wkv_infer_parity.py`: 9 shapes across
@@ -488,6 +515,12 @@ reference implementation, so quality numbers carry over without re-eval):
   539.3 ms of it at 93 % of this machine fp16 GEMM ceiling, so what is left
   to win on prefill is small and lies outside the GEMM.
 
+The kernel is the default prefill path since 2026-09-17 for every K3 tensor
+with `xbits <= 1` (all tensors of all four scales); `xbits = 2` falls back to
+the MLX chain until a real 6-bit file exercises it, and `RWKVQ_GW_DQ_REF=1`
+restores the chain for A/B. The gate below also checks that the production
+path actually routes every eligible tensor to the kernel.
+
 Bit-exactness of that kernel is checked by
 `tests/test_gw_dequant_kernel_parity.py`, which compares the uint16 bit
 patterns of every dequantized tensor against the reference path, on real
@@ -620,10 +653,6 @@ contribute:
   matmuls (`w/a/v/g_lora`) currently cost ~6-8 separate kernel launches per
   layer; fusing them into one or two custom kernels is estimated at another
   ~0.5-1 ms/token on decode, not yet built.
-- **The fused kernel path (`FUSE=True`) isn't the default yet**, despite
-  being a stable ~0.8 ms/token win with matching correctness gates — flipping
-  the default (and updating the benchmarks that assume `FUSE=False`) is
-  pending.
 - **Sub-nibble packing.** The current nibble container has a hard floor
   around 887 MB for this model at acceptable quality — going smaller needs a
   new on-disk format (sparsity- or sub-nibble-based), not just a bit-width
