@@ -414,6 +414,9 @@ GUARD_TAIL        for (uint n = 0; n < NN; n++) {
 # через __getattr__ для _dequant_w/бенчей).
 
 K3 = True
+# Плотный деквант префилла однопроходным кернелем (gw_dequant_kernel.py),
+# включён 17.09. RWKVQ_GW_DQ_REF=1 -- откат на цепочку MLX для A/B.
+DEQUANT_REF = __import__("os").environ.get("RWKVQ_GW_DQ_REF") == "1"
 K3_HALF = False  # полублок: НЕ бит-в-бит (порядок simd_sum), включать после ppl-гейта
 _XB_DUMMY = None
 K3_XSUM = False   # xbsum в кернеле: НЕ бит-в-бит (порядок сумм), включать после ppl-гейта
@@ -819,8 +822,31 @@ class GwQuantLinear:
         raise AttributeError(name)
 
     def _dequant_w(self):
-        """sb6 -> fp16 [OUT, IN] на GPU для GEMM-префилла (транзиент на
-        вызов, не кешируется -- см. примечание в QuantLinearV2)."""
+        """sb6 -> fp16 [OUT, IN] для GEMM-префилла (транзиент на вызов).
+
+        С 17.09 -- однопроходным кернелем (gw_dequant_kernel.py) для K3 при
+        xbits <= 1: статья декванта 175.6 -> 47.4 мс, префилл 1.5B T=512
+        -16.3%, бит-в-бит на всех тензорах четырёх размеров
+        (tests/test_gw_dequant_kernel_parity.py). Прочее -- откат на
+        `_dequant_w_ref`:
+          * не K3 (K3=False или OUT не кратен 16) -- кернель читает интерлив;
+          * IN не кратен 256 -- кернель считает суперблоки по 8 блоков;
+          * xbits >= 2 -- ветка в кернеле написана, но гейтом НЕ покрыта
+            (таких тензоров нет ни в одной модели); включать только после
+            зелёного гейта на реальном 6-битном asym.
+        DEQUANT_REF (RWKVQ_GW_DQ_REF=1) -- A/B подменой одного флага."""
+        if (not DEQUANT_REF and self._k3 and self.xbits <= 1
+                and self.in_features % 256 == 0):
+            from .gw_dequant_kernel import dequant_w
+            return dequant_w(self)
+        return self._dequant_w_ref()
+
+    def _dequant_w_ref(self):
+        """ЭТАЛОН И ОТКАТ: sb6 -> fp16 цепочкой MLX-операций (до 17.09 --
+        единственный путь; транзиент на вызов, см. примечание в
+        QuantLinearV2). Медленный (concatenate рвёт слияние, разбор 16.09),
+        но от кернеля не зависит -- ради этого и оставлен: на нём стоит
+        гейт кернеля."""
         OUT, IN = self.out_features, self.in_features
         cb = self.codes.reshape(OUT, self.NB, 16)
         q = mx.concatenate([cb & 0xF, cb >> 4], axis=2).astype(mx.float16)

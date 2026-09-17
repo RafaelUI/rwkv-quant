@@ -30,7 +30,7 @@ from rwkv_quant.formats.reader import load_raw
 KV = "/Users/s/Develop/WKV-kvant/"
 COMP = KV + "compression_v2_cand.rwkvq"
 T, ROUNDS, WARM = 512, 7, 3
-V1 = gw.GwQuantLinear._dequant_w
+V1 = gw.GwQuantLinear._dequant_w_ref  # цепочка; с 17.09 _dequant_w -- кернель
 _SH = mx.array(np.array([0] * 16 + [4] * 16, dtype=np.uint8)).reshape(1, 1, 32)
 NOOP = [0]
 

@@ -43,7 +43,7 @@ COMP = KV + os.environ.get("RWKVQ_COMP", "compression_v2_cand.rwkvq")
 T = int(os.environ.get("RWKVQ_T", "512"))
 ROUNDS = int(os.environ.get("RWKVQ_ROUNDS", "7"))
 WARM = 3
-V1 = gw.GwQuantLinear._dequant_w
+V1 = gw.GwQuantLinear._dequant_w_ref  # цепочка; с 17.09 _dequant_w -- кернель
 _SH = mx.array(np.array([0] * 16 + [4] * 16, dtype=np.uint8)).reshape(1, 1, 32)
 
 

@@ -7,6 +7,10 @@ concatenate удвоения кодов разрывает слияние и с�
 Здесь один проход: поток читает свой блок (16-24 Б), распаковывает в
 регистрах и пишет 32 половины подряд. Цель числом: 146 -> 30-40 мс.
 
+ВКЛЮЧЁН 17.09 в GwQuantLinear._dequant_w (K3, xbits <= 1, IN кратен 256);
+вышло 175.6 -> 47.4 мс статьи. Рабочий путь мутацию не принимает вовсе:
+флаг только аргументом, среда production-путём не читается.
+
 БИТ-В-БИТ -- ТРЕБОВАНИЕ, А НЕ ПОЖЕЛАНИЕ. Поэтому:
   1. распаковка НЕ переписана, а взята из штатного k3-кернеля
      (_K3_DECODE, _k3_plane) -- те же мультитрюки битплоскостей;
@@ -21,15 +25,13 @@ concatenate удвоения кодов разрывает слияние и с�
 tests/test_gw_dequant_kernel_parity.py. Если бит-в-бит не выйдет -- это
 расхождение в 1 ULP и решение владельца, а не повод подгонять порог.
 
-MUTATE=1 портит кернель нарочно (сдвиг битплоскости 4 -> 5): гейт обязан
+mutate=True (гейт ставит его по MUTATE=1) портит кернель нарочно (сдвиг битплоскости 4 -> 5): гейт обязан
 покраснеть, иначе он ничего не проверяет (закон 37).
 
 ПЕРЕВОД СТРОКИ ТОЛЬКО ЧЕРЕЗ NL: экранирование в этом файле запрещено --
 16.09 два патча молча положили в источник литеральный слэш-n, и Metal
 падал на utils.h, а не на нашей строке (закон 33 про проверку записи).
 """
-import os
-
 import mlx.core as mx
 
 from .quant_linear_gw import _K3_DECODE, _k3_plane
@@ -86,7 +88,7 @@ def _kernel(IN, OUT, xbits, mutate):
     return k
 
 
-def dequant_w(self):
+def dequant_w(self, mutate=False):
     """Возвращает fp16 [OUT, IN]. Требует интерлив K3."""
     OUT, IN, NSB = self.out_features, self.in_features, self.NSB
     assert getattr(self, "_k3", False), "кернель декванта написан под интерлив K3"
@@ -95,7 +97,7 @@ def dequant_w(self):
          * self.d.astype(mx.float32)[..., None]).astype(mx.float16)
     m = (self.qm.astype(mx.float32).reshape(OUT, NSB, 8)
          * self.dm.astype(mx.float32)[..., None]).astype(mx.float16)
-    kern = _kernel(IN, OUT, self.xbits, bool(int(os.environ.get("MUTATE", "0"))))
+    kern = _kernel(IN, OUT, self.xbits, bool(mutate))
     return kern(
         inputs=[self.qblk, s.reshape(OUT, -1), m.reshape(OUT, -1)],
         grid=(OUT * (IN // 32), 1, 1), threadgroup=(256, 1, 1),

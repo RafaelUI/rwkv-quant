@@ -36,7 +36,7 @@ KV = "/Users/s/Develop/WKV-kvant/"
 COMP = KV + os.environ.get("RWKVQ_COMP", "compression_v2_cand.rwkvq")
 T = int(os.environ.get("RWKVQ_T", "512"))
 ROUNDS = int(os.environ.get("RWKVQ_ROUNDS", "5"))
-_REAL = gw.GwQuantLinear._dequant_w
+_REAL = gw.GwQuantLinear._dequant_w_ref  # цепочка; с 17.09 _dequant_w -- кернель
 
 
 def swap_used():

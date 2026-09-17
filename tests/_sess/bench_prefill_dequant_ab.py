@@ -34,7 +34,7 @@ T = int(os.environ.get("RWKVQ_T", "512"))
 ROUNDS = int(os.environ.get("RWKVQ_ROUNDS", "7"))
 WARM = 3
 
-_REAL = gw.GwQuantLinear._dequant_w
+_REAL = gw.GwQuantLinear._dequant_w_ref  # цепочка; с 17.09 _dequant_w -- кернель
 _CACHE = {}
 USE_CACHE = [False]
 

@@ -95,7 +95,7 @@ def read_bw():
 
 W = {}
 for l in lins:
-    w = gw.GwQuantLinear._dequant_w(l)
+    w = gw.GwQuantLinear._dequant_w_ref(l)
     mx.eval(w)
     W[id(l)] = w
 X = {}
@@ -112,7 +112,7 @@ print("веса fp16 разложены, своп %+.1f" % (sw1 - sw0), flush=Tr
 
 def arm_deq():
     for l in lins:
-        mx.eval(gw.GwQuantLinear._dequant_w(l))
+        mx.eval(gw.GwQuantLinear._dequant_w_ref(l))
     mx.synchronize()
 
 
