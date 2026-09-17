@@ -1,6 +1,6 @@
 """Численная сверка GwQuantLinear (GEMV sb6 + GEMM-путь) для int6
 (xbits=2, вторая битплоскость qh2) с референсом x @ dequant(qt).T в fp32,
-на живых тензорах REDUCTION v2 (presets.REDUCTION, bits=6 для
+на живых тензорах REDUCTION v2 (LEGACY_REDUCTION, bits=6 для
 proj/cmix/emb_head). Аналог test_gw_kernel.py, но покрывает три разных
 group_scale_mode при bits=6:
   proj      -> mode="asym_sb6"      (без AW, без search)  -- xbits=2, search=False
@@ -13,7 +13,14 @@ import torch, numpy as np, mlx.core as mx
 from rwkv_quant.formats.writer import quantize_tensor
 from rwkv_quant.formats.reader import _dequantize_one
 from rwkv_quant.backends.metal.quant_linear_gw import GwQuantLinear
-from rwkv_quant.presets import REDUCTION
+# 17.09: presets.REDUCTION с 16.08 -- proj/emb/head @8 sym, int6 в нём НЕТ, и гейт
+# падал на bits == 8. База int6 заморожена рядом с экспериментом (закон 30):
+# LEGACY_REDUCTION из ablate_sym_composite -- ровно те режимы, что в докстринге.
+import copy
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from ablate_sym_composite import LEGACY_REDUCTION
+REDUCTION = copy.deepcopy(LEGACY_REDUCTION)
+REDUCTION.act_stats_path = os.path.expanduser("~/Develop/WKV-kvant/artifacts/act_stats_1p5b_ml.pt")
 
 CKPT = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
 sd = torch.load(CKPT, map_location="cpu")
