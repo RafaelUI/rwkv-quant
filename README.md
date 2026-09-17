@@ -436,6 +436,43 @@ reference implementation, so quality numbers carry over without re-eval):
 - Fused r/k/v projection launch and fused lerp/LoRA batching in the decode
   path.
 
+- **Single-pass prefill dequant kernel** (`backends/metal/gw_dequant_kernel.py`).
+  The GEMV path above never materializes weights, but the prefill dense path
+  has to hand `mx.matmul` an fp16 tensor, and expressing that materialization
+  in MLX costs 175.6 ms of a 785.7 ms prefill (1.5B, T=512, single call).
+  Two measured reasons: the `concatenate` that doubles the code bytes breaks
+  operator fusion and costs 68.9 ms by itself, and the remaining fused chain
+  runs at 48.8 GB/s against ~107 GB/s measured on the same machine. One
+  thread per (row, block) — read 16-24 B, unpack in registers, write 32
+  halves — takes it to 47.4 ms, i.e. prefill 785.7 → 657.5 ms and
+  651.7 → 778.7 tok/s (-16.3 % time, +19.5 % throughput). The floor with the
+  dequant removed entirely is 610.1 ms, and `mx.matmul` alone accounts for
+  539.3 ms of it at 93 % of this machine fp16 GEMM ceiling, so what is left
+  to win on prefill is small and lies outside the GEMM.
+
+Bit-exactness of that kernel is checked by
+`tests/test_gw_dequant_kernel_parity.py`, which compares the uint16 bit
+patterns of every dequantized tensor against the reference path, on real
+files rather than synthetic shapes, and which is itself verified by mutation
+(`MUTATE=1` corrupts one bit-plane shift and the gate must go red):
+
+| scale | tensors | xbits 0 / 1 | mismatching elements |
+|---|---|---|---|
+| 0.1B | 73 | 60 / 13 | 0 |
+| 0.4B | 145 | 120 / 25 | 0 |
+| 1.5B | 145 | 120 / 25 | 0 |
+| 2.9B | 193 | 160 / 33 | 0 |
+
+Because the dequantized tensors are identical bit for bit, every quality
+number in this README carries over to the kernel path unchanged; the
+end-to-end prefill benchmark confirms it independently, with identical logit
+fingerprints across all arms. Two caveats worth stating: no preset in use
+produces `xbits=2` tensors, so that branch of the kernel is written but not
+exercised by any of the four gates above; and reaching bit-exactness
+required blocking the fma contraction — Metal folds `q * s + m` into a
+single-rounding fma while MLX rounds twice, which showed up as a 1 ULP
+difference on 42 % of elements until the product was rounded explicitly.
+
 ## Why quantization sensitivity doesn't transfer across scale
 
 Ran weight-only fake-quantization ablations on two RWKV-7 checkpoints — a
