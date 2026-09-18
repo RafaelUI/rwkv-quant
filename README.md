@@ -23,22 +23,33 @@ actual `.rwkvq` files on disk.
 | model | bf16 ppl | build | size | Δppl (all) | en / ru / sr |
 |---|---|---|---|---|---|
 | **0.1B** (`rwkv7-g1d-0.1b`) | 15.183 | `reduction` | 190.7 MB (2.00x) | **+0.33%** | +0.21 / +0.22 / +0.69% |
-| | | `compression` | 126.8 MB (3.01x) | **+10.59%** | +6.70 / +8.73 / +19.02% |
+| | | `compression` | 126.8 MB (3.01x) | **+8.68%** | +5.49 / +9.18 / +10.83% |
 | **0.4B** (`rwkv7-g1d-0.4b`) | 10.994 | `reduction` | 433.1 MB (2.08x) | **+0.33%** | +0.16 / +0.36 / +0.42% |
-| | | `compression` | 291.3 MB (3.10x) | **+5.37%** | +4.32 / +5.08 / +7.10% |
+| | | `compression` | 291.3 MB (3.10x) | **+4.30%** | +3.53 / +4.19 / +5.34% |
 | **1.5B** (`rwkv7-g1h-1.5b`) | 8.198 | `reduction` | 1435.1 MB (2.13x) | **+0.15%** | +0.36 / -0.05 / +0.40% |
-| | | `compression` | 970.6 MB (3.15x) | **+4.03%** | +4.57 / +3.28 / +5.19% |
+| | | `compression` | 970.6 MB (3.15x) | **+2.85%** | +3.20 / +2.25 / +3.84% |
 | **2.9B** (`rwkv7-g1h-2.9b`) | 7.163 | `reduction` | 2737.3 MB (2.15x) | **+0.24%** | +0.37 / +0.11 / +0.38% |
-| | | `compression` | 1855.2 MB (3.18x) | **+5.10%** | +6.09 / +4.12 / +6.31% |
+| | | `compression` | 1855.2 MB (3.18x) | **+4.05%** | +4.25 / +3.21 / +5.71% |
 
-> **`compression` rows are stale as of 09.09.** The preset's bit allocation was
-> changed (`proj` 5→4, `cmix.key` 4→5) after per-matrix sensitivity turned out
-> to diverge several-fold *inside* the old groups. Re-measured on 1.5B only:
-> same 970.5 MB, Δppl +2.850% instead of +3.390%, KL 0.0360 vs 0.0386 (paired
-> 95% CI [+0.00169; +0.00352]). The 0.1B / 0.4B / 2.9B rows above were measured
-> with the previous allocation and have **not** been recomputed; sensitivity
-> does not transfer across scale, so they cannot simply be scaled. `reduction`
-> rows are unaffected.
+> **All four `compression` rows re-measured 2026-09-18.** The bit allocation
+> was changed on 09.09 (`proj` 5 to 4, `cmix.key` 4 to 5) after per-matrix
+> sensitivity turned out to diverge several-fold inside the old groups, and
+> only the 1.5B row had been recomputed. All four are now measured with one
+> recipe: calibration statistics from the repo corpus (the shipped default,
+> `act_stats=auto`), evaluation on the same 38 windows, real sb6 packing.
+> The 1.5B number reproduced the 09.09 measurement exactly (+2.850%). Sizes
+> are unchanged: the reallocation moved bits, it did not add them.
+> `reduction` rows were not re-measured and are unaffected by it.
+>
+> Calibration corpus matters more than 09.09 assumed, and not in one
+> direction. Against a second honest corpus (three languages, disjoint from
+> the evaluation half, 8704 tokens against 11776 in the repo one) the deltas
+> move to +8.30 / +3.87 / +3.22 / +4.69%: the narrow domain-matched corpus
+> wins on the two small models by about 0.4 points and loses on the two big
+> ones by as much. The flip lines up with size and with the checkpoint
+> series (g1d below, g1h above) at once, and four points cannot separate
+> those. Both corpora are disjoint from what is scored: this is sensitivity
+> of the activation-weighted search, not leakage.
 
 Perplexity is a coarse instrument at these margins, so `reduction` is also
 scored by **KL divergence against an fp32 reference** — same weights, same
@@ -60,7 +71,7 @@ big picture and disagree on the fine ordering; where they disagree, KL is
 the more sensitive of the two.
 
 `compression` degrades far faster on small models than `reduction` does:
-+10.59% at 0.1B against +0.33%. Presets in this repo were tuned on the 1.5B
++8.68% at 0.1B against +0.33%. Presets in this repo were tuned on the 1.5B
 checkpoint, and the numbers above are the measured cost of assuming they
 transfer.
 
@@ -153,6 +164,42 @@ conservatively 4%. Our throughput does not drop from T=512 to T=2048
 > 4.4 GB/s. One Metal kernel took it from 10.68 ms to 0.84 ms per layer.
 > Neither was a modelling insight; both were found by decomposing a
 > number instead of trusting it.
+
+#### Across scales, pp1024 and tg1024 (2026-09-18)
+
+Same command on their side (`-p 1024 -n 1024 -ngl 99 -r 3 -b 1024 -ub 1024`),
+one compiled prefill call and 1024 single-token steps on ours, arms strictly
+alternated on a cold machine on mains power. Pairs are matched by file size;
+GGUF files are the published conversions of the same checkpoints (g1d for
+0.1B and 0.4B, g1h for 1.5B and 2.9B).
+
+| scale | build | size | pp1024, t/s | tg1024, t/s |
+|---|---|---|---|---|
+| **0.1B** | `compression` | 126.8 MB | 6728 | 364.8 |
+| | `reduction` | 190.7 MB | 6539 | 302.3 |
+| | Q8_0 | 211.0 MB | 5223 ± 253 | 72.5 ± 17.8 |
+| **0.4B** | `compression` | 291.3 MB | 2457 | 183.2 |
+| | `reduction` | 433.1 MB | 2411 | 148.9 |
+| | Q8_0 | 500.1 MB | 2088 ± 2 | 49.8 ± 2.0 |
+| **1.5B** | `compression` | 970.6 MB | 798 | 74.6 |
+| | Q4_K_M | 990.1 MB | 748 ± 2 | 51.5 ± 0.8 |
+| | `reduction` | 1435.1 MB | 792 | 58.1 |
+| | Q6_K | 1336.1 MB | 740 ± 0.1 | 48.9 ± 2.3 |
+| **2.9B** | `compression` | 1855.2 MB | 403 | 40.0 |
+| | Q4_K_M | 1919.0 MB | 377 ± 4 | 34.2 ± 0.3 |
+
+Prefill is ahead by 7% on the two big models and by 15-29% on the two small
+ones. Decode is ahead everywhere and the margin grows as the model shrinks:
++17% at 2.9B, +45% at 1.5B, 3x at 0.4B, 5x at 0.1B. That shape says their
+decode carries a fixed per-token cost of roughly 13-19 ms that arithmetic
+hides only on large models; their own spread on the small models (± 17.8
+t/s at 0.1B) points the same way.
+
+A second pass ten minutes later, on a machine warmed by the first, moved
+both sides down together (ours 403 to 325 t/s at 2.9B, theirs 377 to 294;
+their Q6_K prefill 740 to 624). The table above is the cold pass. On a
+fanless laptop any single number here is worth less than the alternation
+that produced it.
 
 #### Decode and pp512 (2026-09-16)
 

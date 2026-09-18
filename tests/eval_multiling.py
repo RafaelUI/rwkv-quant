@@ -68,6 +68,15 @@ CONFIGS = [
 ]
 
 
+# 17.09: RWKVQ_CONFIGS=bf16 baseline,COMPRESSION -- считать только нужные
+# плечи (строки reduction в README не менялись, а bf16 нужен как парная база).
+_SEL = os.environ.get("RWKVQ_CONFIGS")
+if _SEL:
+    _want = _SEL.split(",")
+    CONFIGS = [c for c in CONFIGS if c[0] in _want]
+    assert len(CONFIGS) == len(_want), [c[0] for c in CONFIGS]
+
+
 def tensor_bytes(qt) -> int:
     """Честный размер одного QuantizedTensor во всех режимах формата.
     (measure_size_mb в quality_speed_curve.py считает только v1-путь

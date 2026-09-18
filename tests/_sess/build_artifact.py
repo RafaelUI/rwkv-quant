@@ -20,6 +20,12 @@ A = "/Users/s/Develop/WKV-kvant/artifacts"
 TOK = "/Users/s/Develop/rwkv-metal/rwkv_metal/tokenizer/rwkv_vocab_v20230424.txt"
 CK = {"1p5b": ("/Users/s/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth",
                A + "/act_stats_1p5b_ml.pt", [2048, 8192]),
+      # 17.09 ночь: 0.1B и 0.4B добавлены под таблицу скорости (нужна пара к
+      # Q8_0); статистика -- ЧЕСТНАЯ calibml, снятая в тот же день под ppl.
+      "0p1b": ("/Users/s/Develop/WKV-kvant/rwkv7-g1d-0.1b.pth",
+               A + "/act_stats_0p1b_calibml.pt", None),
+      "0p4b": ("/Users/s/rwkv7-g1d-0.4b-ctx8192.pth",
+               A + "/act_stats_0p4b_calibml.pt", None),
       "2p9b": ("/Users/s/Develop/rwkv7-g1h-2.9b-ctx10240.pth",
                A + "/act_stats_2p9b_ml.pt", [2560, 10240])}
 recipe, scale = sys.argv[1], sys.argv[2]
@@ -33,7 +39,7 @@ print("rwkv_quant из:", rwkv_quant.__file__, flush=True)
 st = torch.load(stats, map_location="cpu")
 ch = sorted({int(v.numel()) for v in st.values()})
 print("act_stats: %d тензоров, каналы %s" % (len(st), ch), flush=True)
-assert ch == chans, "статистика не от этого масштаба: %s" % ch
+assert chans is None or ch == chans, "статистика не от этого масштаба: %s" % ch
 del st
 config = None
 if recipe != "reduction":
