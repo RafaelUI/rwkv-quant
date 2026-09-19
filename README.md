@@ -50,6 +50,20 @@ actual `.rwkvq` files on disk.
 > series (g1d below, g1h above) at once, and four points cannot separate
 > those. Both corpora are disjoint from what is scored: this is sensitivity
 > of the activation-weighted search, not leakage.
+>
+> **Volume or domain, and does it matter? (2026-09-19, 0.4B and 1.5B.)** The
+> narrow corpus is also smaller (8687 tokens against 11753), so a third arm
+> takes the repo corpus down to the same volume without changing its mix
+> (every window shortened, none dropped). On the real path, from the same
+> files: volume alone moves ppl by +0.12 / -0.09 points (0.4B / 1.5B),
+> domain at equal volume by +0.29 / -0.27, both inside their paired 95%
+> intervals; only the full repo-versus-narrow gap at 0.4B (0.42 points) is
+> significant. So most of the shift is domain, it keeps its scale-dependent
+> sign at equal volume, and it is small. **KL does not see it at all**: all
+> three calibrations sit within 1.5% of each other and every pair is inside
+> its interval. The choice of calibration corpus moves which tokens the
+> quantized model happens to favour, not how far it drifts from the fp
+> model, so the shipped default stays.
 
 Perplexity is a coarse instrument at these margins, so `reduction` is also
 scored by **KL divergence against an fp32 reference** — same weights, same
