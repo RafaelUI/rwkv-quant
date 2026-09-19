@@ -54,7 +54,9 @@ actual `.rwkvq` files on disk.
 Perplexity is a coarse instrument at these margins, so `reduction` is also
 scored by **KL divergence against an fp32 reference** — same weights, same
 inputs, activations in fp32 — on 8 x 512 tokens through the real quantized
-kernel. This separates rows that ppl cannot:
+kernel. Those 8 windows are the first 8 of the evaluation corpus and are
+**all Russian**, so this table is a Russian-only reading, unlike the ppl
+columns above. This separates rows that ppl cannot:
 
 | model | KL vs fp32 (nats/token) | 95% CI | top-1 agreement |
 |---|---|---|---|
@@ -69,6 +71,25 @@ scheme better. Δppl does **not** follow that order (0.33 / 0.33 / 0.15 /
 percent of perplexity on 19 456 predictions. The two metrics agree on the
 big picture and disagree on the fine ordering; where they disagree, KL is
 the more sensitive of the two.
+
+`compression` scored the same way (measured 2026-09-19), but on **all 38
+windows** — the same 19 418 predictions and the same en / ru / sr split as
+the ppl columns — through the same `.rwkvq` files listed above:
+
+| model | KL vs fp32 (nats/token) | 95% CI | top-1 agreement | en / ru / sr |
+|---|---|---|---|---|
+| 0.1B | 0.089564 | [0.081614; 0.097300] | 81.67% | 0.0547 / 0.0952 / 0.1119 |
+| 0.4B | 0.049644 | [0.045884; 0.053345] | 86.52% | 0.0356 / 0.0506 / 0.0614 |
+| 1.5B | 0.035989 | [0.033966; 0.038189] | 89.14% | 0.0362 / 0.0352 / 0.0376 |
+| 2.9B | 0.052052 | [0.047391; 0.057174] | 89.00% | 0.0496 / 0.0506 / 0.0578 |
+
+Here KL and ppl agree on the ordering, including the one that breaks the
+trend: `compression` is best at 1.5B and worse again at 2.9B, where
+`reduction` keeps improving with scale. The preset was tuned on 1.5B
+(see below). On the Russian-only 8-window slice used for `reduction` the
+`compression` rows read 0.1067 / 0.0556 / 0.0365 / 0.0487, so the two
+tables are directly comparable only through that slice: `compression`
+costs 15-17x the KL of `reduction` at 0.1B-1.5B and 29x at 2.9B.
 
 `compression` degrades far faster on small models than `reduction` does:
 +8.68% at 0.1B against +0.33%. Presets in this repo were tuned on the 1.5B
