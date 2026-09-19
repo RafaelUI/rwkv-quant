@@ -74,6 +74,15 @@ FUSE_TAIL = True
 # замера. Гейт -- tests/test_prewkv_parity.py.
 FUSE_PREWKV = False
 
+# 19.09: декод без копирующих запусков вокруг GEMV. На T=1 сдвиг токена --
+# это просто prev (concatenate не нужен), а строки лерп-стека и выхода
+# фьюза r/k/v берутся ВИДАМИ (срезы непрерывных кусков), а не Gather:
+# стек коэффициентов переупорядочен в (r,k,v,w,a,g), чтобы вход фьюза был
+# непрерывным префиксом. Арифметика та же -- обязано быть бит-в-бит
+# (tests/_sess/gate_decode_views_1909.py). Трассируется на момент
+# mx.compile, как и остальные флаги.
+DECODE_VIEWS = os.environ.get("RWKVQ_DECODE_VIEWS", "0") != "0"
+
 # ---------------------------------------------------------------------------
 # LoRA-ветки под нативный mx.quantized_matmul. ЭТО НОВОЕ КВАНТОВАНИЕ, А НЕ
 # РЕПАК: в .rwkvq LoRA лежит в asym gw64, но writer квантует её по СЫРЫМ
@@ -464,6 +473,8 @@ def _token_shift_stateful(x, prev):
     без state (нулевой pad)."""
     B, T, D = x.shape
     p = mx.zeros((B, 1, D)) if prev is None else prev
+    if DECODE_VIEWS and T == 1:
+        return p, x                      # x[:, :-1] пуст: сдвиг == prev
     shifted = mx.concatenate([p, x[:, :-1]], axis=1)
     new_prev = x[:, -1:]
     return shifted, new_prev
@@ -825,6 +836,9 @@ class QuantTMix:
         wkv_state, shift_state = state
         B, T, D = x.shape
         H, S = self.H, self.S
+        if (DECODE_VIEWS and B * T == 1 and LORA_Q
+                and self._rkv_fused is not None):
+            return self._forward_decode_views(x, v_first, state)
 
         shifted, new_shift_state = _token_shift_stateful(x, shift_state)
         xx = shifted - x
@@ -896,6 +910,46 @@ class QuantTMix:
         bonus = (r * k * self.r_k).sum(axis=-1, keepdims=True) * v
         out = (out + bonus).reshape(B, T, D)
 
+        return self.o_proj(out * g), v_first, (new_wkv_state, new_shift_state)
+
+    def _forward_decode_views(self, x, v_first, state):
+        """Фьюзнутый декод (B*T == 1, LORA_Q, фьюз r/k/v) без Gather и
+        concatenate: см. DECODE_VIEWS. Остальное -- строка в строку как
+        _forward_stateful_fused."""
+        wkv_state, shift_state = state
+        B, T, D = x.shape
+        H, S = self.H, self.S
+        if getattr(self, "_xcoef_v", None) is None:
+            # (r, k, v, w, a, g): вход фьюза -- непрерывный префикс [0:3]
+            self._xcoef_v = mx.stack([self.x_r, self.x_k, self.x_v,
+                                      self.x_w, self.x_a, self.x_g])
+            mx.eval(self._xcoef_v)
+        shifted, new_shift_state = _token_shift_stateful(x, shift_state)
+        xx = shifted - x
+        xs = (x[None] + xx[None] * self._xcoef_v).reshape(6, D)
+        rkv = self._rkv_fused(xs[0:3])
+        r = rkv[0:1].reshape(B, T, H, S)
+        k = rkv[1:2].reshape(B, T, H, S)
+        v = rkv[2:3].reshape(B, T, H, S)
+        xw = xs[3:4].reshape(B, T, D)
+        xa = xs[4:5].reshape(B, T, D)
+        xv = xs[2:3].reshape(B, T, D)
+        xg = xs[5:6].reshape(B, T, D)
+        y_w, y_a, y_v, g = self._lora(xw, xa, xv, xg, x, xx)
+        y_w = y_w.reshape(B, T, D)
+        y_a = y_a.reshape(B, T, D)
+        y_v = None if y_v is None else y_v.reshape(B, T, D)
+        w, k, v, nkk, kka, v_first = self._prewkv(
+            y_w, y_a, y_v, k, v, v_first, B, T, x.dtype)
+        out, new_wkv_state = _wkv_stateful(r, w, k, v, nkk, kka, wkv_state)
+        if FUSE_TAIL and can_fuse_tail(H, S):
+            out = wkv_tail(out, r, k, v, self.r_k, self.ln_x_w, self.ln_x_b,
+                           g, H, S).reshape(B, T, D)
+            return self.o_proj(out), v_first, (new_wkv_state, new_shift_state)
+        out2d = _group_norm(out.reshape(B * T, D), H, self.ln_x_w, self.ln_x_b)
+        out = out2d.reshape(B, T, H, S)
+        bonus = (r * k * self.r_k).sum(axis=-1, keepdims=True) * v
+        out = (out + bonus).reshape(B, T, D)
         return self.o_proj(out * g), v_first, (new_wkv_state, new_shift_state)
 
     def forward_stateful(self, x, v_first, state):

@@ -76,7 +76,9 @@ def main():
         return 1
     src, dst = sys.argv[1], sys.argv[2]
     ref = sys.argv[3] if len(sys.argv) > 3 else os.path.expanduser(
-        "~/Develop/WKV-kvant/rwkv7-g1h-1.5b-Q4_K_M.gguf")
+        "~/Develop/WKV-kvant/rwkv7-1p5b-Q4_K_M.gguf")
+    # 18.09: июльский rwkv7-g1h-1.5b-Q4_K_M.gguf удалён; все семь ключей
+    # tokenizer.* у этого файла совпадают с ним побайтово (сверено md5).
 
     print("читаю", src, flush=True)
     sd = torch.load(src, map_location="cpu", mmap=True, weights_only=True)

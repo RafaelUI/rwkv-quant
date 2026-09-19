@@ -62,7 +62,7 @@ ORIG = {"wkv": qm._wkv_stateful, "ln": qm._layer_norm, "tail": qm.wkv_tail,
         "lora": qm.QuantTMix._lora, "prewkv": qm.QuantTMix._prewkv,
         "gl": gw.GwQuantLinear.__call__, "gf": gw.GwQuantLinearFused.__call__,
         "sl": sy.SymQuantLinear.__call__, "sf": sy.SymQuantLinearFused.__call__,
-        "fprewkv": qm.FUSE_PREWKV}
+        "fprewkv": qm.FUSE_PREWKV, "views": qm.DECODE_VIEWS}
 
 
 def apply(names):
@@ -81,6 +81,8 @@ def apply(names):
         elif n == "prewkv":
             qm.QuantTMix._prewkv = lambda self, y_w, y_a, y_v, k, v, v_first, B, T, dtype: (
                 k + pin(y_w, y_a, y_v, v_first).astype(k.dtype), k, v, k, k, v)
+        elif n == "views":
+            qm.DECODE_VIEWS = True
         elif n == "fprewkv":
             qm.FUSE_PREWKV = True
         elif n == "gemv":
@@ -96,18 +98,27 @@ def restore():
     gw.GwQuantLinear.__call__ = ORIG["gl"]; gw.GwQuantLinearFused.__call__ = ORIG["gf"]
     sy.SymQuantLinear.__call__ = ORIG["sl"]; sy.SymQuantLinearFused.__call__ = ORIG["sf"]
     qm.FUSE_PREWKV = ORIG["fprewkv"]
+    qm.DECODE_VIEWS = ORIG["views"]
 
 
 ARMS = [("full", []), ("gemv0", ["gemv"]), ("lora0", ["lora"]), ("wkv0", ["wkv"]),
         ("ln_id", ["ln"]), ("tail_id", ["tail"]), ("prewkv_id", ["prewkv"]),
         ("all", ["gemv", "lora", "wkv", "ln", "tail", "prewkv"]),
         # готовое ядро пред-WKV (11.09, выключено) -- НЕ заглушка, отпечаток может совпасть с full
-        ("prewkv_kern", ["fprewkv"])]
+        ("prewkv_kern", ["fprewkv"]),
+        # 19.09: DECODE_VIEWS, бит-в-бит -- отпечаток обязан совпасть с full
+        ("views", ["views"]),
+        # 19.09: лестница сверху вниз -- всё, кроме GEMV, заглушено, и по одной
+        # группе возвращается настоящей
+        ("L_gemv", ["lora", "wkv", "ln", "tail", "prewkv"]),
+        ("L_lora", ["wkv", "ln", "tail", "prewkv"]),
+        ("L_wkvblk", ["lora", "ln"]),
+        ("L_ln", ["lora", "wkv", "tail", "prewkv"])]
 SEL = os.environ.get("RWKVQ_ARMS")
 if SEL:
     ARMS = [a for a in ARMS if a[0] in SEL.split(",")]
 else:
-    ARMS = [a for a in ARMS if a[0] != "prewkv_kern"]
+    ARMS = [a for a in ARMS if a[0] not in ("prewkv_kern", "views") and not a[0].startswith("L_")]
 
 
 def swap_used():
@@ -163,14 +174,16 @@ V["sync"] = []
 
 
 def run_arm(name):
-    fn = FNS[name]
+    every = 8 if name.endswith("_s8") else 1
+    fn = FNS[name[:-3] if every == 8 else name]
     st, tok = ST[name]
     mx.synchronize()
     t0 = time.perf_counter()
-    for _ in range(K):
+    for i in range(K):
         lg, st = fn(tok[None], st)
         tok = mx.argmax(lg[:, -1], axis=-1)
-        mx.eval(tok, st)
+        if (i + 1) % every == 0:
+            mx.eval(tok, st)
     mx.synchronize()
     dt = (time.perf_counter() - t0) * 1e3 / K
     ST[name] = (st, tok)
@@ -188,7 +201,11 @@ def run_sync():
     return (time.perf_counter() - t0) * 1e3 / K
 
 
-names = [n for n, _ in ARMS] + ["sync"]
+S8 = [n + "_s8" for n in os.environ.get("RWKVQ_S8", "").split(",") if n]
+names = [n for n, _ in ARMS] + S8 + ["sync"]
+for n in S8:
+    V[n] = []
+    ST[n] = ST[n[:-3]]
 for rd in range(ROUNDS):
     order = names if rd % 2 == 0 else names[::-1]
     for name in order:
@@ -202,7 +219,10 @@ for name, _ in ARMS:
         ok = False
         print("  НЕДЕЙСТВИТЕЛЬНО: %s отпечаток уехал %.6e -> %.6e" % (name, FP0[name], fp), flush=True)
 for name, _ in ARMS[1:]:
-    if name != "prewkv_kern" and FP0[name] == FP0.get("full"):
+    if name == "views" and FP0[name] != FP0.get("full"):
+        ok = False
+        print("  НЕДЕЙСТВИТЕЛЬНО: views не бит-в-бит с full", flush=True)
+    if name not in ("prewkv_kern", "views") and FP0[name] == FP0.get("full"):
         ok = False
         print("  НЕДЕЙСТВИТЕЛЬНО: заглушка %s не изменила выход" % name, flush=True)
 
@@ -212,7 +232,7 @@ print("--- медианы, мс/ток (разброс = (max-min)/медиан�
 tot = 0.0
 for name in names:
     d = full - med[name]
-    if name not in ("full", "all", "sync", "prewkv_kern"):
+    if name not in ("full", "all", "sync", "prewkv_kern", "views") and not name.endswith("_s8"):
         tot += d
     print("  %-10s %7.3f  разброс %4.1f%%  статья %+7.3f  (%5.1f%% шага)" % (
         name, med[name], 100 * (max(V[name]) - min(V[name])) / med[name], d, 100 * d / full), flush=True)
