@@ -34,3 +34,32 @@ for s, d in docs.items():
     print("  вклад в Δppl, п.п. (base - без группы):  " + "  ".join(
         "%s %+.2f" % (a, 100 * (np.exp(np.mean(b["ce"])) - np.exp(np.mean(d[a]["ce"]))) / np.exp(np.mean(b["ce_ref"])))
         for a in arms if a in d))
+
+# ПЛЕЧИ ПРАВКИ (20.09): не вклад группы, а пресет с правкой. Выигрыш
+# = base - плечо (KL и ppl), парный бутстрэп; ppl по языкам; байты.
+def ppl(ce, ref, m=None):
+    ce, ref = np.array(ce), np.array(ref)
+    if m is not None:
+        ce, ref = ce[m], ref[m]
+    return 100 * (np.exp(ce.mean()) / np.exp(ref.mean()) - 1)
+
+for s, d in docs.items():
+    for a in ["o5", "o6", "o4s"] + sorted(k for k in d if k.startswith("oL")):
+        if a not in d or "base" not in d:
+            continue
+        b, x = d["base"], d[a]
+        dd = np.array(b["kl"]) - np.array(x["kl"]); lo, hi = boot(dd)
+        dc = np.array(b["ce"]) - np.array(x["ce"]); clo, chi = boot(dc)
+        L = np.array(b["langs"])
+        print("%s %s: KL %.6f -> %.6f, выигрыш %.5f [%.5f; %.5f] (%.1f%% KL); "
+              "ppl %+.3f%% -> %+.3f%%, ΔCE %.5f [%.5f; %.5f]" % (
+                  s, a, np.mean(b["kl"]), np.mean(x["kl"]), dd.mean(), lo, hi,
+                  100 * dd.mean() / np.mean(b["kl"]), ppl(b["ce"], b["ce_ref"]),
+                  ppl(x["ce"], x["ce_ref"]), dc.mean(), clo, chi))
+        print("   по языкам base -> %s: " % a + "  ".join(
+            "%s %+.2f -> %+.2f" % (l, ppl(b["ce"], b["ce_ref"], L == l), ppl(x["ce"], x["ce_ref"], L == l))
+            for l in ("en", "ru", "sr")))
+        if "nbytes" in b and "nbytes" in x:
+            print("   байты: %.1f -> %.1f МБ (+%.2f МБ, +%.2f%%)" % (
+                b["nbytes"] / 1e6, x["nbytes"] / 1e6, (x["nbytes"] - b["nbytes"]) / 1e6,
+                100 * (x["nbytes"] - b["nbytes"]) / b["nbytes"]))
