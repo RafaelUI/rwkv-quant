@@ -9,7 +9,10 @@ def boot(d, it=20000, seed=0):
     m = d[idx].mean(1); return np.percentile(m, 2.5), np.percentile(m, 97.5)
 
 
-docs = {s: json.load(open("/Users/s/Develop/WKV-kvant/loo_compression_%s_1909.json" % s)) for s in sys.argv[1:]}
+import os
+# RWKVQ_LOO_TPL (20.09): шаблон json, напр. .../loo_reduction_%s_2009.json
+TPL = os.environ.get("RWKVQ_LOO_TPL", "/Users/s/Develop/WKV-kvant/loo_compression_%s_1909.json")
+docs = {s: json.load(open(TPL % s)) for s in sys.argv[1:]}
 arms = ["r", "k", "v", "o", "ffn_k", "ffn_v", "head", "emb", "lora"]
 print("вклад группы в KL (base - без неё), нат/ток; доля от KL base; 95% CI парно")
 hdr = "группа  " + "".join("| %-44s" % s for s in docs)

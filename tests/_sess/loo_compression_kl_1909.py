@@ -18,7 +18,11 @@ sys.path.insert(0, "/Users/s/Develop/rwkv-quant"); sys.path.insert(0, "/Users/s/
 import numpy as np
 import torch
 import mlx.core as mx
-from rwkv_quant.presets import COMPRESSION
+from rwkv_quant.presets import PRESETS
+# ПРЕСЕТ (20.09): RWKVQ_PRESET=reduction -- те же плечи поверх REDUCTION.
+# По умолчанию compression, прежние вызовы не меняются.
+PRESET = os.environ.get("RWKVQ_PRESET", "compression")
+COMPRESSION = PRESETS[PRESET]
 from rwkv_quant.formats.writer import quantize_tensor
 from rwkv_quant.formats.schema import QuantizedCheckpoint
 from rwkv_quant.backends.metal.quant_model import QuantRWKV7
