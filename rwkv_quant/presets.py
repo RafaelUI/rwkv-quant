@@ -48,6 +48,23 @@ tests/eval_corpora_compare.py).
 """
 from .calibration.group_config import QuantConfig
 
+# o_proj СЛОЯ 0 -- В bf16 В ОБОИХ ПРЕСЕТАХ (20.09, решение Алексея:
+# страховка). Вход o_proj слоя 0 во всех моделях линейки -- самый
+# концентрированный (8 каналов несут 46-98% E[x^2]), а у 2.9B g1h там
+# массивный канал, max/median 7.2e6. Leave-one-out на 38 окнах, реальный
+# путь, o_proj одного слоя 0 в bf16 (KL, ppl):
+#   COMPRESSION 2.9B  0.052048 -> 0.031966   +4.04% -> +2.43%   +9.4 МБ
+#   REDUCTION   2.9B  0.001635 -> 0.001573   +0.08% -> +0.06%   +6.1 МБ
+# На 0.4B/1.5B эффект в шуме (0.4B при концентрации 0.91 -- тоже), цена
+# 0.2-0.6% файла. Порог по статистике не выводится из одной положительной
+# точки, поэтому правка безусловная. Локальная ошибка выхода слоя вред НЕ
+# предсказывает (у слоя 0 она наименьшая во всех моделях) -- вред идёт по
+# остаточному потоку. Замеры: NEXT_SESSION.md, 20.09.
+# ПОРЯДОК: разрез первым (совпадение подстрокой, первое побеждает);
+# "blocks.0." не задевает blocks.10. -- после номера стоит точка.
+O_PROJ_L0_BF16 = {"blocks.0.att.output.weight": 16,    # world
+                  "blocks.0.tmix.o_proj.weight": 16}   # custom
+
 # REDUCTION v2: цель -- деградация около нуля (для QAT/QLoRA-базы, где
 # training чувствителен даже к небольшим потерям -- см. сессию 19.07-5).
 # proj=6 БЕЗ AW (asym_sb6 plain): на 6 битах AW-взвешивание для proj
@@ -96,6 +113,7 @@ from .calibration.group_config import QuantConfig
 # раскладка и роль разные, и `calibrate()` подбирает их порознь.
 REDUCTION = QuantConfig(
     proj=8, cmix=6, emb=8, head=8,
+    bits_overrides=dict(O_PROJ_L0_BF16),
     w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16,
     outlier_fracs={},
     group_scale={"proj": 16, "cmix": 16, "emb": 16, "head": 16,
@@ -141,7 +159,7 @@ REDUCTION = QuantConfig(
 # Калибровано на rwkv7-g1h-1.5b; на другие масштабы НЕ переносится.
 COMPRESSION = QuantConfig(
     proj=4, cmix=4, emb_head=5,
-    bits_overrides={"ffn.key.weight": 5, "cmix.key.weight": 5},
+    bits_overrides=dict(O_PROJ_L0_BF16, **{"ffn.key.weight": 5, "cmix.key.weight": 5}),
     w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16,
     outlier_fracs={},
     group_scale={"proj": 32, "cmix": 32, "emb_head": 32,

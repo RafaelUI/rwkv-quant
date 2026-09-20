@@ -22,15 +22,33 @@ actual `.rwkvq` files on disk.
 
 | model | bf16 ppl | build | size | Δppl (all) | en / ru / sr |
 |---|---|---|---|---|---|
-| **0.1B** (`rwkv7-g1d-0.1b`) | 15.183 | `reduction` | 190.7 MB (2.00x) | **+0.33%** | +0.21 / +0.22 / +0.69% |
-| | | `compression` | 126.8 MB (3.01x) | **+8.68%** | +5.49 / +9.18 / +10.83% |
-| **0.4B** (`rwkv7-g1d-0.4b`) | 10.994 | `reduction` | 433.1 MB (2.08x) | **+0.33%** | +0.16 / +0.36 / +0.42% |
-| | | `compression` | 291.3 MB (3.10x) | **+4.30%** | +3.53 / +4.19 / +5.34% |
-| **1.5B** (`rwkv7-g1h-1.5b`) | 8.198 | `reduction` | 1435.1 MB (2.13x) | **+0.15%** | +0.36 / -0.05 / +0.40% |
-| | | `compression` | 970.6 MB (3.15x) | **+2.85%** | +3.20 / +2.25 / +3.84% |
-| **2.9B** (`rwkv7-g1h-2.9b`) | 7.163 | `reduction` | 2737.3 MB (2.15x) | **+0.24%** | +0.37 / +0.11 / +0.38% |
-| | | `compression` | 1855.2 MB (3.18x) | **+4.05%** | +4.25 / +3.21 / +5.71% |
+| **0.1B** (`rwkv7-g1d-0.1b`) | 15.183 | `reduction` | 191.3 MB (2.00x) | **+0.29%** | +0.22 / +0.18 / +0.59% |
+| | | `compression` | 127.6 MB (2.99x) | **+8.01%** | +5.30 / +8.41 / +9.86% |
+| **0.4B** (`rwkv7-g1d-0.4b`) | 10.994 | `reduction` | 434.1 MB (2.08x) | **+0.18%** | +0.15 / +0.24 / +0.06% |
+| | | `compression` | 292.8 MB (3.08x) | **+4.28%** | +3.51 / +4.20 / +5.22% |
+| **1.5B** (`rwkv7-g1h-1.5b`) | 8.198 | `reduction` | 1439.0 MB (2.12x) | **+0.04%** | -0.05 / +0.03 / +0.17% |
+| | | `compression` | 976.6 MB (3.13x) | **+2.87%** | +3.22 / +2.28 / +3.85% |
+| **2.9B** (`rwkv7-g1h-2.9b`) | 7.163 | `reduction` | 2743.3 MB (2.15x) | **+0.06%** | +0.07 / +0.03 / +0.12% |
+| | | `compression` | 1864.6 MB (3.16x) | **+2.43%** | +3.02 / +2.19 / +2.36% |
 
+> **All eight rows re-measured 2026-09-20: layer-0 `o_proj` now stays in
+> bf16 in both presets.** Leave-one-out on the real path showed that the 2.9B
+> `compression` deficit (+4.04% against +2.85% at 1.5B) was mostly one matrix:
+> the output projection of layer 0, whose input carries a massive activation
+> channel (one channel ~7e6 times the median energy). Keeping that single
+> matrix unquantized takes 2.9B `compression` from +4.04% to +2.43% (KL 0.052
+> to 0.032) for +9.4 MB, and 0.1B from +8.68% to +8.01%. At 0.4B and 1.5B the
+> change is inside noise, and `reduction` barely moves (8-bit weights already
+> cope). It costs 0.2-0.7% of file size and applies unconditionally, as
+> insurance: the activation statistic does not predict which models benefit
+> (0.1B gains with a mild channel, 0.4B and 7.2B gain nothing with strong
+> ones). Decode is not slower (2.9B, interleaved A/B: -0.4 to -0.5 ms/token;
+> A/A control ±0.02). All rows are now measured from the written `.rwkvq`
+> files with one instrument (38 windows, fp32 reference as the ppl base); the
+> older `reduction` rows came from an earlier recipe, which is why they move
+> more than the change itself explains. The KL tables further down predate
+> this change.
+>
 > **All four `compression` rows re-measured 2026-09-18.** The bit allocation
 > was changed on 09.09 (`proj` 5 to 4, `cmix.key` 4 to 5) after per-matrix
 > sensitivity turned out to diverge several-fold inside the old groups, and
