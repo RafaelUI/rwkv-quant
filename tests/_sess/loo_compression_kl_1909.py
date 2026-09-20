@@ -42,9 +42,12 @@ CUTS = {
 # «o_proj в 5 битах» (раздел 19.09, НОЧЬ, шаг 3).
 # o4s: те же 4 бита, но режим asym_sb6_search (поиск БЕЗ AW-статистики)
 # только у задетых ключей -- отделяет «мало бит» от «AW портит o_proj».
+# e6/e8: ЭМБЕДДИНГ в 6/8 бит вместо 5 -- второй адрес 2.9B (17% KL у g1h,
+# 30% у g1j). Плечо считается ПОВЕРХ нынешнего пресета (o_proj слоя 0 уже
+# в bf16), поэтому base здесь -- пресет с правкой.
 UP = {"o5": ("att.output.weight",), "o6": ("att.output.weight",),
-      "o4s": ("att.output.weight",)}
-BITS = dict({a: 16 for a in CUTS}, o5=5, o6=6, o4s=4)
+      "o4s": ("att.output.weight",), "e6": ("emb.weight",), "e8": ("emb.weight",)}
+BITS = dict({a: 16 for a in CUTS}, o5=5, o6=6, o4s=4, e6=6, e8=8)
 MODE = {"o4s": "asym_sb6_search"}
 CUTS = dict(CUTS, **UP)
 arm = sys.argv[1]

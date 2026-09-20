@@ -47,7 +47,7 @@ def ppl(ce, ref, m=None):
     return 100 * (np.exp(ce.mean()) / np.exp(ref.mean()) - 1)
 
 for s, d in docs.items():
-    for a in ["o5", "o6", "o4s"] + sorted(k for k in d if k.startswith("oL")):
+    for a in ["o5", "o6", "o4s", "e6", "e8"] + sorted(k for k in d if k.startswith("oL")):
         if a not in d or "base" not in d:
             continue
         b, x = d["base"], d[a]
