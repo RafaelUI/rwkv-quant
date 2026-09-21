@@ -153,11 +153,38 @@ def with_mode(cfg, group, mode):
     return cfg
 
 
+def _with_act(_ignored=None, live=False):
+    # ЗАКОН 30 (21.09): имена "compression"/"compression_nol0" обозначают
+    # пресет СОСТОЯНИЯ 632eee3 (emb 5 бит) -- под ними записаны числа
+    # 20-21.09 на сервере. Живой пресет (emb 6) -- "compression_live".
+    from rwkv_quant.presets import COMPRESSION as _C
+    cfg = copy.deepcopy(_C)
+    if not live:
+        cfg.bits = dict(cfg.bits, emb=5)
+    cfg.act_stats_path = ACT
+    return cfg
+
+
+def _strip_l0(cfg):
+    from rwkv_quant.presets import O_PROJ_L0_BF16
+    cfg.bits_overrides = {k: v for k, v in cfg.bits_overrides.items()
+                          if k not in O_PROJ_L0_BF16}
+    return cfg
+
+
 CONFIGS = {
     "bf16": lambda: QuantConfig(),
     # нынешний пресет как он есть в presets.py -- отдельным именем, чтобы
     # дельта-конфиги ниже остались привязаны к своей исторической базе
     "preset": preset_cfg,
+    # 20.09: пресет БЕЗ o_proj слоя 0 в bf16 -- база для плеча proj_o_l0
+    # (сама правка уже в presets.py, иначе плечо мерило бы ноль)
+    "preset_nol0": lambda: _strip_l0(preset_cfg()),
+    # COMPRESSION как он есть в presets.py, и он же без o_proj слоя 0
+    "compression": lambda: _with_act(),
+    "compression_nol0": lambda: _strip_l0(_with_act()),
+    "compression_live": lambda: _with_act(live=True),
+    "compression_live_nol0": lambda: _strip_l0(_with_act(live=True)),
     "preset_noaw": preset_noaw_cfg,
     "reduction": base_cfg,
     "reduction_sym_cmix": lambda: with_sym(base_cfg(), "cmix"),

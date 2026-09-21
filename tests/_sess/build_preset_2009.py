@@ -1,9 +1,11 @@
 """Сборка пресета публичным путём (api.quantize), act_stats -- авто-кеш.
     python build_preset_2009.py <чекпоинт> <пресет> <выход.rwkvq>"""
-import sys, time
-sys.path.insert(0, "/Users/s/Develop/rwkv-quant")
+import os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # корень репо: Mac и сервер
 from rwkv_quant.api import quantize
-TOK = "/Users/s/Develop/rwkv-metal/rwkv_metal/tokenizer/rwkv_vocab_v20230424.txt"
+TOK = os.environ.get("RWKVQ_TOK") or next(p for p in (
+    "/Users/s/Develop/rwkv-metal/rwkv_metal/tokenizer/rwkv_vocab_v20230424.txt",
+    os.path.expanduser("~/rwkvq/rwkv_vocab_v20230424.txt")) if os.path.exists(p))
 t0 = time.time()
 name = sys.argv[2]
 if name.endswith("_nol0"):

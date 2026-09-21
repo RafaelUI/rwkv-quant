@@ -21,8 +21,18 @@ import mlx.core as mx
 from rwkv_quant.presets import PRESETS
 # ПРЕСЕТ (20.09): RWKVQ_PRESET=reduction -- те же плечи поверх REDUCTION.
 # По умолчанию compression, прежние вызовы не меняются.
-PRESET = os.environ.get("RWKVQ_PRESET", "compression")
-COMPRESSION = PRESETS[PRESET]
+PRESET = os.environ.get("RWKVQ_PRESET", "compression_2109")
+# ЗАКОН 30 (21.09): база плеч заморожена ЗДЕСЬ. Все числа 20-21.09 в логах
+# сняты на пресете "o_proj слоя 0 в bf16, emb 5 бит"; живой COMPRESSION с
+# 21.09 держит emb в 6 битах, и под ним "base" совпал бы с плечом e6.
+# compression_2109 = COMPRESSION с emb=5 (ровно состояние 632eee3);
+# живой пресет -- RWKVQ_PRESET=compression.
+if PRESET == "compression_2109":
+    import copy as _copy
+    COMPRESSION = _copy.deepcopy(PRESETS["compression"])
+    COMPRESSION.bits["emb"] = 5
+else:
+    COMPRESSION = PRESETS[PRESET]
 from rwkv_quant.formats.writer import quantize_tensor
 from rwkv_quant.formats.schema import QuantizedCheckpoint
 from rwkv_quant.backends.metal.quant_model import QuantRWKV7

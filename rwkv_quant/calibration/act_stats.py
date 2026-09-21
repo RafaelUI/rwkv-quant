@@ -156,7 +156,7 @@ def collect(ckpt_path, tokenizer, corpus_path=CORPUS, seq_len=SEQ_LEN,
             "проверьте токенизатор" % seq_len)
     data = torch.tensor(wins, dtype=torch.int32)
 
-    model = RWKV7Ref(ckpt_path, device="cpu", dtype=torch.bfloat16)
+    model = RWKV7Ref(ckpt_path, device=os.environ.get("RWKVQ_DEVICE", "cpu"), dtype=torch.bfloat16)
     vocab = int(getattr(model, "vocab_size", 0) or 0)
     top = int(data.max())
     if vocab and top >= vocab:
@@ -171,6 +171,8 @@ def collect(ckpt_path, tokenizer, corpus_path=CORPUS, seq_len=SEQ_LEN,
               % (len(wins), seq_len, len(wins) * seq_len, len(chunks), vocab))
 
     ref_mod.ACT_RECORDER = {}
+    # токены собираются на cpu, а модель может быть на cuda (RWKVQ_DEVICE)
+    data = data.to(getattr(model, "device", "cpu"))
     t0 = time.time()
     with torch.no_grad():
         for i in range(data.shape[0]):

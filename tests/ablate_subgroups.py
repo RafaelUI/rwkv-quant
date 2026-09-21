@@ -119,11 +119,24 @@ SUBSETS = {
     "head":       r"^head\.weight$",
     "layer0":     r"^blocks\.0\.",
     "vfirst":     r"^blocks\.0\.att\.value\.weight$",
+    # 20.09: o_proj ТОЛЬКО слоя 0 -- на Mac дало 85% вклада o на 2.9B g1h
+    "proj_o_l0":  r"^blocks\.0\.att\.output\.weight$",
+    # 21.09: верх по ЛОКАЛЬНОЙ ошибке впрыска на 2.9B (0.16) -- проверка,
+    # что локальный признак не предсказывает вред
+    "cmix_v_l15": r"^blocks\.15\.ffn\.value\.weight$",
     "lora":       r"att\.[wavg][12]$",
 }
 
 
 def mem(tag):
+    """Своп и давление памяти. На Linux (сервер) sysctl/memory_pressure нет,
+    поэтому читаем /proc/meminfo; печать формата прежняя."""
+    if os.path.exists("/proc/meminfo"):
+        mi = {l.split(":")[0]: int(l.split()[1]) for l in open("/proc/meminfo")}
+        used = "%.0fM" % ((mi["SwapTotal"] - mi["SwapFree"]) / 1024)
+        free = "%d%%" % (100 * mi["MemAvailable"] // mi["MemTotal"])
+        print("  [mem/%s] своп %s, свободно %s" % (tag, used, free), flush=True)
+        return
     sw = subprocess.run(["sysctl", "-n", "vm.swapusage"],
                         capture_output=True, text=True).stdout.strip()
     used = sw.split("used =")[1].split()[0] if "used =" in sw else "?"
@@ -138,7 +151,7 @@ def load_data():
     blob = torch.load(CORPUS)
     tok = blob["tokens"] if isinstance(blob, dict) else blob
     langs = list(blob.get("lang", []))[:NSEQ] if isinstance(blob, dict) else []
-    return tok[:NSEQ, :SEQLEN].contiguous().to("mps"), langs
+    return tok[:NSEQ, :SEQLEN].contiguous().to(os.environ.get("RWKVQ_DEVICE", "mps")), langs
 
 
 def prequantize(model, cfg, pred, verbose=True):
@@ -208,7 +221,10 @@ def build_ref():
     # не срежутся, а вопрос здесь как раз о точности. Цена -- 34 с на
     # 1.5B и 9 с на 0.1B, то есть дешевле любого прогона, ради которого
     # эталон делается.
-    dev, dt = (("cpu", torch.float32) if REF_DTYPE == "fp32"
+    # RWKVQ_REF_DEVICE: на сервере fp32-эталон можно считать на cuda, если
+    # модель влезает (7.2B в fp32 -- 28.8 ГБ, в 24 ГБ одной 4090 НЕ влезает).
+    # По умолчанию cpu, как на Mac, чтобы числа оставались сравнимыми.
+    dev, dt = ((os.environ.get("RWKVQ_REF_DEVICE", "cpu"), torch.float32) if REF_DTYPE == "fp32"
                else ("mps", torch.bfloat16))
     print(f"  эталон в {REF_DTYPE} на {dev}", flush=True)
     model = RWKV7Ref(CKPT, device=dev, dtype=dt)
@@ -284,7 +300,7 @@ def run(name, only, exc, trace):
     else:
         pred = lambda k: True                                # noqa: E731
 
-    model = RWKV7Ref(CKPT, device="mps", dtype=torch.bfloat16)
+    model = RWKV7Ref(CKPT, device=os.environ.get("RWKVQ_DEVICE", "mps"), dtype=torch.bfloat16)
     prequantize(model, cfg, pred)
     mem("после кванта")
 
@@ -316,7 +332,7 @@ def run(name, only, exc, trace):
         # прогон одной последовательности стоит секунды.
         tr_q = trace_of(model, data[:1])
         del model
-        base = RWKV7Ref(CKPT, device="mps", dtype=torch.bfloat16)
+        base = RWKV7Ref(CKPT, device=os.environ.get("RWKVQ_DEVICE", "mps"), dtype=torch.bfloat16)
         tr_b = trace_of(base, data[:1])
         del base
         rel = [float((b - qq).norm() / b.norm()) for b, qq in zip(tr_b, tr_q)]

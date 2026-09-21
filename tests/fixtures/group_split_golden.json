@@ -34,14 +34,15 @@
   "compression|blocks.3.ffn.value.weight|real=True|gw_dm": "4fd8156a2ccf5b59a9368e35581daba24c83195e4986e5bcc8d95564fd44e320",
   "compression|blocks.3.ffn.value.weight|real=True|gw_qsqm": "510fca55898fc5512104459a84f21ff4c9240414692b3292d71847b1b4f043de",
   "compression|blocks.3.ffn.value.weight|real=True|meta": "ce5583a8b4e41007d880b3bf2e9176727db0e9b24aa36a6cc3a954d41968e861",
-  "compression|emb.weight|real=False|dense": "ec740e39a972026c400a11a08116681ac57c57928d74341fd76cf3bd2de466fc",
+  "compression|emb.weight|real=False|dense": "031c2138d574e1c2893951330f2bf65a64d824705d8a8aa43874cdc0956704d7",
   "compression|emb.weight|real=False|meta": "2739e36f71da741cd880001a509f2b507598dbc443e49f00a363d4229d0bc403",
-  "compression|emb.weight|real=True|codes_packed": "6c1dbbf2d51849b61b127f62a59412f1d6c27a655bc67b4f2121e90f9590e04a",
-  "compression|emb.weight|real=True|gw_d": "0d54d50a0ba55cff564fc43ae329269228d1c6df9c725535cfbe163524cdb1f5",
-  "compression|emb.weight|real=True|gw_dm": "eecadd7be01aa34bce52353745af56a7657f8d35006b80743bb6f9ff8d3c4a97",
-  "compression|emb.weight|real=True|gw_qh": "cab1e8bbdf740a9311a93b0630ffda0aebcee8cb3f8083bec3e15d88d91f2bf1",
-  "compression|emb.weight|real=True|gw_qsqm": "16fce3b0843d920a4b8be0034510f447fcaee88a870b7d8c1ec54b10ae172eb8",
-  "compression|emb.weight|real=True|meta": "d711b508301ace20f6cd6af0b5c71e66e8d1f9d5ecbb68a9d588b03214c11b76",
+  "compression|emb.weight|real=True|codes_packed": "32bee04013cb245e939ff1580b41f4c13d890e57141e42e530a9e431c6976e88",
+  "compression|emb.weight|real=True|gw_d": "90c20e5dab8809500ae7d4974ff409f8092ea85a2facd5df2d8786219ed532ba",
+  "compression|emb.weight|real=True|gw_dm": "f256731f6c4fb000dd91fc7ddb25ad61af9e56cd08a547bc9f4f214f136ecb65",
+  "compression|emb.weight|real=True|gw_qh": "e03e7f7c7f0843c83c1d242bba6a991901a43bf606afb83d03bfb36328f27181",
+  "compression|emb.weight|real=True|gw_qh2": "e1174984bb75ac4ba2f76f8b76c0fd4bc36708a0e601b733d05ca0660ea5748f",
+  "compression|emb.weight|real=True|gw_qsqm": "b8d377b1ce5ed07427ccd620391c3033811084f504ad4dcd699e5545c2455167",
+  "compression|emb.weight|real=True|meta": "6de6c059089db7a58a322814145c41da9962d2ee2e81ca9da40b57a2fe1350c0",
   "compression|head.weight|real=False|dense": "36d200ba3e1a2a977052d72ea05045ce468fc075b97730e4e263ca3e3bf47231",
   "compression|head.weight|real=False|meta": "2739e36f71da741cd880001a509f2b507598dbc443e49f00a363d4229d0bc403",
   "compression|head.weight|real=True|codes_packed": "ac6a2720961f731fa18942cb9b66fd7f385e11cd25f4cc9448f9031187b08194",
@@ -98,7 +99,7 @@
   "reduction|head.weight|real=True|meta": "4d8ebc47b5538c12ce4f601bfc0ee38ad813e48e1cb7cdc6644c7546b3cf08a7"
  },
  "reprs": {
-  "compression": "QuantConfig(proj=4, w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16, cmix=4, emb_head=5, overrides={'ffn.key.weight': 5, 'cmix.key.weight': 5})",
-  "reduction": "QuantConfig(proj=8, w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16, cmix=6, emb_head=8)"
+  "compression": "QuantConfig(proj=4, w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16, cmix=4, emb=6, head=5, overrides={'blocks.0.att.output.weight': 16, 'blocks.0.tmix.o_proj.weight': 16, 'ffn.key.weight': 5, 'cmix.key.weight': 5})",
+  "reduction": "QuantConfig(proj=8, w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16, cmix=6, emb_head=8, overrides={'blocks.0.att.output.weight': 16, 'blocks.0.tmix.o_proj.weight': 16})"
  }
 }

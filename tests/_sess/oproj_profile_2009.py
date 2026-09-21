@@ -8,15 +8,17 @@ o_proj держать в высокой точности». LOO показал: 
 Без прогона модели: веса + act-статистика.
     python oproj_profile_2009.py <чекпоинт> [act_stats.pt] [json]
 Без act_stats -- сбор штатным collect() (кеш ~/.cache/rwkv-quant)."""
-import copy, json, sys
-sys.path.insert(0, "/Users/s/Develop/rwkv-quant")
+import copy, json, os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # корень репо: Mac и сервер
 import torch
 from rwkv_quant.presets import COMPRESSION
 from rwkv_quant.formats.writer import quantize_tensor
 from rwkv_quant.formats.reader import dequantize_banded
 from rwkv_quant.calibration import act_stats as A
 
-TOK = "/Users/s/Develop/rwkv-metal/rwkv_metal/tokenizer/rwkv_vocab_v20230424.txt"
+TOK = os.environ.get("RWKVQ_TOK") or next(p for p in (
+    "/Users/s/Develop/rwkv-metal/rwkv_metal/tokenizer/rwkv_vocab_v20230424.txt",
+    os.path.expanduser("~/rwkvq/rwkv_vocab_v20230424.txt")) if os.path.exists(p))
 ck = sys.argv[1]
 if len(sys.argv) > 2 and sys.argv[2] != "-":
     ap = sys.argv[2]

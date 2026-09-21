@@ -23,14 +23,28 @@ actual `.rwkvq` files on disk.
 | model | bf16 ppl | build | size | Δppl (all) | en / ru / sr |
 |---|---|---|---|---|---|
 | **0.1B** (`rwkv7-g1d-0.1b`) | 15.183 | `reduction` | 191.3 MB (2.00x) | **+0.29%** | +0.22 / +0.18 / +0.59% |
-| | | `compression` | 127.6 MB (2.99x) | **+8.01%** | +5.30 / +8.41 / +9.86% |
+| | | `compression` | 133.9 MB (2.85x) | **+7.50%** | +5.22 / +7.97 / +8.77% |
 | **0.4B** (`rwkv7-g1d-0.4b`) | 10.994 | `reduction` | 434.1 MB (2.08x) | **+0.18%** | +0.15 / +0.24 / +0.06% |
-| | | `compression` | 292.8 MB (3.08x) | **+4.28%** | +3.51 / +4.20 / +5.22% |
+| | | `compression` | 301.2 MB (2.99x) | **+4.20%** | +3.43 / +4.32 / +4.72% |
 | **1.5B** (`rwkv7-g1h-1.5b`) | 8.198 | `reduction` | 1439.0 MB (2.12x) | **+0.04%** | -0.05 / +0.03 / +0.17% |
-| | | `compression` | 976.6 MB (3.13x) | **+2.87%** | +3.22 / +2.28 / +3.85% |
+| | | `compression` | 993.4 MB (3.08x) | **+2.82%** | +3.12 / +2.28 / +3.74% |
 | **2.9B** (`rwkv7-g1h-2.9b`) | 7.163 | `reduction` | 2743.3 MB (2.15x) | **+0.06%** | +0.07 / +0.03 / +0.12% |
-| | | `compression` | 1864.6 MB (3.16x) | **+2.43%** | +3.02 / +2.19 / +2.36% |
+| | | `compression` | 1885.5 MB (3.13x) | **+1.85%** | +2.33 / +1.66 / +1.81% |
 
+> **All four `compression` rows re-measured 2026-09-21: the embedding is now
+> 6-bit instead of 5** (`head` stays at 5). On 2.9B the embedding carried
+> 17% of the remaining KL; one more bit takes 2.9B from +2.43% to +1.85%
+> (KL 0.0320 to 0.0249) for +21 MB, and 0.1B from +8.00% to +7.50% (both
+> significant by paired bootstrap over the 38 windows). At 0.4B and 1.5B the
+> change is inside noise. Keeping the embedding fully in bf16 would buy only
+> 5% more on 2.9B at ten times the bytes. It applies unconditionally: the
+> price is file size only (+1.1% at 2.9B, but +4.9% at 0.1B, where the
+> vocabulary is a large share of the model); in memory the `compression`
+> embedding is expanded to fp16 anyway and read one row per token, so RAM
+> and decode speed do not change. Each new file was measured next to the
+> previous one with the same instrument; the previous rows reproduce to
+> +-0.01 points.
+>
 > **All eight rows re-measured 2026-09-20: layer-0 `o_proj` now stays in
 > bf16 in both presets.** Leave-one-out on the real path showed that the 2.9B
 > `compression` deficit (+4.04% against +2.85% at 1.5B) was mostly one matrix:
