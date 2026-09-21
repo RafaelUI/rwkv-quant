@@ -422,6 +422,19 @@ def preset_of(ckpt):
     return hits[0] if len(hits) == 1 else None
 
 
+# 22.09: repr() COMPRESSION в прежних редакциях presets.py -- для файлов,
+# собранных до поля runtime в манифесте. Строгое равенство, как preset_of:
+# 09.09-20.09 (до 0208ec5) и 20.09-21.09 (632eee3, o_proj L0 в bf16, emb 5).
+# После правки 21.09 (emb 6) такие файлы молча теряли быструю норму.
+LEGACY_COMPRESSION_REPRS = (
+    "QuantConfig(proj=4, w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16, "
+    "cmix=4, emb_head=5, overrides={'ffn.key.weight': 5, 'cmix.key.weight': 5})",
+    "QuantConfig(proj=4, w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16, "
+    "cmix=4, emb_head=5, overrides={'blocks.0.att.output.weight': 16, "
+    "'blocks.0.tmix.o_proj.weight': 16, 'ffn.key.weight': 5, 'cmix.key.weight': 5})",
+)
+
+
 def _layer_norm_ref(x, weight, bias, eps=1e-5):
     mean = x.mean(axis=-1, keepdims=True)
     var = ((x - mean) ** 2).mean(axis=-1, keepdims=True)
@@ -1075,10 +1088,23 @@ class QuantRWKV7:
         # пресет уже заключил. REDUCTION -- база под QAT/QLoRA и
         # векторные модели, где ценится сравнимость с записанным
         # бит-в-бит, поэтому там остаётся рукописная норма.
+        # 22.09 (решение владельца, вариант 2): порядок
+        #   явный аргумент -> runtime.fast_ln манифеста -> preset_of() ->
+        #   исторические конфиги COMPRESSION -> модульное умолчание FAST_LN.
+        # Манифест -- решение, записанное при сборке; preset_of и история --
+        # только для файлов, собранных до появления поля.
         self.preset = preset_of(ckpt)
+        rt = getattr(ckpt, "runtime", None) or {}
+        self.fast_ln_source = "аргумент"
+        if fast_ln is None and "fast_ln" in rt:
+            fast_ln, self.fast_ln_source = bool(rt["fast_ln"]), "манифест"
+        if fast_ln is None and self.preset in ("compression", "reduction"):
+            fast_ln = self.preset == "compression"
+            self.fast_ln_source = "пресет"
+        if fast_ln is None and getattr(ckpt, "config_repr", "") in LEGACY_COMPRESSION_REPRS:
+            fast_ln, self.fast_ln_source = True, "история compression"
         if fast_ln is None:
-            fast_ln = True if self.preset == "compression" else (
-                False if self.preset == "reduction" else None)
+            self.fast_ln_source = "умолчание"
         self.fast_ln = fast_ln
         self.naming = ckpt.naming
         self.n_layer = ckpt.n_layer

@@ -1528,3 +1528,22 @@ RWKVQ_BENCH_FAST_LN=1; json ce_rule_fl_<s>_2109.json) -- числа почти �
         tau5 +5.42% KL 0.0542, значимо (+1.96 п.п.)
   0.4B  live +4.20% KL 0.0468 | tau10 KL 0.0471, в шуме | tau5 +3.39% KL 0.0401,
         значимо (+0.79 п.п.)
+
+### 22.09: ВАРИАНТ 2 (решение владельца) -- быстрая норма записана в файл
+Манифест: "runtime": {"fast_ln": bool}. Намерение едет с объектом конфига
+(QuantConfig.runtime_fast_ln, НЕ в repr и НЕ в config_to_json): COMPRESSION
+True, REDUCTION False, deepcopy пресета (автоподбор, build_rule) наследует,
+свой QuantConfig -- None (поле не пишется). Пересохранение поле сохраняет.
+Рантайм (QuantRWKV7): явный аргумент -> манифест -> preset_of -> исторические
+repr COMPRESSION (LEGACY_COMPRESSION_REPRS: 09-20.09 и 20-21.09) -> умолчание;
+источник виден в m.fast_ln_source.
+РЕГРЕССИЯ ЗАКРЫТА: правка 21.09 (emb 5->6) молча сняла быструю норму со ВСЕХ
+compression-файлов, собранных раньше (20.09 и 7.2B -- проверено: теперь
+"история compression").
+Гейт tests/test_fast_ln_intent.py (13 пунктов) -- ЗЕЛЁНЫЙ; group_split_compat,
+codec_parity, act_stats_auto, manifest_selfdesc, rwkvq_container -- зелёные.
+rule_0p4b_tau10 пересобран (_v2): флаг из манифеста, ABBA против пресета БЕЗ
+переключателя: -0.49% [-0.053; -0.004 мс] -- быстрая норма включилась сама.
+Файлы правила, собранные ДО этой правки (rule_*_2109, сервер rule_files,
+собранные до синхронизации), флага НЕ несут -- мерить их с
+RWKVQ_BENCH_FAST_LN=1 или пересобрать.

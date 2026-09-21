@@ -91,7 +91,8 @@ def _load_safetensors(path: str) -> QuantizedCheckpoint:
         tensors=tensors, config_repr=m.get("config_repr", ""),
         # v1 этих полей не имеет -- отсутствие тут норма, а не ошибка
         config=config_from_json(m.get("config")),
-        tokenizer=m.get("tokenizer"))
+        tokenizer=m.get("tokenizer"),
+        runtime=m.get("runtime"))
 
 
 def config_from_json(d):

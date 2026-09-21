@@ -133,6 +133,13 @@ def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str,
         "vocab_size": int(ckpt.vocab_size),
         "config_repr": ckpt.config_repr,
         "config": config_to_json(config) if config is not None else None,
+        # 22.09: намерение рантайма. Пересохранение сохраняет прочитанное
+        # (config_from_json его не несёт), новая сборка берёт из конфига.
+        "runtime": (getattr(ckpt, "runtime", None)
+                    or ({"fast_ln": bool(config.runtime_fast_ln)}
+                        if config is not None
+                        and getattr(config, "runtime_fast_ln", None) is not None
+                        else None)),
         "tokenizer": tokenizer if tokenizer is not None
         else getattr(ckpt, "tokenizer", None),
         "tensors": manifest_t,
