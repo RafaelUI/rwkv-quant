@@ -29,6 +29,11 @@ si, sn = (int(x) for x in shard.split("/"))
 DEV = os.environ.get("RWKVQ_DEVICE", "cuda:0")
 DT = {"fp32": torch.float32, "bf16": torch.bfloat16}[os.environ.get("RWKVQ_SWEEP_DTYPE", "fp32")]
 WIN = [int(x) for x in os.environ.get("RWKVQ_SWEEP_WIN", "0,6,13,20,24,28,30,35").split(",")]
+# Батч по окнам (21.09): скан WKV идёт по времени, батч почти бесплатен, а
+# на B=1 карта была загружена на 4-7%. Эквивалентность B=1 проверяется
+# повтором уже снятых плеч (RWKVQ_SWEEP_ONLY), пол -- плечом __none__.
+BATCH = int(os.environ.get("RWKVQ_SWEEP_BATCH", 8))
+ONLY = [a for a in os.environ.get("RWKVQ_SWEEP_ONLY", "").split(",") if a]
 QGROUPS = ("proj", "cmix", "emb", "head")          # по одной матрице
 LORA = ("w_lora", "a_lora", "v_lora", "g_lora")    # LoRA слоя -- одним плечом
 
@@ -59,20 +64,26 @@ arms += [("blocks.%d.lora" % i, v) for i, v in sorted(by_layer.items())]
 arms = [a for j, a in enumerate(arms) if j % sn == si]
 if si == 0:
     arms = [("__none__", [])] + arms + [("__all__", [p for p in pts])]
+if ONLY:
+    arms = [a for a in arms if a[0] in ONLY]
 
 
 @torch.no_grad()
 def measure():
     kls, tops = [], []
-    for i in range(len(WIN)):
-        lg = model.forward(data[i:i + 1, :-1])[0].double()
-        P = REF[i].double()
-        lp = torch.log_softmax(P, -1); lq = torch.log_softmax(lg, -1)
-        kl = (lp.exp() * (lp - lq)).sum(-1)
-        if not torch.isfinite(kl).all():
-            raise RuntimeError("не-конечный KL, окно %d" % WIN[i])
-        kls.append(float(kl.mean())); tops.append(float((P.argmax(-1) == lg.argmax(-1)).double().mean()))
-        del lg, P, lp, lq, kl
+    for b0 in range(0, len(WIN), BATCH):
+        LG = model.forward(data[b0:b0 + BATCH, :-1])
+        for j in range(LG.shape[0]):
+            i = b0 + j
+            lg = LG[j].double()
+            P = REF[i].double()
+            lp = torch.log_softmax(P, -1); lq = torch.log_softmax(lg, -1)
+            kl = (lp.exp() * (lp - lq)).sum(-1)
+            if not torch.isfinite(kl).all():
+                raise RuntimeError("не-конечный KL, окно %d" % WIN[i])
+            kls.append(float(kl.mean())); tops.append(float((P.argmax(-1) == lg.argmax(-1)).double().mean()))
+            del lg, P, lp, lq, kl
+        del LG
     return kls, tops
 
 
@@ -83,21 +94,31 @@ for arm, sel in arms:
         continue
     t1 = time.time()
     saved = []
+    # __all__ идёт ПОСЛЕДНИМ и не возвращается: копии всех оригиналов
+    # удваивали память (2.9B fp32 -- OOM 21.09)
+    keep = arm != "__all__"
+    nq = 0
     for obj, attr, group, key in sel:
         w = getattr(obj, attr)
         if w is None:
             continue
         q = fake_quant.q(w, group, cfg, key)
         if q is not w:
-            saved.append((obj, attr, w)); setattr(obj, attr, q.to(w.dtype))
-    if sel and not saved:
+            nq += 1
+            if keep:
+                saved.append((obj, attr, w))
+            setattr(obj, attr, q.to(w.dtype))
+            del w
+            if not keep:
+                torch.cuda.empty_cache()
+    if sel and not nq:
         res[arm] = {"skip": "не квантуется в %s" % name}
         continue
     kls, tops = measure()
     for obj, attr, w in saved:
         setattr(obj, attr, w)
     res[arm] = {"kl": float(np.mean(kls)), "per_win": kls, "top1": float(np.mean(tops)),
-                "n": len(saved), "s": round(time.time() - t1, 1)}
+                "n": nq, "b": BATCH, "s": round(time.time() - t1, 1)}
     print("%-34s KL %.6f  top1 %.4f  %4.1f с" % (arm, res[arm]["kl"], res[arm]["top1"], time.time() - t1), flush=True)
     json.dump(res, open(out_path + ".tmp", "w"), indent=1, ensure_ascii=False)
     os.replace(out_path + ".tmp", out_path)
