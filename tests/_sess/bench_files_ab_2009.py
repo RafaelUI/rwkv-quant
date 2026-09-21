@@ -13,7 +13,13 @@ sw = lambda: subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=Tru
 A, B = sys.argv[1], sys.argv[2]
 R = int(sys.argv[3]) if len(sys.argv) > 3 else 16
 N = int(sys.argv[4]) if len(sys.argv) > 4 else 32
-M = {"A": QuantRWKV7(load_raw(A)), "B": QuantRWKV7(load_raw(B))}
+# 21.09: RWKVQ_BENCH_FAST_LN=1 -- быстрая норма ОБОИМ плечам явно. Иначе
+# fast_ln решает preset_of() по СТРОГОМУ равенству конфига канону: файл
+# правила (тот же COMPRESSION + поточечные биты) получал рукописную норму
+# и терял ~7% декода -- это и было "замедление смешанной битности".
+_FL = True if os.environ.get("RWKVQ_BENCH_FAST_LN") == "1" else None
+M = {"A": QuantRWKV7(load_raw(A), fast_ln=_FL), "B": QuantRWKV7(load_raw(B), fast_ln=_FL)}
+print("fast_ln A=%s B=%s" % (M["A"].fast_ln, M["B"].fast_ln))
 data = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt"))["tokens"][:1].numpy()
 p = mx.array(data[:, :64].astype(np.int32))
 st, tk = {}, {}
