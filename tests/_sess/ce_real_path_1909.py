@@ -36,7 +36,7 @@ def run(path, name, out):
         import mlx.core as mx
         from rwkv_quant.formats.reader import load_raw
         from rwkv_quant.backends.metal.quant_model import QuantRWKV7
-        model = QuantRWKV7(load_raw(path))
+        model = QuantRWKV7(load_raw(path), fast_ln=(True if os.environ.get("RWKVQ_BENCH_FAST_LN") == "1" else None))
     for i in range(N):
         tgt = data[i, 1:512]
         if path == "--ref":
