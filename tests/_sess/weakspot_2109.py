@@ -302,17 +302,20 @@ elif MODE == "ladder":
 
 elif MODE == "joint":
     name, ovr = sys.argv[3], json.loads(sys.argv[4])
-    saved, add = [], 0.0
+    add = 0.0
     for obj, attr, group, key in PTS:
         w = getattr(obj, attr)
         if group not in cfg.bits or w is None:
             continue
         if key in ovr:
             add += nbytes(w.numel(), ovr[key]) - nbytes(w.numel(), base_bits(group, key))
-        saved += with_bits([(obj, attr, group, key)], ovr.get(key))
+        # оригиналы НЕ храним: процесс на один прогон, а копии всех матриц
+        # удваивали память (2.9B/7.2B/13.3B в fp32 -- OOM 21.09)
+        with_bits([(obj, attr, group, key)], ovr.get(key))
+        torch.cuda.empty_cache()
     missing = [k for k in ovr if k not in {p[3] for p in PTS}]
     assert not missing, "ключей нет в модели: %s" % missing
-    kl = kl_of(run()); restore(saved)
+    kl = kl_of(run())
     res.setdefault("joint", {})[name] = {"kl": kl, "ovr": ovr, "add_bytes": add}
     dump(res)
     print("joint %-20s KL %.6f  +%.2f МБ (%.2f%% файла)" % (name, kl, add / 1e6, 100 * add / FILE), flush=True)

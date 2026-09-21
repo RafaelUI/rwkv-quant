@@ -817,9 +817,13 @@ class QuantTMix:
         self._rkv_fused = None
         self._rkv_idx = mx.array([0, 2, 3])          # (xr, xk, xv) из xs
         lins = [self.r_proj, self.k_proj, self.v_proj]
+        # 21.09: xbits ОБЯЗАН совпадать (GwQuantLinearFused его ассертит).
+        # 5 и 6 бит оба has_qh, и файл с r/k/v в 5 и 6 битах (поточечная
+        # битность правила "слабое место -> бит") падал на декоде. Разная
+        # битность -- законный формат: тогда просто без фьюза.
         if (all(isinstance(l, GwQuantLinear) for l in lins)
-                and len({(l.in_features, l.out_features, l.has_qh)
-                         for l in lins}) == 1):
+                and len({(l.in_features, l.out_features, l.has_qh,
+                          getattr(l, "xbits", None)) for l in lins}) == 1):
             self._rkv_fused = GwQuantLinearFused(lins)
         elif (all(isinstance(l, SymQuantLinear) for l in lins)
                 and all(lins[0].can_fuse_with(l) for l in lins)):
