@@ -214,6 +214,21 @@ def q(w, group, cfg: "QuantConfig", key: str = None):
     так же, как writer ведёт себя при отсутствующем файле статистики.
     """
     bits = cfg.bits[group]
+    # 21.09: ПОТОЧЕЧНАЯ БИТНОСТЬ -- ровно как в writer._quantize_impl
+    # (подстрока ключа, первое совпадение побеждает). До этой правки fake-путь
+    # bits_overrides НЕ ВИДЕЛ: весь fake-путь (ablate_*, серверные LOO и
+    # свипы 20-21.09) квантовал ffn.key COMPRESSION в 4 бита вместо 5, а
+    # o_proj слоя 0 -- в 4 вместо bf16. Измерялась одна схема, деплоилась
+    # другая (закон 15). Без key переопределение не применимо, как и AW.
+    if key is not None:
+        for pat, b in getattr(cfg, "bits_overrides", {}).items():
+            if pat in key:
+                bits = b
+                break
+    if bits != cfg.bits[group]:
+        import copy as _copy
+        cfg = _copy.copy(cfg)
+        cfg.bits = dict(cfg.bits, **{group: bits})
     gs = cfg.group_scale.get(group)
 
     if gs and bits < 16:
