@@ -111,11 +111,14 @@ def run(inject=None, cache=None):
     return h @ M.head_weight.T
 
 
+PW = []   # KL по окнам последнего вызова kl_of (22.09 ночь: для парных сравнений в joint)
+
+
 def kl_of(lg):
-    s = 0.0
+    s = 0.0; PW.clear()
     for j in range(lg.shape[0]):
         lp = LPREF[j].double(); lq = torch.log_softmax(lg[j].double(), -1)
-        s += float((lp.exp() * (lp - lq)).sum(-1).mean())
+        PW.append(float((lp.exp() * (lp - lq)).sum(-1).mean())); s += PW[-1]
     return s / lg.shape[0]
 
 
@@ -285,6 +288,12 @@ elif MODE == "ladder":
     top = [k for k, _ in sorted(prox.items(), key=lambda kv: -kv[1]["score"]) if k in ARMS and not k.endswith(".lora")][:K]
     ends = [k for k in ARMS if not k.endswith(".lora") and (k.startswith("blocks.0.") or k.startswith("blocks.%d." % (L - 1)))]
     cand = list(dict.fromkeys(top + ends + ["emb.weight", "head.weight"]))
+    if os.environ.get("RWKVQ_LADDER_ARMS"):
+        # явный список плеч (22.09 ночь): добор кандидатов по строгой границе из свипа
+        extra = json.load(open(os.environ["RWKVQ_LADDER_ARMS"]))
+        bad = [a for a in extra if a not in ARMS or a.endswith(".lora")]
+        assert not bad, "нет таких плеч: %s" % bad[:5]
+        cand = list(dict.fromkeys(extra))
     lad = res.setdefault("ladder", {})
     for arm in cand:
         sel = ARMS[arm]; obj, attr, group, key = sel[0]
@@ -297,6 +306,29 @@ elif MODE == "ladder":
             t1 = time.time()
             # bf16 одной матрицы при остальном fp32 -- это пол (0): вклад снят целиком
             e["kl"][str(b)] = 0.0 if b >= 16 else only_kl(arm, None if b == b0 else b)
+            dump(res)
+            print("%-32s %2d бит  KL %.6f  %.1f с" % (arm, b, e["kl"][str(b)], time.time() - t1), flush=True)
+
+elif MODE == "down":
+    # ЛЕСТНИЦА ВНИЗ (22.09 ночь): KL, когда ОДНА матрица квантована на base, base-1,
+    # ..., RWKVQ_DOWN_MIN (умолч. 3), остальное fp32 -- тот же прибор, что ladder.
+    # emb (решение владельца: 6) и o_proj слоя 0 (bf16 в пресете) не трогаются.
+    # База мерится заново: сверка со свипом = проверка прибора.
+    lo = int(os.environ.get("RWKVQ_DOWN_MIN", "3"))
+    dn = res.setdefault("down", {})
+    for arm, sel in ARMS.items():
+        if arm.endswith(".lora") or arm in ("emb.weight", "blocks.0.att.output.weight"):
+            continue
+        obj, attr, group, key = sel[0]
+        b0 = base_bits(group, key)
+        if b0 >= 16 or b0 <= lo:
+            continue
+        e = dn.setdefault(arm, {"group": group, "params": getattr(obj, attr).numel(), "base_bits": b0, "kl": {}})
+        for b in range(b0, lo - 1, -1):
+            if str(b) in e["kl"]:
+                continue
+            t1 = time.time()
+            e["kl"][str(b)] = only_kl(arm, None if b == b0 else b)
             dump(res)
             print("%-32s %2d бит  KL %.6f  %.1f с" % (arm, b, e["kl"][str(b)], time.time() - t1), flush=True)
 
@@ -316,7 +348,7 @@ elif MODE == "joint":
     missing = [k for k in ovr if k not in {p[3] for p in PTS}]
     assert not missing, "ключей нет в модели: %s" % missing
     kl = kl_of(run())
-    res.setdefault("joint", {})[name] = {"kl": kl, "ovr": ovr, "add_bytes": add}
+    res.setdefault("joint", {})[name] = {"kl": kl, "ovr": ovr, "add_bytes": add, "win": WIN, "per_win": list(PW)}
     dump(res)
     print("joint %-20s KL %.6f  +%.2f МБ (%.2f%% файла)" % (name, kl, add / 1e6, 100 * add / FILE), flush=True)
 print("ГОТОВО %s за %.0f с" % (MODE, time.time() - t0), flush=True)

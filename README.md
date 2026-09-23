@@ -457,10 +457,10 @@ row; only the linear projections differ by scheme.
 ```python
 from rwkv_quant import quantize
 
-# near-lossless: 2.1x smaller, +0.15% ppl on the 1.5B reference
+# near-lossless: 2.1x smaller, +0.04% ppl on 1.5B, +0.06% on 2.9B (table above)
 quantize("model.pth", "model.rwkvq", preset="reduction", tokenizer=tok)
 
-# 3.2x smaller, +4.03% ppl, fastest decode
+# 3.1x smaller, +2.82% ppl on 1.5B, +1.85% on 2.9B, fastest decode
 quantize("model.pth", "model.rwkvq", preset="compression", tokenizer=tok)
 ```
 

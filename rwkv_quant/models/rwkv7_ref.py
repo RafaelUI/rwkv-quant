@@ -55,10 +55,16 @@ class CMix:
 
 class RWKV7Ref(nn.Module):
     def __init__(self, ckpt_path: str, device="mps", dtype=torch.bfloat16,
-                 n_layer=None, n_embd=None, head_size=64, vocab_size=None):
+                 n_layer=None, n_embd=None, head_size=64, vocab_size=None,
+                 compute_dtype=None):
+        """dtype -- тип ХРАНЕНИЯ весов; compute_dtype -- тип СЧЁТА (умолч. = dtype,
+        поведение прежнее). dtype=bf16, compute_dtype=fp32 численно равно fp32-модели
+        (апкаст bf16->fp32 точен, чекпоинты bf16) при вдвое меньшей памяти весов:
+        матрица приводится к типу счёта в момент использования (22.09, для measure)."""
         super().__init__()
         self.device = device
         self.dtype = dtype
+        self.cdtype = compute_dtype if compute_dtype is not None else dtype
 
         naming = detect_naming(ckpt_path, None)
         if naming == "world":
@@ -177,6 +183,17 @@ class RWKV7Ref(nn.Module):
                 c.x_k = get(fp + "x_k"); c.key = get(fp + "key.weight"); c.value = get(fp + "value.weight")
             self.cmix.append(c)
 
+    def _q(self, w, group, cfg, key):
+        """calibration.q + приведение к типу счёта (no-op при cdtype == dtype)."""
+        # квантуется УЖЕ приведённая матрица: иначе деквант округлялся бы в тип
+        # хранения (bf16), и bf16+fp32 перестал бы совпадать с fp32-моделью на
+        # квантующем конфиге. При cdtype == dtype -- прежнее поведение.
+        out = q(w if w.dtype == self.cdtype else w.to(self.cdtype), group, cfg, key)
+        return out if out.dtype == self.cdtype else out.to(self.cdtype)
+
+    def _c(self, t):
+        return t if t is None or t.dtype == self.cdtype else t.to(self.cdtype)
+
     @staticmethod
     def _time_shift(x):
         return F.pad(x, (0, 0, 1, -1))
@@ -196,26 +213,26 @@ class RWKV7Ref(nn.Module):
         _rec(f"blocks.{layer_id}.att.receptance.weight", xr)
         _rec(f"blocks.{layer_id}.att.key.weight", xk)
         _rec(f"blocks.{layer_id}.att.value.weight", xv)
-        r = xr @ q(t.r_proj, "proj", cfg, f"blocks.{layer_id}.att.receptance.weight").T
-        w_ = -F.softplus(-(F.linear(torch.tanh(xw @ q(t.w_lora_A, "w_lora", cfg, f"blocks.{layer_id}.att.w1").T),
-                                     q(t.w_lora_B_w, "w_lora", cfg, f"blocks.{layer_id}.att.w2"), t.w_lora_B_b))) - 0.5
-        k = xk @ q(t.k_proj, "proj", cfg, f"blocks.{layer_id}.att.key.weight").T
-        v = xv @ q(t.v_proj, "proj", cfg, f"blocks.{layer_id}.att.value.weight").T
+        r = xr @ self._q(t.r_proj, "proj", cfg, f"blocks.{layer_id}.att.receptance.weight").T
+        w_ = -F.softplus(-(F.linear(torch.tanh(xw @ self._q(t.w_lora_A, "w_lora", cfg, f"blocks.{layer_id}.att.w1").T),
+                                     self._q(t.w_lora_B_w, "w_lora", cfg, f"blocks.{layer_id}.att.w2"), self._c(t.w_lora_B_b)))) - 0.5
+        k = xk @ self._q(t.k_proj, "proj", cfg, f"blocks.{layer_id}.att.key.weight").T
+        v = xv @ self._q(t.v_proj, "proj", cfg, f"blocks.{layer_id}.att.value.weight").T
 
         if layer_id == 0:
             v_first = v
         else:
-            resid_gate = torch.sigmoid(F.linear(xv @ q(t.v_lora_A, "v_lora", cfg, f"blocks.{layer_id}.att.v1").T,
-                                                 q(t.v_lora_B_w, "v_lora", cfg, f"blocks.{layer_id}.att.v2"), t.v_lora_B_b))
+            resid_gate = torch.sigmoid(F.linear(xv @ self._q(t.v_lora_A, "v_lora", cfg, f"blocks.{layer_id}.att.v1").T,
+                                                 self._q(t.v_lora_B_w, "v_lora", cfg, f"blocks.{layer_id}.att.v2"), self._c(t.v_lora_B_b)))
             v = v + (v_first - v) * resid_gate
 
-        a = torch.sigmoid(F.linear(xa @ q(t.a_lora_A, "a_lora", cfg, f"blocks.{layer_id}.att.a1").T,
-                                    q(t.a_lora_B_w, "a_lora", cfg, f"blocks.{layer_id}.att.a2"), t.a_lora_B_b))
-        g = torch.sigmoid(xg @ q(t.g_lora_A, "g_lora", cfg, f"blocks.{layer_id}.att.g1").T) @ q(t.g_lora_B_w, "g_lora", cfg, f"blocks.{layer_id}.att.g2").T
+        a = torch.sigmoid(F.linear(xa @ self._q(t.a_lora_A, "a_lora", cfg, f"blocks.{layer_id}.att.a1").T,
+                                    self._q(t.a_lora_B_w, "a_lora", cfg, f"blocks.{layer_id}.att.a2"), self._c(t.a_lora_B_b)))
+        g = torch.sigmoid(xg @ self._q(t.g_lora_A, "g_lora", cfg, f"blocks.{layer_id}.att.g1").T) @ self._q(t.g_lora_B_w, "g_lora", cfg, f"blocks.{layer_id}.att.g2").T
 
-        k_k = q(t.k_k, "small", cfg, f"blocks.{layer_id}.att.k_k").reshape(1, 1, C)
-        k_a = q(t.k_a, "small", cfg, f"blocks.{layer_id}.att.k_a").reshape(1, 1, C)
-        r_k = q(t.r_k, "small", cfg, f"blocks.{layer_id}.att.r_k").reshape(H, N)
+        k_k = self._q(t.k_k, "small", cfg, f"blocks.{layer_id}.att.k_k").reshape(1, 1, C)
+        k_a = self._q(t.k_a, "small", cfg, f"blocks.{layer_id}.att.k_a").reshape(1, 1, C)
+        r_k = self._q(t.r_k, "small", cfg, f"blocks.{layer_id}.att.r_k").reshape(H, N)
 
         kk = k * k_k
         kk = F.normalize(kk.view(B, T, H, N), dim=-1, p=2.0).view(B, T, C)
@@ -230,7 +247,7 @@ class RWKV7Ref(nn.Module):
         out = out + bonus
         og = out * g
         _rec(f"blocks.{layer_id}.att.output.weight", og)
-        out = og @ q(t.o_proj, "proj", cfg, f"blocks.{layer_id}.att.output.weight").T
+        out = og @ self._q(t.o_proj, "proj", cfg, f"blocks.{layer_id}.att.output.weight").T
         return out, v_first
 
     @staticmethod
@@ -258,11 +275,12 @@ class RWKV7Ref(nn.Module):
         xx = self._time_shift(x) - x
         k = x + xx * c.x_k
         _rec(f"blocks.{layer_id}.ffn.key.weight", k)
-        k = torch.relu(k @ q(c.key, "cmix", cfg, f"blocks.{layer_id}.ffn.key.weight").T) ** 2
+        k = torch.relu(k @ self._q(c.key, "cmix", cfg, f"blocks.{layer_id}.ffn.key.weight").T) ** 2
         _rec(f"blocks.{layer_id}.ffn.value.weight", k)
-        return k @ q(c.value, "cmix", cfg, f"blocks.{layer_id}.ffn.value.weight").T
+        return k @ self._q(c.value, "cmix", cfg, f"blocks.{layer_id}.ffn.value.weight").T
 
-    def forward(self, idx: torch.Tensor, cfg: QuantConfig = None, trace=None):
+    def forward(self, idx: torch.Tensor, cfg: QuantConfig = None, trace=None,
+                return_hidden: bool = False):
         """trace -- список, в который дописывается residual stream ПОСЛЕ
         каждого блока (fp32 на CPU). Нужен для локализации ошибки по
         стеку: у RWKV ошибка входит в состояние и копится по длине, и
@@ -271,7 +289,12 @@ class RWKV7Ref(nn.Module):
         влияет: только .detach() уже посчитанного x."""
         if cfg is None:
             cfg = QuantConfig()
-        x = F.embedding(idx, q(self.emb_weight, "emb", cfg, "emb.weight"))
+        if self.cdtype == self.dtype:
+            x = F.embedding(idx, q(self.emb_weight, "emb", cfg, "emb.weight"))
+        else:
+            # таблица приводится ДО квантования (как в fp32-модели); транзиент
+            # 65536xC в типе счёта -- цена побитного совпадения с fp32
+            x = F.embedding(idx, self._q(self.emb_weight, "emb", cfg, "emb.weight"))
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln0_w.float(), self.ln0_b.float()).to(x.dtype)
 
         v_first = torch.empty_like(x)
@@ -285,6 +308,10 @@ class RWKV7Ref(nn.Module):
                 trace.append(x.detach().float().cpu())
 
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln_out_w.float(), self.ln_out_b.float()).to(x.dtype)
+        if return_hidden:
+            # состояние после ln_out: голову и KL вызывающий считает по окнам
+            # (логиты 8x511x65536 в fp32 -- 1.07 ГБ, measure их целиком не держит)
+            return x
         _rec("head.weight", x)
-        logits = x @ q(self.head_weight, "head", cfg, "head.weight").T
+        logits = x @ self._q(self.head_weight, "head", cfg, "head.weight").T
         return logits
