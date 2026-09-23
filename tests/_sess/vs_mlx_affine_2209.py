@@ -100,7 +100,7 @@ def record(name, h, head, byt, note):
         name, tot, by["en"], by["ru"], by["sr"], byt / 1e6, time.time() - t0, sw() - s0), flush=True)
 
 
-for bits in (6, 4):
+for bits in [int(b) for b in os.environ.get("VSMLX_BITS", "6,4").split(",") if b]:
     name = "mlx%d" % bits
     if name in res:
         continue

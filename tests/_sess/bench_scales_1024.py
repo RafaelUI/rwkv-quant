@@ -29,6 +29,15 @@ def swap():
 
 sw0 = swap()
 m = qm.QuantRWKV7(load_raw(PATH))
+AFF = os.environ.get("RWKVQ_AFFINE")   # "6,64": тяжёлые матрицы -> штатный MLX affine (23.09)
+if AFF:
+    # формат MLX-файлов MollySophia (int6, группа 64) В НАШЕМ движке: голова, r/k/v/o,
+    # ffn -- mx.quantize + quantized_matmul; LoRA и эмбеддинг остаются нашей раскладкой
+    sys.path.insert(0, "/Users/s/Develop/rwkv-quant/tests")
+    from eval_affine_inmem import to_affine
+    _b, _g = (int(x) for x in AFF.split(","))
+    to_affine(m, _b, _g); mx.clear_cache()
+    PATH = PATH + " [affine %d/%d]" % (_b, _g)
 IDX = mx.array(np.random.default_rng(0).integers(1, 60000, size=(1, T)).astype(np.int32))
 step = mx.compile(m.forward_stateful)
 
