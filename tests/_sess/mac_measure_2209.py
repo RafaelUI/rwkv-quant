@@ -8,6 +8,9 @@ CK, TAG = sys.argv[1], sys.argv[2]
 TOK = "/Users/s/Develop/rwkv-metal/rwkv_metal/tokenizer/rwkv_vocab_v20230424.txt"
 O = os.path.expanduser("~/Develop/WKV-kvant/sym_2209")
 sw = lambda: float(subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout.split("used = ")[1].split("M")[0])
+if os.environ.get("RWKVQ_QUOTA"):   # диагностика: "en:3,ru:3,sr:2"
+    ap.QUOTA = tuple((l, int(n)) for l, n in (x.split(":") for x in os.environ["RWKVQ_QUOTA"].split(",")))
+    print("КВОТА", ap.QUOTA, flush=True)
 s0 = sw(); t0 = time.time()
 _, sig = act_stats.collect(CK, TOK)
 cfg = copy.deepcopy(presets.COMPRESSION); cfg.act_stats_path = os.path.join(act_stats.CACHE_DIR, "act_%s.pt" % sig)

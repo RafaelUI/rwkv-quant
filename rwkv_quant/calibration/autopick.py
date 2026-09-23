@@ -287,7 +287,7 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
     from . import fake_quant
     from ..models.rwkv7_ref import RWKV7Ref
     corpus_path = corpus_path or A.CORPUS
-    n_windows = N_WINDOWS
+    n_windows = sum(n for _, n in QUOTA)
     sig = _signature(ckpt_path, cfg, corpus_path, n_windows, seq_len, tokenizer)
     path = _os.path.join(MEASURE_CACHE, "measure_%s.json" % sig)
     if cache and _os.path.exists(path):
@@ -296,7 +296,7 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
         return _json.load(open(path))
     device = device or _os.environ.get("RWKVQ_DEVICE") or ("mps" if torch.backends.mps.is_available() else "cpu")
     t0 = _time.time()
-    wins, langs = _pick_windows(A._encoder(tokenizer), corpus_path, seq_len)
+    wins, langs = _pick_windows(A._encoder(tokenizer), corpus_path, seq_len, QUOTA)   # квота -- на момент вызова
     M = RWKV7Ref(ckpt_path, device=device, dtype=torch.bfloat16, compute_dtype=torch.float32)
     data = torch.tensor(wins, dtype=torch.long)[:, :-1].contiguous()
     if int(data.max()) >= M.vocab_size:

@@ -321,10 +321,10 @@ elif MODE == "down":
             continue
         obj, attr, group, key = sel[0]
         b0 = base_bits(group, key)
-        if b0 >= 16 or b0 <= lo:
-            continue
+        if b0 >= 16:
+            continue    # 23.09: было «or b0 <= lo» -- при RWKVQ_DOWN_MIN=4 выбрасывало 4-битные плечи ВМЕСТЕ С БАЗОЙ
         e = dn.setdefault(arm, {"group": group, "params": getattr(obj, attr).numel(), "base_bits": b0, "kl": {}})
-        for b in range(b0, lo - 1, -1):
+        for b in range(b0, min(b0, lo) - 1, -1):   # база всегда, шаги вниз -- до lo
             if str(b) in e["kl"]:
                 continue
             t1 = time.time()
