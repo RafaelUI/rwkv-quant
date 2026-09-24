@@ -59,5 +59,28 @@ for t in (5, 6, 7):
     print("4 tau %d: вверх %d, вниз %d, байты %+.2f МБ, предск. KL %+.1f%%, нереализуемых %d"
           % (t, rep["n_up"], rep["n_down"], rep["bytes"] / 1e6, 100 * rep["kl_pred"], len(bad)))
     fails += bool(bad)
+# 5 (24.09, measure v3): KL по окнам и reweight
+n = len(m["langs"])
+ok = len(m["kl_all_w"]) == n and ap._mean(m["kl_all_w"]) == m["kl_all"] and all(
+    len(v) == n and ap._mean(v) == e["kl"][b] for e in m["arms"].values() for b, v in e["klw"].items())
+fails += not ok
+print("5 klw: %d окон у каждого плеча, среднее == kl побитно: %s" % (n, ok))
+cnt = {l: m["langs"].count(l) for l in set(m["langs"])}
+mp = ap.reweight(m, cnt)                      # веса = число окон -> то же измерение
+dev = max(abs(mp["arms"][k]["kl"][b] / m["arms"][k]["kl"][b] - 1) for k in m["arms"] for b in m["arms"][k]["kl"])
+same = ap.select(mp, 5)[0] == ap.select(m, 5)[0]
+fails += not (dev < 1e-12 and same)
+print("5 reweight(веса = число окон): макс. отн. отклонение KL %.1e, выбор tau5 совпал: %s" % (dev, same))
+m1 = ap.reweight(m, {"en": 1.0})               # только английский -> KL = среднее по окнам en
+en = [j for j, l in enumerate(m["langs"]) if l == "en"]
+k0 = next(iter(m["arms"]))
+exp = ap._mean([m["arms"][k0]["klw"][str(m["arms"][k0]["bits"])][j] for j in en])
+ok1 = abs(m1["arms"][k0]["kl"][str(m["arms"][k0]["bits"])] - exp) <= 1e-15 * max(1.0, exp)
+fails += not ok1
+print("5 reweight({en: 1}) == среднее по окнам en: %s" % ok1)
+try:
+    ap.reweight(m, {"xx": 1.0}); fails += 1; print("5 вес языка без окон НЕ отвергнут")
+except ValueError:
+    print("5 вес языка без окон отвергнут")
 print("ИТОГ:", "ЗЕЛЁНЫЙ" if not fails else "КРАСНЫЙ (%d)" % fails)
 sys.exit(1 if fails else 0)

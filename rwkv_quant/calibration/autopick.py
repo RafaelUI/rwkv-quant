@@ -123,6 +123,34 @@ def select_budget(measure, budget, down=True, tau_lo=1.0, tau_hi=100.0, iters=60
     r.update(tau=t, budget=budget, bytes_frac=r["bytes"] / FILE, feasible=True)
     return o, r
 
+
+def reweight(measure, weights):
+    """Измерение с ВЕСАМИ ЯЗЫКОВ в цели выбора (24.09): KL плеча и KL пресета заменяются на
+    sum_l w_l * (средний KL по окнам языка l). weights -- {язык: вес}, нормируются к сумме 1;
+    язык окон без веса получает 0; вес языка, которого нет в окнах, -- ошибка. Нужны KL по
+    окнам (measure v3). Результат -- обычное измерение: select/select_budget без изменений.
+    При весах, пропорциональных числу окон, совпадает с исходным (до округления)."""
+    import copy as _cp
+    if "kl_all_w" not in measure:
+        raise ValueError("в измерении нет KL по окнам (нужна версия >= 3): пересчитать measure")
+    langs = measure["langs"]
+    miss = [l for l in weights if l not in langs]
+    if miss:
+        raise ValueError("веса для языков без окон: %s (окна: %s)" % (miss, sorted(set(langs))))
+    tot = float(sum(weights.values()))
+    assert tot > 0
+    idx = {l: [j for j, x in enumerate(langs) if x == l] for l in weights}
+
+    def agg(xs):
+        return sum(weights[l] / tot * _mean([xs[j] for j in idx[l]]) for l in weights if weights[l])
+
+    out = _cp.deepcopy(measure)
+    out["kl_all"] = agg(measure["kl_all_w"])
+    for k, a in out["arms"].items():
+        a["kl"] = {b: agg(v) for b, v in a["klw"].items()}
+    out["weights"] = {l: weights[l] / tot for l in weights}
+    return out
+
 # =====================================================================================
 # ИЗМЕРЕНИЕ (measure). Прибор -- RWKV7Ref: веса хранятся в bf16, счёт в fp32 (численно
 # та же fp32-модель, гейт tests/test_ref_storage_dtype.py). Эталон -- тот же прибор в
@@ -140,7 +168,7 @@ import os as _os
 import re as _re
 import time as _time
 
-MEASURE_VERSION = 2
+MEASURE_VERSION = 3   # v3 (24.09): KL по каждому окну (klw, kl_all_w) -- для reweight
 MEASURE_CACHE = _os.path.expanduser("~/.cache/rwkv-quant/measure")
 SEQ_LEN = 512
 # КВОТА ОКОН ПО ЯЗЫКАМ -- это ЦЕЛЕВАЯ функция выбора (чью деградацию правило снижает).
@@ -305,16 +333,27 @@ class _Instrument:
             x = self.ffn(j, x)
         return self._ln(x, M.ln_out_w, M.ln_out_b)
 
-    def kl(self, h, h_ref, head=None):
-        """Средний по токенам KL(эталон || проба), окно за окном (логиты целиком не держатся)."""
+    def klw(self, h, h_ref, head=None):
+        """KL(эталон || проба), средний по токенам, ПО КАЖДОМУ окну (логиты целиком не держатся)."""
         torch = self.torch
         W = self.head32 if head is None else head
-        s = 0.0
+        out = []
         for j in range(h.shape[0]):
             lp = torch.log_softmax((h_ref[j] @ self.head32.T).to(self.kdt), -1)
             lq = torch.log_softmax((h[j] @ W.T).to(self.kdt), -1)
-            s += float((lp.exp() * (lp - lq)).sum(-1).mean())
-        return s / h.shape[0]
+            out.append(float((lp.exp() * (lp - lq)).sum(-1).mean()))
+        return out
+
+    def kl(self, h, h_ref, head=None):
+        """Среднее klw по окнам (тот же порядок суммирования, что до v3)."""
+        return _mean(self.klw(h, h_ref, head))
+
+
+def _mean(xs):
+    s = 0.0
+    for v in xs:
+        s += v
+    return s / len(xs)
 
 
 def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
@@ -373,8 +412,8 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
             setattr(obj, attr, quantized(obj, attr, group, key, bits))
             try:
                 if key == "head.weight":
-                    return I.kl(h_ref, h_ref, head=getattr(obj, attr))
-                return I.kl(start(), h_ref)
+                    return I.klw(h_ref, h_ref, head=getattr(obj, attr))
+                return I.klw(start(), h_ref)
             finally:
                 setattr(obj, attr, w)
 
@@ -383,10 +422,10 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
             b0 = _bits_of(cfg, group, key)
             if b0 >= 16:
                 return
-            e = arms[key] = dict(group=group, params=getattr(obj, attr).numel(), bits=b0, kl={})
-            e["kl"][str(b0)] = one(p, b0, start)
-            if key not in NO_DOWN and b0 - 1 >= MIN_REAL:
-                e["kl"][str(b0 - 1)] = one(p, b0 - 1, start)
+            e = arms[key] = dict(group=group, params=getattr(obj, attr).numel(), bits=b0, kl={}, klw={})
+            for b in [b0] + ([b0 - 1] if key not in NO_DOWN and b0 - 1 >= MIN_REAL else []):
+                e["klw"][str(b)] = one(p, b, start)
+                e["kl"][str(b)] = _mean(e["klw"][str(b)])
 
         record(by_layer["emb.weight"][0], lambda: I.run_from(0, "att", I.x0(), torch.empty_like(x)))
         record(by_layer["head.weight"][0], None)
@@ -410,7 +449,8 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
         resume_exact = bool(torch.equal(h_chk, h_ref))
         # KL всего конфига тем же прибором
         h_all = M.forward(data, cfg=cfg, return_hidden=True)
-        kl_all_cfg = I.kl(h_all, h_ref, head=M._q(M.head_weight, "head", cfg, "head.weight"))
+        kl_all_w = I.klw(h_all, h_ref, head=M._q(M.head_weight, "head", cfg, "head.weight"))
+        kl_all_cfg = _mean(kl_all_w)
     if not resume_exact:
         raise RuntimeError("послойный проход разошёлся с эталоном: прибор неисправен")
     if not (floor < 1e-9 and kl_all_cfg > 0 and all(v >= 0 for a in arms.values() for v in a["kl"].values())):
@@ -419,7 +459,7 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
     out = dict(version=MEASURE_VERSION, signature=sig, ckpt=_os.path.basename(ckpt_path),
                device=str(device), n_windows=n_windows, seq_len=seq_len, langs=langs, floor=floor,
                ckpt_sig=_ckpt_signature(ckpt_path),
-               kl_all=kl_all_cfg, file_bytes=file_bytes, arms=arms, seconds=round(_time.time() - t0, 1))
+               kl_all=kl_all_cfg, kl_all_w=kl_all_w, file_bytes=file_bytes, arms=arms, seconds=round(_time.time() - t0, 1))
     if cache:
         _os.makedirs(MEASURE_CACHE, exist_ok=True)
         _json.dump(out, open(path + ".tmp", "w"), indent=1)
