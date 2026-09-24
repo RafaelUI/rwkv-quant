@@ -26,6 +26,7 @@ DEV = "mps"
 sw = lambda: float(subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout.split("used = ")[1].split("M")[0])
 blob = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt"))
 data = blob["tokens"][:, :512][:, :-1].contiguous().to(DEV); langs = list(blob["lang"])
+tgt = blob["tokens"][:, 1:512].contiguous().to(DEV)   # следующие токены: для ppl (23.09)
 res = json.load(open(OUT)) if os.path.exists(OUT) else {}
 s0 = sw(); t0 = time.time()
 
@@ -45,12 +46,21 @@ del M; torch.mps.empty_cache()
 print("эталон %.0f с" % (time.time() - t0), flush=True)
 
 
-def kl_per(h, head):
+CE_REF = []
+
+
+def kl_per(h, head, extra=None):
+    """KL по окну; в extra -- CE по окну (для ppl) и доля совпадения top-1 с эталоном."""
     out = []
     with torch.no_grad():
         for j in range(h.shape[0]):
             lp = torch.log_softmax(h_ref[j] @ head_ref.T, -1); lq = torch.log_softmax(h[j] @ head.T, -1)
             out.append(float((lp.exp() * (lp - lq)).sum(-1).mean()))
+            if extra is not None:
+                extra.setdefault("ce", []).append(float(-lq.gather(-1, tgt[j][:, None]).mean()))
+                extra.setdefault("top1", []).append(float((lq.argmax(-1) == lp.argmax(-1)).float().mean()))
+                if len(CE_REF) < h.shape[0]:
+                    CE_REF.append(float(-lp.gather(-1, tgt[j][:, None]).mean()))
     return out
 
 
@@ -93,8 +103,12 @@ def mlx_arm(M, bits_main):
 
 
 def record(name, h, head, byt, note):
-    kl = kl_per(h, head); tot = float(np.mean(kl))
-    res[name] = dict(kl=kl, mean=tot, bytes=byt, note=note); json.dump(res, open(OUT, "w"), indent=1)
+    ex = {}; kl = kl_per(h, head, ex); tot = float(np.mean(kl))
+    ppl, ppl0 = float(np.exp(np.mean(ex["ce"]))), float(np.exp(np.mean(CE_REF)))
+    res[name] = dict(kl=kl, mean=tot, bytes=byt, note=note, ce=ex["ce"], ce_ref=CE_REF, top1=ex["top1"],
+                     ppl=ppl, ppl_ref=ppl0, dppl_pct=100 * (ppl / ppl0 - 1))
+    json.dump(res, open(OUT, "w"), indent=1)
+    print("%-22s ppl %.4f (эталон %.4f, %+.3f%%)  top-1 %.2f%%" % (name, ppl, ppl0, 100 * (ppl / ppl0 - 1), 100 * np.mean(ex["top1"])), flush=True)
     by = {g: float(np.mean([k for k, l in zip(kl, langs) if l == g])) for g in ("en", "ru", "sr")}
     print("%-22s KL %.5f  en %.5f ru %.5f sr %.5f  %8.1f МБ  (%.0f с, своп %+0.0f МБ)" % (
         name, tot, by["en"], by["ru"], by["sr"], byt / 1e6, time.time() - t0, sw() - s0), flush=True)
