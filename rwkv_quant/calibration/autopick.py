@@ -82,6 +82,47 @@ def select(measure, tau, down=True):
     return ovr, rep
 
 
+
+def select_budget(measure, budget, down=True, tau_lo=1.0, tau_hi=100.0, iters=60):
+    """Выбор при БЮДЖЕТЕ БАЙТ вместо цены (решение владельца 24.09: бюджет -- ДОЛЯ ФАЙЛА).
+    budget -- допустимое изменение байт файла долей от file_bytes (0.005 = +0.5%; 0 --
+    байт-нейтрально; отрицательный -- обязательная экономия).
+
+    select(tau) -- лагранжево решение при цене байта tau: вверх, где e >= tau, вниз, где
+    e < tau. Байты select(tau) не возрастают с tau (подъёмы -- префикс одной и той же жадной
+    последовательности, спуски -- растущее множество), и KL-выигрыш тоже. Поэтому лучший
+    выбор в бюджете -- select при НАИМЕНЬШЕМ tau, чьи байты <= бюджета: ищется бисекцией
+    по log tau. Если бюджет не достижим даже при tau_hi -- возвращается выбор при tau_hi
+    с rep["feasible"] = False (вызывающий решает); если достижим уже при tau_lo -- tau_lo.
+    -> (bits_overrides, отчёт select + tau, budget, bytes_frac, feasible)."""
+    import math
+    FILE = measure["file_bytes"]
+    lim = budget * FILE
+
+    def at(t):
+        o, r = select(measure, t, down=down)
+        return o, r
+
+    o, r = at(tau_lo)
+    if r["bytes"] <= lim:
+        best = (tau_lo, o, r)
+    else:
+        o_hi, r_hi = at(tau_hi)
+        if r_hi["bytes"] > lim:
+            r_hi.update(tau=tau_hi, budget=budget, bytes_frac=r_hi["bytes"] / FILE, feasible=False)
+            return o_hi, r_hi
+        lo, hi, best = math.log(tau_lo), math.log(tau_hi), (tau_hi, o_hi, r_hi)
+        for _ in range(iters):
+            mid = 0.5 * (lo + hi)
+            om, rm = at(math.exp(mid))
+            if rm["bytes"] <= lim:
+                hi, best = mid, (math.exp(mid), om, rm)
+            else:
+                lo = mid
+    t, o, r = best
+    r.update(tau=t, budget=budget, bytes_frac=r["bytes"] / FILE, feasible=True)
+    return o, r
+
 # =====================================================================================
 # ИЗМЕРЕНИЕ (measure). Прибор -- RWKV7Ref: веса хранятся в bf16, счёт в fp32 (численно
 # та же fp32-модель, гейт tests/test_ref_storage_dtype.py). Эталон -- тот же прибор в

@@ -1,0 +1,1210 @@
+{
+ "version": 2,
+ "signature": "e4bccc7ec2fedaee",
+ "ckpt": "rwkv7-g1j-1.5b-20260831-ctx16384.pth",
+ "device": "mps",
+ "n_windows": 8,
+ "seq_len": 512,
+ "langs": [
+  "en",
+  "en",
+  "en",
+  "ru",
+  "ru",
+  "ru",
+  "sr",
+  "sr"
+ ],
+ "floor": 0.0,
+ "ckpt_sig": "9108ff5a4ffcbf3f",
+ "kl_all": 0.0365672716870904,
+ "file_bytes": 984432640.0,
+ "arms": {
+  "emb.weight": {
+   "group": "emb",
+   "params": 134217728,
+   "bits": 6,
+   "kl": {
+    "6": 0.0002789592754197656
+   }
+  },
+  "head.weight": {
+   "group": "head",
+   "params": 134217728,
+   "bits": 5,
+   "kl": {
+    "5": 0.004666496242862195,
+    "4": 0.009425393538549542
+   }
+  },
+  "blocks.0.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.249343978950492e-05
+   }
+  },
+  "blocks.0.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 4.607364098774269e-05
+   }
+  },
+  "blocks.0.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0006255688222154276
+   }
+  },
+  "blocks.0.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00018716106433203095,
+    "4": 0.0007810253755451413
+   }
+  },
+  "blocks.0.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0004717283309219056
+   }
+  },
+  "blocks.1.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.851965352121624e-05
+   }
+  },
+  "blocks.1.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.8915753697874607e-05
+   }
+  },
+  "blocks.1.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.458273153635673e-05
+   }
+  },
+  "blocks.1.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0001279807756873197
+   }
+  },
+  "blocks.1.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00019441415497567505,
+    "4": 0.0007166530704125762
+   }
+  },
+  "blocks.1.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003647598805400776
+   }
+  },
+  "blocks.2.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 4.406437369652849e-05
+   }
+  },
+  "blocks.2.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 4.000332694431563e-05
+   }
+  },
+  "blocks.2.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00014489291515928926
+   }
+  },
+  "blocks.2.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00015051862374093616
+   }
+  },
+  "blocks.2.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.0001484198778598511,
+    "4": 0.0005923220251133898
+   }
+  },
+  "blocks.2.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003835647212326876
+   }
+  },
+  "blocks.3.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.945848738519999e-05
+   }
+  },
+  "blocks.3.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.429279121926811e-05
+   }
+  },
+  "blocks.3.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0001426621993232402
+   }
+  },
+  "blocks.3.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0001756955807650229
+   }
+  },
+  "blocks.3.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00014424457503992016,
+    "4": 0.000519993698617327
+   }
+  },
+  "blocks.3.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003337229745739023
+   }
+  },
+  "blocks.4.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.145304839970777e-05
+   }
+  },
+  "blocks.4.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.307503965923388e-05
+   }
+  },
+  "blocks.4.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00011296571665297961
+   }
+  },
+  "blocks.4.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0001438952785974834
+   }
+  },
+  "blocks.4.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00014500014367513359,
+    "4": 0.0005144075785210589
+   }
+  },
+  "blocks.4.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003365103475516662
+   }
+  },
+  "blocks.5.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 4.578178209158068e-05
+   }
+  },
+  "blocks.5.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.9632982179682585e-05
+   }
+  },
+  "blocks.5.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0001346581611869624
+   }
+  },
+  "blocks.5.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00015309407444874523
+   }
+  },
+  "blocks.5.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00015567159243801143,
+    "4": 0.0004943742060277145
+   }
+  },
+  "blocks.5.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003062635751120979
+   }
+  },
+  "blocks.6.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.0588098929438274e-05
+   }
+  },
+  "blocks.6.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 4.952582730766153e-05
+   }
+  },
+  "blocks.6.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0001547508636576822
+   }
+  },
+  "blocks.6.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00018675555838854052
+   }
+  },
+  "blocks.6.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00013317484444996808,
+    "4": 0.000469752871140372
+   }
+  },
+  "blocks.6.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003837533149635419
+   }
+  },
+  "blocks.7.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.1481325095228385e-05
+   }
+  },
+  "blocks.7.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 2.663352756826498e-05
+   }
+  },
+  "blocks.7.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00016406156191806076
+   }
+  },
+  "blocks.7.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00016244471589743625
+   }
+  },
+  "blocks.7.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00010726016535045346,
+    "4": 0.0003784365580941085
+   }
+  },
+  "blocks.7.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0004864968104811851
+   }
+  },
+  "blocks.8.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.788920366787352e-05
+   }
+  },
+  "blocks.8.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.6846579178018146e-05
+   }
+  },
+  "blocks.8.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0002848263266059803
+   }
+  },
+  "blocks.8.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0002339156526431907
+   }
+  },
+  "blocks.8.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 9.654039513407042e-05,
+    "4": 0.0002908649075834546
+   }
+  },
+  "blocks.8.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003274711089034099
+   }
+  },
+  "blocks.9.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.880924714394496e-05
+   }
+  },
+  "blocks.9.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.4920240977953654e-05
+   }
+  },
+  "blocks.9.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00010833657233888516
+   }
+  },
+  "blocks.9.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00011290255952189909
+   }
+  },
+  "blocks.9.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 8.304236416734057e-05,
+    "4": 0.0002613957531139022
+   }
+  },
+  "blocks.9.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003111165751761291
+   }
+  },
+  "blocks.10.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 2.9946844506412162e-05
+   }
+  },
+  "blocks.10.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 2.6473359639567207e-05
+   }
+  },
+  "blocks.10.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0001043284955812851
+   }
+  },
+  "blocks.10.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0001020837044052314
+   }
+  },
+  "blocks.10.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 8.032908090171986e-05,
+    "4": 0.00023317599880101625
+   }
+  },
+  "blocks.10.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003203814230801072
+   }
+  },
+  "blocks.11.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.373502750037005e-05
+   }
+  },
+  "blocks.11.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 2.7542647785594454e-05
+   }
+  },
+  "blocks.11.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00010759664019133197
+   }
+  },
+  "blocks.11.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00011065226226492086
+   }
+  },
+  "blocks.11.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 8.029599439396407e-05,
+    "4": 0.00024532305178581737
+   }
+  },
+  "blocks.11.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003212927513231989
+   }
+  },
+  "blocks.12.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 2.717423353715276e-05
+   }
+  },
+  "blocks.12.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 2.2592355435335776e-05
+   }
+  },
+  "blocks.12.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 9.734317973197903e-05
+   }
+  },
+  "blocks.12.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00010628161726344842
+   }
+  },
+  "blocks.12.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 9.219675939675653e-05,
+    "4": 0.00027598569613473956
+   }
+  },
+  "blocks.12.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.00037571677967207506
+   }
+  },
+  "blocks.13.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 4.510466169449501e-05
+   }
+  },
+  "blocks.13.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.682783881231444e-05
+   }
+  },
+  "blocks.13.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00014226378425519215
+   }
+  },
+  "blocks.13.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00016251427587121725
+   }
+  },
+  "blocks.13.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.0001122447574744001,
+    "4": 0.00033411896947654895
+   }
+  },
+  "blocks.13.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.00044016711399308406
+   }
+  },
+  "blocks.14.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.697059491969412e-05
+   }
+  },
+  "blocks.14.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 2.79444832358422e-05
+   }
+  },
+  "blocks.14.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00012328299271757714
+   }
+  },
+  "blocks.14.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 9.185721319227014e-05
+   }
+  },
+  "blocks.14.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00010684740846045315,
+    "4": 0.000322589239658555
+   }
+  },
+  "blocks.14.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.00037175823308643885
+   }
+  },
+  "blocks.15.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.8960676874921774e-05
+   }
+  },
+  "blocks.15.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.4837042903745896e-05
+   }
+  },
+  "blocks.15.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00010443828614370432
+   }
+  },
+  "blocks.15.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00015969970445439685
+   }
+  },
+  "blocks.15.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00011700432332872879,
+    "4": 0.0003838590782834217
+   }
+  },
+  "blocks.15.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0004537994464044459
+   }
+  },
+  "blocks.16.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.798813299406902e-05
+   }
+  },
+  "blocks.16.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 3.668137969725649e-05
+   }
+  },
+  "blocks.16.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00015261946282407735
+   }
+  },
+  "blocks.16.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00014483239465334918
+   }
+  },
+  "blocks.16.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00011927066498174099,
+    "4": 0.0003855519462376833
+   }
+  },
+  "blocks.16.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003949412966903765
+   }
+  },
+  "blocks.17.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 7.003391556281713e-05
+   }
+  },
+  "blocks.17.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 4.3352947159291944e-05
+   }
+  },
+  "blocks.17.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00018100533088727389
+   }
+  },
+  "blocks.17.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00019993536261608824
+   }
+  },
+  "blocks.17.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00014566161007678602,
+    "4": 0.00047538008220726624
+   }
+  },
+  "blocks.17.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.00045042804413242266
+   }
+  },
+  "blocks.18.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 7.934724271763116e-05
+   }
+  },
+  "blocks.18.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 6.460106260419707e-05
+   }
+  },
+  "blocks.18.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00030277587575255893
+   }
+  },
+  "blocks.18.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00027399544887884986
+   }
+  },
+  "blocks.18.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.0001972790287254611,
+    "4": 0.0006344061330310069
+   }
+  },
+  "blocks.18.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0007807409638189711
+   }
+  },
+  "blocks.19.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 7.66310276958393e-05
+   }
+  },
+  "blocks.19.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.518572470464278e-05
+   }
+  },
+  "blocks.19.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00024063559794740286
+   }
+  },
+  "blocks.19.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0004080146136402618
+   }
+  },
+  "blocks.19.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.0002070420978270704,
+    "4": 0.0007417907072522212
+   }
+  },
+  "blocks.19.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0007556056152679957
+   }
+  },
+  "blocks.20.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 8.099266869976418e-05
+   }
+  },
+  "blocks.20.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.790704904029553e-05
+   }
+  },
+  "blocks.20.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00025452140289417
+   }
+  },
+  "blocks.20.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003891510405082954
+   }
+  },
+  "blocks.20.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.00023781835443514865,
+    "4": 0.0008129158486553933
+   }
+  },
+  "blocks.20.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0009341585318907164
+   }
+  },
+  "blocks.21.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00010052238394564483
+   }
+  },
+  "blocks.21.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 7.121736166482151e-05
+   }
+  },
+  "blocks.21.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0003037980477529345
+   }
+  },
+  "blocks.21.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00039020018448354676
+   }
+  },
+  "blocks.21.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.0002586991768112057,
+    "4": 0.000830550750833936
+   }
+  },
+  "blocks.21.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0007728171549388207
+   }
+  },
+  "blocks.22.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 6.829125118201773e-05
+   }
+  },
+  "blocks.22.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 5.80957350848621e-05
+   }
+  },
+  "blocks.22.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00022232256742427126
+   }
+  },
+  "blocks.22.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00027937466438743286
+   }
+  },
+  "blocks.22.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.0002985920236824313,
+    "4": 0.0009675567562226206
+   }
+  },
+  "blocks.22.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.0010836273941094987
+   }
+  },
+  "blocks.23.att.receptance.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.00013299702459335094
+   }
+  },
+  "blocks.23.att.key.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 9.148623621513252e-05
+   }
+  },
+  "blocks.23.att.value.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0004998509066354018
+   }
+  },
+  "blocks.23.att.output.weight": {
+   "group": "proj",
+   "params": 4194304,
+   "bits": 4,
+   "kl": {
+    "4": 0.0017860380903584883
+   }
+  },
+  "blocks.23.ffn.key.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 5,
+   "kl": {
+    "5": 0.0009449828212382272,
+    "4": 0.002985411963891238
+   }
+  },
+  "blocks.23.ffn.value.weight": {
+   "group": "cmix",
+   "params": 16777216,
+   "bits": 4,
+   "kl": {
+    "4": 0.002453286331729032
+   }
+  }
+ },
+ "seconds": 1951.9
+}
