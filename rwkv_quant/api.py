@@ -24,7 +24,9 @@ from .formats import save, quantize_file  # noqa: F401 (save -- публичны
 from .calibration import act_stats as act_stats_mod
 def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
              config: QuantConfig = None, real_gw: bool = True,
-             verbose: bool = True, tokenizer=None, act_stats="auto"):
+             verbose: bool = True, tokenizer=None, act_stats="auto",
+             autopick: bool = False, autopick_budget: float = 0.005,
+             measure="auto", device: str = None):
     """
     Quick-start: quantize(ckpt, out, tokenizer=tok, preset="compression")
     Advanced:    quantize(ckpt, out, tokenizer=tok, config=QuantConfig(proj=4, ...))
@@ -52,6 +54,18 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         остаётся на вызывающем);
       None -- ОСОЗНАННО без AW. Измеренная цена: KL(bf16 || квант) хуже на
         38%, top-1 на 0.78 п.п. (NEXT_SESSION, раздел 9).
+
+    autopick (24.09, по умолчанию выключен): перераспределить биты по матрицам по
+      измерению чувствительности (calibration.autopick): подъёмы, где байт окупается
+      сильнее, спуски (>= 4 бит), где слабее, в пределах бюджета autopick_budget --
+      ДОЛИ ФАЙЛА (0.005 = +0.5%; 0 -- байт-нейтрально). g1j 1.5B, +0.5%: KL на
+      отложенном тексте -16%, Δppl +4.15% -> +3.13%, на отложенном коде -13.5%.
+      Цель -- широкая квота окон с весами пропорционально окнам (autopick.QUOTA).
+    measure: "auto" -- измерить здесь (кеш ~/.cache/rwkv-quant/measure; ~1 ч на 1.5B
+      на M4, линейно по числу окон; нужна плотная модель в bf16 на device) или путь к
+      JSON готового измерения (перенос с машины с большей памятью, как imatrix): чужой
+      чекпоинт -- отказ, иная подпись конфига/корпуса -- предупреждение.
+    device: для измерения ("mps"/"cuda"/"cpu"; по умолчанию RWKVQ_DEVICE или mps/cpu).
     """
     if config is None:
         if preset not in PRESETS:
@@ -87,6 +101,11 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
             raise FileNotFoundError("act_stats=%r не существует" % act_stats)
         config.act_stats_path = act_stats
 
+    ap_meta = None
+    if autopick:
+        ap_meta = _autopick(checkpoint_path, config, tokenizer, autopick_budget,
+                            measure, device, verbose)
+
     # В манифест едет ОПИСАНИЕ калибровки, а не только имя словаря: файл
     # должен сам отвечать на вопрос "чем это калибровалось".
     tok_label = tokenizer if isinstance(tokenizer, str) else (
@@ -100,7 +119,46 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     # всю модель в bf16, 5.9 ГБ на 2.9B), потом грузила state_dict ЕЩЁ
     # РАЗ целиком -- на 16 ГБ это давало пик 9-12 ГБ и своп.
     return quantize_file(checkpoint_path, output_path, config,
-                         real_gw=real_gw, verbose=verbose, tokenizer=tok_label)
+                         real_gw=real_gw, verbose=verbose, tokenizer=tok_label,
+                         autopick=ap_meta)
+
+
+def _autopick(ckpt, config, tokenizer, budget, measure, device, verbose):
+    """Измерение (или перенесённое) -> select_budget -> bits_overrides ПЕРВЫМИ в config
+    (подстрока, первое побеждает). Мутирует config (это уже копия). -> метаданные."""
+    import json
+    from .calibration import autopick as ap
+    needs_aw = any(str(m).endswith("_aw") for m in (config.group_scale_mode or {}).values())
+    if needs_aw and not config.act_stats_path:
+        raise ValueError("autopick с AW-пресетом требует act_stats (измерение без статистики "
+                         "мерило бы вырожденный квантователь)")
+    if measure == "auto":
+        m = ap.measure(ckpt, config, tokenizer, device=device, verbose=verbose)
+    else:
+        m = json.load(open(measure))
+        if m.get("ckpt_sig") != ap._ckpt_signature(ckpt):
+            raise ValueError("измерение %s -- от другого чекпоинта (ckpt_sig %s)"
+                             % (measure, m.get("ckpt_sig")))
+        from .calibration import act_stats as A
+        exp = ap._signature(ckpt, config, A.CORPUS, m.get("n_windows", ap.N_WINDOWS),
+                            m.get("seq_len", ap.SEQ_LEN), tokenizer)
+        if m.get("signature") != exp and verbose:
+            print("[autopick] ВНИМАНИЕ: подпись перенесённого измерения %s не равна здешней %s "
+                  "(другие AW-статистика/конфиг/корпус/квота или устройство сборки статистики) "
+                  "-- выбор берётся как есть" % (m.get("signature"), exp))
+    ovr, rep = ap.select_budget(m, budget)
+    if not rep["feasible"] and verbose:
+        print("[autopick] бюджет %+.2f%% недостижим: взят самый дешёвый выбор (%+.2f%%)"
+              % (100 * budget, 100 * rep["bytes_frac"]))
+    config.bits_overrides = dict(ovr, **(config.bits_overrides or {}))
+    if verbose:
+        print("[autopick] бюджет %+.2f%%: tau %.3f, вверх %d, вниз %d, байты %+.2f МБ (%+.3f%%), "
+              "предсказание KL %+.1f%%" % (100 * budget, rep["tau"], rep["n_up"], rep["n_down"],
+                                          rep["bytes"] / 1e6, 100 * rep["bytes_frac"], 100 * rep["kl_pred"]))
+    return dict(measure_signature=m.get("signature"), measure_version=m.get("version"),
+                measure_device=m.get("device"), langs=m.get("langs"), budget=budget,
+                tau=rep["tau"], feasible=rep["feasible"], n_up=rep["n_up"], n_down=rep["n_down"],
+                bytes_frac=rep["bytes_frac"], kl_pred=rep["kl_pred"], overrides=ovr)
 
 
 def _load_corpus(path, device, n_seq=None, seq_len=None):

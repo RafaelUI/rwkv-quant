@@ -80,7 +80,7 @@ def _n_blocks(qt) -> int:
 
 
 def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str,
-               config: QuantConfig = None, tokenizer: str = None):
+               config: QuantConfig = None, tokenizer: str = None, autopick: dict = None):
     """QuantizedCheckpoint -> .rwkvq в контейнере safetensors.
 
     Плоские имена "<ключ>::<поле>", метаданные -- одним JSON в
@@ -144,6 +144,10 @@ def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str,
         else getattr(ckpt, "tokenizer", None),
         "tensors": manifest_t,
     }
+    if autopick is not None:
+        # 24.09: происхождение битовой раскладки autopick (подпись измерения, бюджет, tau).
+        # Ключ пишется ТОЛЬКО при autopick: файлы без него побайтно те же, что раньше.
+        manifest["autopick"] = autopick
     from safetensors.torch import save_file
     save_file(tensors, output_path, metadata={"rwkvq": json.dumps(manifest)})
     return ckpt
@@ -520,7 +524,7 @@ def detect_meta(checkpoint_path: str, state_dict) -> dict:
 
 def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
                   real_gw: bool = True, verbose: bool = True,
-                  tokenizer: str = None):
+                  tokenizer: str = None, autopick: dict = None):
     """Потоковое квантование чекпоинта: .pth/.safetensors -> .rwkvq.
 
     Отличие от save(): state_dict не держится в памяти целиком. Тензоры
@@ -565,7 +569,7 @@ def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
 
     ckpt = QuantizedCheckpoint(tensors=tensors, config_repr=repr(config),
                                config=config, tokenizer=tokenizer, **meta)
-    save_rwkvq(ckpt, output_path)
+    save_rwkvq(ckpt, output_path, autopick=autopick)
     if verbose:
         print(f"-> {output_path} "
               f"({os.path.getsize(output_path)/1e6:.1f} МБ)", flush=True)
