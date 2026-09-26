@@ -62,6 +62,11 @@ class RWKV7Ref(nn.Module):
         (апкаст bf16->fp32 точен, чекпоинты bf16) при вдвое меньшей памяти весов:
         матрица приводится к типу счёта в момент использования (22.09, для measure)."""
         super().__init__()
+        # 24.09: device -- строка или список устройств (разнесение слоёв по картам: 13.3B в bf16
+        # не входит в одну 24 ГБ). Слой i -> devices[i * k // n_layer]; emb/ln0 -- на первом,
+        # ln_out/голова -- на последнем; forward переносит поток на границах. k=1 -- как было.
+        self.devices = list(device) if isinstance(device, (list, tuple)) else [device]
+        device = self.devices[0]
         self.device = device
         self.dtype = dtype
         self.cdtype = compute_dtype if compute_dtype is not None else dtype
@@ -105,8 +110,11 @@ class RWKV7Ref(nn.Module):
         print(f"[RWKV7Ref] naming={naming} n_layer={n_layer} n_embd={n_embd} "
               f"n_head={self.n_head} head_size={head_size} vocab={vocab_size}")
 
+        _cur = [device]
+        self.layer_dev = [self.devices[i * len(self.devices) // n_layer] for i in range(n_layer)]
+
         def get(name):
-            return sd[name].to(device=device, dtype=dtype)
+            return sd[name].to(device=_cur[0], dtype=dtype)
 
         if naming == "custom":
             self.emb_weight = get("emb.weight")
@@ -119,10 +127,16 @@ class RWKV7Ref(nn.Module):
             self.ln0_w, self.ln0_b = get("blocks.0.ln0.weight"), get("blocks.0.ln0.bias")
             self.ln_out_w, self.ln_out_b = get("ln_out.weight"), get("ln_out.bias")
 
+        if len(self.devices) > 1:
+            last = self.devices[-1]
+            self.head_weight = self.head_weight.to(last)
+            self.ln_out_w, self.ln_out_b = self.ln_out_w.to(last), self.ln_out_b.to(last)
+
         self.ln1_w, self.ln1_b, self.ln2_w, self.ln2_b = [], [], [], []
         self.tmix, self.cmix = [], []
 
         for i in range(self.n_layer):
+            _cur[0] = self.layer_dev[i]
             p = f"blocks.{i}."
             self.ln1_w.append(get(p + "ln1.weight")); self.ln1_b.append(get(p + "ln1.bias"))
             self.ln2_w.append(get(p + "ln2.weight")); self.ln2_b.append(get(p + "ln2.bias"))
@@ -298,7 +312,10 @@ class RWKV7Ref(nn.Module):
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln0_w.float(), self.ln0_b.float()).to(x.dtype)
 
         v_first = torch.empty_like(x)
+        multi = len(self.devices) > 1
         for i in range(self.n_layer):
+            if multi:
+                x, v_first = x.to(self.layer_dev[i]), v_first.to(self.layer_dev[i])
             xn = F.layer_norm(x.float(), (self.n_embd,), self.ln1_w[i].float(), self.ln1_b[i].float()).to(x.dtype)
             att, v_first = self._tmix_forward(xn, v_first, self.tmix[i], i, cfg)
             x = x + att
@@ -307,6 +324,8 @@ class RWKV7Ref(nn.Module):
             if trace is not None:
                 trace.append(x.detach().float().cpu())
 
+        if multi:
+            x = x.to(self.devices[-1])
         x = F.layer_norm(x.float(), (self.n_embd,), self.ln_out_w.float(), self.ln_out_b.float()).to(x.dtype)
         if return_hidden:
             # состояние после ln_out: голову и KL вызывающий считает по окнам

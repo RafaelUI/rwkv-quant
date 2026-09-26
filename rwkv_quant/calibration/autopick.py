@@ -316,11 +316,13 @@ class _Instrument:
 
     def att(self, i, x, vf):
         M = self.M
+        x, vf = x.to(M.layer_dev[i]), vf.to(M.layer_dev[i])   # разнесение по картам (no-op на одной)
         a, vf = M._tmix_forward(self._ln(x, M.ln1_w[i], M.ln1_b[i]), vf, M.tmix[i], i, self.C16)
         return x + a, vf
 
     def ffn(self, i, x):
         M = self.M
+        x = x.to(M.layer_dev[i])
         return x + M._cmix_forward(self._ln(x, M.ln2_w[i], M.ln2_b[i]), M.cmix[i], self.C16, i)
 
     def run_from(self, i, stage, x, vf):
@@ -333,7 +335,7 @@ class _Instrument:
         for j in range(i + 1, M.n_layer):
             x, vf = self.att(j, x, vf)
             x = self.ffn(j, x)
-        return self._ln(x, M.ln_out_w, M.ln_out_b)
+        return self._ln(x.to(M.devices[-1]), M.ln_out_w, M.ln_out_b)
 
     def klw(self, h, h_ref, head=None):
         """KL(эталон || проба), средний по токенам, ПО КАЖДОМУ окну (логиты целиком не держатся)."""
@@ -379,11 +381,13 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
     device = device or _os.environ.get("RWKVQ_DEVICE") or ("mps" if torch.backends.mps.is_available() else "cpu")
     t0 = _time.time()
     wins, langs = _pick_windows(A._encoder(tokenizer), corpus_path, seq_len, QUOTA)   # квота -- на момент вызова
-    M = RWKV7Ref(ckpt_path, device=device, dtype=torch.bfloat16, compute_dtype=torch.float32)
+    # "cuda:1,cuda:2" -- слои разнесены по картам (24.09); данные -- на первой
+    devs = device.split(",") if isinstance(device, str) and "," in device else device
+    M = RWKV7Ref(ckpt_path, device=devs, dtype=torch.bfloat16, compute_dtype=torch.float32)
     data = torch.tensor(wins, dtype=torch.long)[:, :-1].contiguous()
     if int(data.max()) >= M.vocab_size:
         raise ValueError("токенизатор не от этого чекпоинта: id %d при vocab %d" % (int(data.max()), M.vocab_size))
-    data = data.to(device)
+    data = data.to(M.devices[0])
     I = _Instrument(M, data)
     pts = _points(M)
     file_bytes = 0.0
