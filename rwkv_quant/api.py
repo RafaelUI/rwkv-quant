@@ -25,7 +25,7 @@ from .calibration import act_stats as act_stats_mod
 def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
              config: QuantConfig = None, real_gw: bool = True,
              verbose: bool = True, tokenizer=None, act_stats="auto",
-             autopick: bool = False, autopick_budget: float = 0.005,
+             autopick=None, autopick_budget: float = 0.005,
              measure="auto", device: str = None):
     """
     Quick-start: quantize(ckpt, out, tokenizer=tok, preset="compression")
@@ -55,7 +55,11 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
       None -- ОСОЗНАННО без AW. Измеренная цена: KL(bf16 || квант) хуже на
         38%, top-1 на 0.78 п.п. (NEXT_SESSION, раздел 9).
 
-    autopick (24.09, по умолчанию выключен): перераспределить биты по матрицам по
+    autopick (24.09): None (умолчание) -- ВКЛЮЧЁН для preset="compression" без своего
+      config (решение владельца 24.09; проверен только там), иначе выключен; при неявном
+      включении пропускается с предупреждением, если плотная bf16-модель не влезает в
+      половину памяти устройства (измерению нужна плотная модель). True/False -- явно.
+      Суть: перераспределить биты по матрицам по
       измерению чувствительности (calibration.autopick): подъёмы, где байт окупается
       сильнее, спуски (>= 4 бит), где слабее, в пределах бюджета autopick_budget --
       ДОЛИ ФАЙЛА (0.005 = +0.5%; 0 -- байт-нейтрально). g1j 1.5B, +0.5%: KL на
@@ -67,6 +71,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
       чекпоинт -- отказ, иная подпись конфига/корпуса -- предупреждение.
     device: для измерения ("mps"/"cuda"/"cpu"; по умолчанию RWKVQ_DEVICE или mps/cpu).
     """
+    _user_config = config is not None
     if config is None:
         if preset not in PRESETS:
             raise ValueError(f"unknown preset {preset!r}, choose from {list(PRESETS)}")
@@ -102,6 +107,14 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         config.act_stats_path = act_stats
 
     ap_meta = None
+    implicit = autopick is None
+    if implicit:
+        autopick = (preset == "compression" and not _user_config)
+    if autopick and implicit and not _fits_for_measure(checkpoint_path, device):
+        autopick = False
+        if verbose:
+            print("[autopick] пропущен: плотная bf16-модель больше половины памяти устройства; "
+                  "measure -- на машине с большей памятью, затем quantize(measure=путь)")
     if autopick:
         ap_meta = _autopick(checkpoint_path, config, tokenizer, autopick_budget,
                             measure, device, verbose)
@@ -121,6 +134,28 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     return quantize_file(checkpoint_path, output_path, config,
                          real_gw=real_gw, verbose=verbose, tokenizer=tok_label,
                          autopick=ap_meta)
+
+
+# Доля памяти устройства под плотную bf16-модель при НЕЯВНОМ autopick. 0.3 осторожно: 1.5B
+# (3 ГБ) на 16 ГБ идёт со свопом +0.4 ГБ за measure (24.09); 2.9B (5.8 ГБ) на 16 ГБ не
+# проверялся -- неявно не запускается, явный autopick=True -- на ответственности вызывающего.
+FIT_FRACTION = 0.3
+
+
+def _fits_for_measure(ckpt, device):
+    """Грубо: bf16-копия (2 байта на параметр ~ размер bf16/fp16 .pth) <= FIT_FRACTION памяти
+    устройства (cuda -- память карты, иначе -- физическая память)."""
+    try:
+        need = os.path.getsize(ckpt) if not os.path.isdir(ckpt) else sum(
+            os.path.getsize(os.path.join(ckpt, f)) for f in os.listdir(ckpt))
+        dev = device or os.environ.get("RWKVQ_DEVICE", "")
+        if dev.startswith("cuda") and torch.cuda.is_available():
+            have = torch.cuda.get_device_properties(0).total_memory
+        else:
+            have = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        return need <= FIT_FRACTION * have
+    except (OSError, ValueError, AttributeError):
+        return True
 
 
 def _autopick(ckpt, config, tokenizer, budget, measure, device, verbose):

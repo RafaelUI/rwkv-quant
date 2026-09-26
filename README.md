@@ -464,6 +464,20 @@ quantize("model.pth", "model.rwkvq", preset="reduction", tokenizer=tok)
 quantize("model.pth", "model.rwkvq", preset="compression", tokenizer=tok)
 ```
 
+With `preset="compression"`, `quantize()` also runs **autopick** by default:
+it measures how much each matrix's quantization error costs this particular
+checkpoint and moves bits to where a byte buys the most (up where it pays,
+down to no fewer than 4 bits where it does not), within a size budget of
++0.5% of the file (`autopick_budget`, a fraction; `0` keeps the size
+unchanged). On RWKV-7 g1j 1.5B this cuts KL to the bf16 model by 16% on
+held-out text and 13.5% on held-out code, perplexity gap +4.15% -> +3.13%.
+The measurement needs the dense model in memory and takes about an hour for
+1.5B on an M4 (linear in model depth x windows; cached under
+`~/.cache/rwkv-quant/measure`). If the dense model would take more than 30%
+of the device memory, autopick is skipped with a notice: measure on a bigger
+machine and pass the JSON with `measure="path/to/measure_<sig>.json"`.
+`autopick=False` turns it off; the choice is recorded in the file manifest.
+
 `tokenizer` is required, and not for metadata. Both presets use
 activation-weighted (AW) scale search: the scale for each group is chosen
 by an error weighted with the mean square activation of the input

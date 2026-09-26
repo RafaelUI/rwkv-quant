@@ -53,7 +53,7 @@ check("намерение пресетов", COMPRESSION.runtime_fast_ln is True
 
 with tempfile.TemporaryDirectory() as d:
     f1 = os.path.join(d, "c.rwkvq")
-    quantize(CK, f1, preset="compression", tokenizer=TOK, verbose=False)
+    quantize(CK, f1, preset="compression", tokenizer=TOK, verbose=False, autopick=False)
     check("1 compression: манифест", manifest_runtime(f1) == {"fast_ln": True}, manifest_runtime(f1))
     check("1 compression: рантайм", model(f1) == (True, "манифест"), model(f1))
 

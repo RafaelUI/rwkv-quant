@@ -3,7 +3,9 @@
   2  тензоры вне выбора -- ПОБИТНО те же, что в обычном файле; в выборе -- ровно выбранная битность;
   3  размер: прирост к обычному файлу <= бюджет + 0.3% (модель байт select против реального файла);
   4  measure=путь к готовому JSON -> файл побитно тот же, что при measure="auto";
-  5  JSON от другого чекпоинта -> отказ (ValueError).
+  5  JSON от другого чекпоинта -> отказ (ValueError);
+  6  умолчание (autopick не задан) для preset="compression" -> autopick ВКЛЮЧЁН, файл побитно
+     тот же, что при autopick=True; для preset="reduction" -> выключен.
     python tests/test_quantize_autopick.py"""
 import hashlib, json, os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,7 +37,7 @@ def blobs(p):
     return {k: v.hexdigest() for k, v in out.items()}
 
 P, A, A2 = T + "/plain.rwkvq", T + "/auto.rwkvq", T + "/auto_json.rwkvq"
-quantize(CK, P, preset="compression", tokenizer=TOK, verbose=False)
+quantize(CK, P, preset="compression", tokenizer=TOK, verbose=False, autopick=False)
 quantize(CK, A, preset="compression", tokenizer=TOK, autopick=True, autopick_budget=B, verbose=True)
 mp, ma = man(P), man(A)
 ov = ma.get("autopick", {}).get("overrides", {})
@@ -62,5 +64,11 @@ try:
     check("5 чужой чекпоинт отвергнут", False)
 except ValueError as e:
     check("5 чужой чекпоинт отвергнут", True, str(e)[:60])
+D = T + "/default.rwkvq"
+quantize(CK, D, preset="compression", tokenizer=TOK, verbose=False)
+check("6 compression: autopick по умолчанию включён", open(A, "rb").read() == open(D, "rb").read())
+R = T + "/red.rwkvq"
+quantize(CK, R, preset="reduction", tokenizer=TOK, verbose=False)
+check("6 reduction: autopick по умолчанию выключен", "autopick" not in man(R))
 print("ИТОГ:", "ЗЕЛЁНЫЙ" if fails == 0 else "КРАСНЫЙ (%d)" % fails, flush=True)
 sys.exit(1 if fails else 0)
