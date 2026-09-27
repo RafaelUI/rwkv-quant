@@ -283,6 +283,13 @@ def _gw_one(w: torch.Tensor, bits: int, gs: int,
         mmax = 2 ** (sb_bits - 1) - 1                # signed для min
         dm = (msb.abs().amax(dim=2, keepdim=True) / mmax).clamp_min(1e-12).half().float()
         qm = torch.clamp(torch.round(msb / dm), -mmax, mmax)
+        # 28.09: ТОЧНО НУЛЕВОЙ суперблок (все min == 0) при dm, ушедшем в half-underflow
+        # (1e-12 -> 0 в fp16), даёт msb/dm = 0/0 = NaN, а clamp NaN не лечит: деквант
+        # всего суперблока -- NaN, в файл уходит NaN, приведённый к int8. На исходных
+        # чекпоинтах не случалось (почти мёртвые строки g1j 1.5B крошечные, но не нулевые:
+        # ±inf обрезается clamp), зато GPTQ обнуляет их точно. Нулевой суперблок -> qm 0,
+        # деквант 0. Без NaN -- побитно прежнее (gw_zero_sb_freeze_2809, 125 записей).
+        qm = torch.nan_to_num(qm, nan=0.0)
         mn_q = (qm * dm).view(OUT, -1, 1)[:, :nb + pad_b][:, :nb]
         # fp16-раунд-трип может занулить scale у (почти) константных
         # блоков (qs*d < 6e-8 -> half underflow) -> 0/0 = NaN в кодах.

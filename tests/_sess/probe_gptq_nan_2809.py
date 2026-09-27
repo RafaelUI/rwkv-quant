@@ -224,7 +224,31 @@ with torch.no_grad():
         x, vf = att_pass(i, x, vf)
         H = collect([p + "ffn.key.weight"], lambda: ffn_pass(i, x))
         do(c, "key", p + "ffn.key.weight", "cmix", H[p + "ffn.key.weight"])
-        H = collect([p + "ffn.value.weight"], lambda: ffn_pass(i, x))
+        try:
+            H = collect([p + "ffn.value.weight"], lambda: ffn_pass(i, x))
+        except SystemExit:
+            kk = p + "ffn.key.weight"
+            Qk = c.key
+            Wq = M._q(c.key, "cmix", cseq(), kk)
+            from rwkv_quant.calibration import fake_quant as FQ
+            bq = None
+            for pat, b in cseq().bits_overrides.items():
+                if pat in kk:
+                    bq = b; break
+            print("ДИАГ %s: done=%s, биты в cseq()=%s, Q конечен %s, Wq конечен %s, Wq==Q %s, нечисел в Wq %d, строк %d" % (
+                kk, done.get(kk), bq, bool(torch.isfinite(Qk).all()), bool(torch.isfinite(Wq).all()), bool(torch.equal(Wq, Qk)),
+                int((~torch.isfinite(Wq)).sum()), int((~torch.isfinite(Wq)).any(1).sum())), flush=True)
+            rows = (~torch.isfinite(Wq)).any(1).nonzero().flatten()
+            print("  NaN-строки Wq (первые 12):", rows[:12].tolist(), flush=True)
+            if rows.numel():
+                r0 = int(rows[0]); bad = (~torch.isfinite(Wq[r0])).nonzero().flatten()
+                sb0 = int(bad[0]) // 256
+                seg = Qk[r0, sb0 * 256:(sb0 + 1) * 256]
+                print("  строка %d, суперблок %d: нечисел %d; Q в суперблоке: уникальных %d, min %.3g max %.3g, размах по группам 32: %s" % (
+                    r0, sb0, bad.numel(), int(seg.unique().numel()), float(seg.min()), float(seg.max()),
+                    ["%.2g" % float(g.max() - g.min()) for g in seg.view(8, 32)]), flush=True)
+            torch.save(dict(key=kk, Q=Qk.cpu(), Wq=Wq.cpu(), ex2=stats.get(kk)), "/tmp/gptq_nan_key.pt")
+            raise
         do(c, "value", p + "ffn.value.weight", "cmix", H[p + "ffn.value.weight"])
         x = ffn_pass(i, x)
         print("[gptq] слой %d/%d, %.0f с" % (i + 1, M.n_layer, time.time() - tg), flush=True)

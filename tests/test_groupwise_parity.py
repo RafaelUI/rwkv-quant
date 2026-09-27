@@ -64,7 +64,13 @@ def test_golden():
     seen, bad = 0, []
     for name, t in golden.iter_results(FNS, sd):
         h = golden.digest(t)
+        # 28.09: хеш охраняет ПОВЕДЕНИЕ, а не правильность -- эталон synth::degenerate
+        # (нулевая строка) был снят с NaN в asym_sb6, и гейт полгода охранял NaN.
+        # Конечность -- отдельное утверждение, независимое от эталона.
+        finite = (not t.is_floating_point()) or bool(torch.isfinite(t).all())
         del t                       # ключевое: выход не переживает итерацию
+        if not finite:
+            bad.append((name, "нечисло в выходе"))
         seen += 1
         if name not in ref:
             bad.append((name, "нет в эталоне"))
