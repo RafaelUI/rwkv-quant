@@ -275,6 +275,7 @@ class RWKV7Ref(nn.Module):
         w = torch.exp(-torch.exp(w.view(B, T, H, N).float()))
         out = torch.zeros((B, T, H, N), device=r.device, dtype=torch.float)
         state = torch.zeros((B, H, N, N), device=r.device, dtype=torch.float)
+        mps_sync = r.device.type == "mps"
         for tt in range(T):
             kk = k[:, tt, :].view(B, H, 1, N)
             rr = r[:, tt, :].view(B, H, N, 1)
@@ -283,6 +284,12 @@ class RWKV7Ref(nn.Module):
             bb = b[:, tt, :].view(B, H, 1, N)
             state = state * w[:, tt, :, None, :] + state @ aa @ bb + vv @ kk
             out[:, tt, :] = (state @ rr).view(B, H, N)
+            # 27.09: на MPS цикл по T без синхронизаций копит ~5 ядер/шаг в одном
+            # командном буфере; при T=511 IOGPU не смог его нарастить и уронил процесс
+            # (Failed to allocate IOGPUDeviceShmem, abort). Синхронизация раз в 128 шагов
+            # на числа не влияет -- только режет буфер.
+            if mps_sync and tt % 128 == 127:
+                torch.mps.synchronize()
         return out.view(B, T, C)
 
     def _cmix_forward(self, x, c: CMix, cfg: QuantConfig, layer_id: int = -1):
