@@ -78,7 +78,23 @@ enc = A._encoder(TOK)
 text = open(A.CORPUS, encoding="utf-8").read()
 import re
 chunks = [c.strip() for c in re.split(r"—+ CHUNK —+", text) if c.strip()]
+# 27.09: ТЕКСТОВЫЕ eval-окна целиком лежат в калибровочном корпусе (16-граммы: 100%), а 27 из
+# 38 пересекались с 48 окнами калибровки GPTQ -- утечка. RWKVQ_GPTQ_EXCL_EVAL=1 выкидывает из
+# калибровки GPTQ каждый чанк, у которого есть хоть одна общая 16-грамма с окнами оценки.
+if os.environ.get("RWKVQ_GPTQ_EXCL_EVAL") == "1":
+    _ev = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt"))["tokens"][:, :512].tolist()
+    _cd = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_code_heldout.pt"))["tokens"].tolist()
+    _G = set(tuple(w[i:i + 16]) for w in _ev + _cd for i in range(len(w) - 16))
+    keep = []
+    for c in chunks:
+        ids = enc(c)
+        if not any(tuple(ids[i:i + 16]) in _G for i in range(len(ids) - 16)):
+            keep.append(c)
+    print("исключение eval: чанков %d -> %d" % (len(chunks), len(keep)), flush=True)
+    chunks = keep
 cal = A._windows(chunks, enc, A.SEQ_LEN, NCAL * A.SEQ_LEN)[:NCAL]
+_Gev = set(tuple(w[i:i + 16]) for w in torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt"))["tokens"][:, :512].tolist() for i in range(496))
+print("пересечение калибровки GPTQ с текстовыми eval-окнами (16-граммы): %d" % sum(tuple(w[i:i + 16]) in _Gev for w in cal for i in range(len(w) - 16)), flush=True)
 cal = torch.tensor(cal, dtype=torch.long)[:, :-1].contiguous().to(DEV)
 ev = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt"))
 cd = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_code_heldout.pt"))
