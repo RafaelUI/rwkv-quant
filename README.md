@@ -469,8 +469,10 @@ it measures how much each matrix's quantization error costs this particular
 checkpoint and moves bits to where a byte buys the most (up where it pays,
 down to no fewer than 4 bits where it does not), within a size budget of
 +0.5% of the file (`autopick_budget`, a fraction; `0` keeps the size
-unchanged). On RWKV-7 g1j 1.5B this cuts KL to the bf16 model by 16% on
-held-out text and 13.5% on held-out code, perplexity gap +4.15% -> +3.13%.
+unchanged). On RWKV-7 g1j 1.5B this cuts KL to the bf16 model by 17.6% on
+held-out text (Wikipedia en/ru/sr, no 16-gram shared with the calibration
+corpus) and 13.5% on held-out code; the perplexity gap goes +3.88% -> +3.25%
+on the text and +3.86% -> +3.32% on the code.
 The measurement needs the dense model in memory and takes about an hour for
 1.5B on an M4 (linear in model depth x windows; cached under
 `~/.cache/rwkv-quant/measure`). If the dense model would take more than 30%
