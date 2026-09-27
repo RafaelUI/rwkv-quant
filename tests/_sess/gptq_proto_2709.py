@@ -152,7 +152,10 @@ with torch.no_grad():
     R._rec = rec
 
     def cseq():
-        c = copy.copy(cfg); c.bits_overrides = dict(done, **cfg.bits_overrides); return c
+        # 28.09: dict(done, **overrides) отдавал ПРАВОМУ словарю совпавшие ключи -- при autopick
+        # выбор (полные ключи) затирал отметку done=16, и forward квантовал GPTQ-деквант ПОВТОРНО
+        # (RTN поверх GPTQ; на нулевых строках -- NaN). done -- первым и не перезаписывается.
+        c = copy.copy(cfg); c.bits_overrides = dict(done, **{k: v for k, v in cfg.bits_overrides.items() if k not in done}); return c
 
     def collect(keys, fn):
         for k in keys:
@@ -170,6 +173,8 @@ with torch.no_grad():
         Q = gptq(W, H, bits, stats.get(key))
         setattr(obj, attr, Q)          # fp32: деквант без bf16-округления, как у RTN-пути
         done[key] = 16
+        # 28.09: то, что видит forward, обязано быть ровно Q (без повторного квантования)
+        assert torch.equal(M._q(getattr(obj, attr), group, cseq(), key), Q), "повторное квантование " + key
 
     x = F.embedding(cal, M._q(M.emb_weight, "emb", cfg, "emb.weight"))
     x = F.layer_norm(x.float(), (M.n_embd,), M.ln0_w.float(), M.ln0_b.float())

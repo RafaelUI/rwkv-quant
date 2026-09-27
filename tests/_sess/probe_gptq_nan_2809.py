@@ -160,7 +160,10 @@ with torch.no_grad():
     R._rec = rec
 
     def cseq():
-        c = copy.copy(cfg); c.bits_overrides = dict(done, **cfg.bits_overrides); return c
+        # 28.09: dict(done, **overrides) отдавал ПРАВОМУ словарю совпавшие ключи -- при autopick
+        # выбор (полные ключи) затирал отметку done=16, и forward квантовал GPTQ-деквант ПОВТОРНО
+        # (RTN поверх GPTQ; на нулевых строках -- NaN). done -- первым и не перезаписывается.
+        c = copy.copy(cfg); c.bits_overrides = dict(done, **{k: v for k, v in cfg.bits_overrides.items() if k not in done}); return c
 
     def collect(keys, fn):
         for k in keys:
