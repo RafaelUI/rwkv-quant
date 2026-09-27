@@ -96,11 +96,14 @@ cal = A._windows(chunks, enc, A.SEQ_LEN, NCAL * A.SEQ_LEN)[:NCAL]
 _Gev = set(tuple(w[i:i + 16]) for w in torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt"))["tokens"][:, :512].tolist() for i in range(496))
 print("пересечение калибровки GPTQ с текстовыми eval-окнами (16-граммы): %d" % sum(tuple(w[i:i + 16]) in _Gev for w in cal for i in range(len(w) - 16)), flush=True)
 cal = torch.tensor(cal, dtype=torch.long)[:, :-1].contiguous().to(DEV)
-ev = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt"))
+# RWKVQ_EVAL_TEXT: другой текстовый набор (27.09: eval_text_heldout.pt -- Википедия en/ru/sr вне корпуса)
+ev = torch.load(os.path.expanduser(os.environ.get("RWKVQ_EVAL_TEXT", "~/Develop/WKV-kvant/eval_corpus_multiling.pt")))
 cd = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_code_heldout.pt"))
 Wv = torch.cat([ev["tokens"][:, :512], cd["tokens"]]).long()
 langs = list(ev["lang"]) + list(cd["lang"]); kind = ["text"] * len(ev["lang"]) + ["code"] * len(cd["lang"])
 edata, etgt = Wv[:, :-1].contiguous().to(DEV), Wv[:, 1:].contiguous().to(DEV)
+_Gt = set(tuple(w[i:i + 16]) for w in ev["tokens"][:, :512].tolist() for i in range(496))
+print("пересечение калибровки GPTQ с ИСПОЛЬЗУЕМЫМ текстовым eval (16-граммы): %d" % sum(tuple(w[i:i + 16]) in _Gt for w in cal.tolist() for i in range(len(w) - 16)), flush=True)
 print("калибровка %d окон x %d, оценка %d окон; своп старт" % (cal.shape[0], cal.shape[1], len(langs)), flush=True)
 BS = 8
 kdt = torch.float32
