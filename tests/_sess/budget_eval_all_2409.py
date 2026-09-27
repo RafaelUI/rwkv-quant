@@ -19,7 +19,7 @@ SELS = [a.split("=", 1) for a in sys.argv[3:]]
 TOK = "/Users/s/Develop/rwkv-metal/rwkv_metal/tokenizer/rwkv_vocab_v20230424.txt"
 sw = lambda: float(subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout.split("used = ")[1].split("M")[0])
 s0 = sw(); t0 = time.time()
-ev = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_multiling.pt"))
+ev = torch.load(os.path.expanduser(os.environ.get("RWKVQ_EVAL_TEXT", "~/Develop/WKV-kvant/eval_corpus_multiling.pt")))  # 27.09: Википедия -- eval_text_heldout.pt
 wins = [r for r in ev["tokens"][:, :512].tolist()]; langs = list(ev["lang"]); kind = ["eval"] * len(wins)
 cd = torch.load(os.path.expanduser("~/Develop/WKV-kvant/eval_code_heldout.pt"))
 wins += cd["tokens"].tolist(); langs += list(cd["lang"]); kind += ["code"] * len(cd["lang"])
