@@ -80,7 +80,8 @@ def _n_blocks(qt) -> int:
 
 
 def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str,
-               config: QuantConfig = None, tokenizer: str = None, autopick: dict = None):
+               config: QuantConfig = None, tokenizer: str = None, autopick: dict = None,
+               gptq: dict = None):
     """QuantizedCheckpoint -> .rwkvq в контейнере safetensors.
 
     Плоские имена "<ключ>::<поле>", метаданные -- одним JSON в
@@ -148,6 +149,10 @@ def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str,
         # 24.09: происхождение битовой раскладки autopick (подпись измерения, бюджет, tau).
         # Ключ пишется ТОЛЬКО при autopick: файлы без него побайтно те же, что раньше.
         manifest["autopick"] = autopick
+    if gptq is not None:
+        # 28.09: коды матриц proj/cmix/head -- из GPTQ (calibration.gptq) на той же сетке sb6.
+        # Ключ пишется ТОЛЬКО при GPTQ: прочие файлы побайтно прежние.
+        manifest["gptq"] = gptq
     from safetensors.torch import save_file
     save_file(tensors, output_path, metadata={"rwkvq": json.dumps(manifest)})
     return ckpt
@@ -259,6 +264,14 @@ def _make_qt_gw_sb6(key, group, bits, w, gs, ex2, search=True):
     assert (IN // gs) % 8 == 0, f"{key}: NB={IN//gs} не кратно sb=8"
     parts = _groupwise_fake_dequant(w, bits, gs, sb=8, sb_bits=(-6 if search else 6),
                                     ex2=ex2, return_parts=True)
+    return _pack_gw_sb6(key, group, bits, OUT, IN, gs, parts)
+
+
+def _pack_gw_sb6(key, group, bits, OUT, IN, gs, parts):
+    """Упаковка частей sb6 (q uint8 0..2^bits-1 [OUT, IN], qs uint8 / qm int8 [OUT, NB],
+    d / dm fp16 [OUT, NSB]) в QuantizedTensor формата v2. Вынесена из _make_qt_gw_sb6 (28.09),
+    чтобы GPTQ (calibration.gptq) паковал СВОИ коды на той же сетке тем же кодом; для RTN-пути
+    байты те же (гейт test_quantize_gptq, часть «упаковка»)."""
     q = parts["q"]                                   # uint8 0..2^bits-1
     qs, qm = parts["qs"], parts["qm"]                # [OUT, NB]
     qsqm = torch.cat([pack6(qs.view(OUT, -1, 8)),
@@ -524,7 +537,8 @@ def detect_meta(checkpoint_path: str, state_dict) -> dict:
 
 def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
                   real_gw: bool = True, verbose: bool = True,
-                  tokenizer: str = None, autopick: dict = None):
+                  tokenizer: str = None, autopick: dict = None,
+                  gptq_tensors: dict = None, gptq_meta: dict = None):
     """Потоковое квантование чекпоинта: .pth/.safetensors -> .rwkvq.
 
     Отличие от save(): state_dict не держится в памяти целиком. Тензоры
@@ -542,6 +556,8 @@ def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
     torch.load(mmap=True) требует zip-сериализации (все современные .pth)
     и map_location="cpu".
     """
+    if gptq_tensors and not real_gw:
+        raise ValueError("gptq_tensors -- реальная упаковка sb6; с real_gw=False не сочетается")
     if checkpoint_path.endswith(".pth"):
         sd = torch.load(checkpoint_path, map_location="cpu", mmap=True)
     else:
@@ -561,15 +577,19 @@ def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
     tensors = {}
     keys = list(sd.keys())
     for i, key in enumerate(keys):
-        tensors[key] = quantize_tensor(key, sd[key], config, real_gw=real_gw)
+        qt = gptq_tensors.pop(key, None) if gptq_tensors else None
+        # 28.09: готовый GPTQ-тензор (calibration.gptq.run, упакован _pack_gw_sb6) вместо RTN
+        tensors[key] = qt if qt is not None else quantize_tensor(key, sd[key], config, real_gw=real_gw)
         sd[key] = None            # отпускаем ссылку на mmap-вид немедленно
         if verbose and (i + 1) % 200 == 0:
             print(f"  {i+1}/{len(keys)}", flush=True)
     del sd
+    if gptq_tensors:
+        raise KeyError("gptq: ключи не найдены в чекпоинте: %s" % sorted(gptq_tensors)[:5])
 
     ckpt = QuantizedCheckpoint(tensors=tensors, config_repr=repr(config),
                                config=config, tokenizer=tokenizer, **meta)
-    save_rwkvq(ckpt, output_path, autopick=autopick)
+    save_rwkvq(ckpt, output_path, autopick=autopick, gptq=gptq_meta)
     if verbose:
         print(f"-> {output_path} "
               f"({os.path.getsize(output_path)/1e6:.1f} МБ)", flush=True)

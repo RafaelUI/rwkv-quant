@@ -43,7 +43,11 @@ def gptq(W, H, bits, ex2, damp=DAMP):
     W[:, dead.to(W.device)] = 0.0
     H += damp * torch.mean(torch.diag(H)) * torch.eye(IN, dtype=H.dtype)
     DIAG['Hfin'] = bool(torch.isfinite(H).all()); DIAG['Wfin'] = bool(torch.isfinite(W).all())
-    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True).float().to(W.device)
+    # 28.09: НЕ torch.linalg.cholesky(..., upper=True) -- на torch 2.13 / macOS (Accelerate) он портит кучу:
+    # пишет за свой буфер (порча уже упакованных кодов, segfault в MPSGraph, "objc hash table corrupted",
+    # зависание в поиске кеша графов, segfault на выходе процесса). Нижний фактор + транспонирование --
+    # U побитно тот же (12 из 12, 256..3072); на CUDA/MKL -- до 1e-15. Гейт: test_quantize_gptq, часть 2 (коды файла == deq после всего прохода).
+    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H))).mT.contiguous().float().to(W.device)
     DIAG['Hinv_fin'] = bool(torch.isfinite(Hinv).all()); DIAG['Hinv_dmin'] = float(torch.diag(Hinv).min()); DIAG['Hinv_dmax'] = float(torch.diag(Hinv).max())
     Q = torch.zeros_like(W)
     qmax = 2 ** bits - 1
