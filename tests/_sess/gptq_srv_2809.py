@@ -132,6 +132,12 @@ kdt = torch.float32
 head32 = M.head_weight.float()
 
 
+# 28.09: RWKVQ_ACT_CPU=1 -- активации калибровки (x, v_first, выходы проходов) живут на CPU и подаются на карты
+# батчами; H головы копится порциями. Нужно для сотен окон на 7.2B/13.3B (иначе CUDA OOM: 306 окон x 4096 fp32
+# = 2.4 ГБ на тензор, их одновременно 4-5). Без флага -- буквально прежний путь (.to() -- пустые операции).
+ACT_CPU = os.environ.get("RWKVQ_ACT_CPU") == "1"
+
+
 def sync(t):
     # без синхронизации MPS копит сотни тысяч мелких запусков _wkv7 в одном командном
     # буфере и падает на выделении IOGPUDeviceShmem (0.1B, 27.09)
@@ -204,28 +210,31 @@ with torch.no_grad():
 
     x = F.embedding(cal, M._q(M.emb_weight, "emb", cfg, "emb.weight"))
     x = F.layer_norm(x.float(), (M.n_embd,), M.ln0_w.float(), M.ln0_b.float())
+    if ACT_CPU:
+        x = x.cpu()
     vf = torch.empty_like(x)
     tg = time.time()
 
     def att_pass(i, x, vf):
         outs, vfs = [], []
         for b in range(0, x.shape[0], BS):
-            xb, vb = x[b:b + BS], vf[b:b + BS]
+            dv = M.layer_dev[i]
+            xb, vb = x[b:b + BS].to(dv), vf[b:b + BS].to(dv)
             xn = F.layer_norm(xb, (M.n_embd,), M.ln1_w[i].float(), M.ln1_b[i].float())
             a, v2 = M._tmix_forward(xn, vb, M.tmix[i], i, cseq())
-            outs.append(sync(xb + a)); vfs.append(v2)
+            outs.append(sync(xb + a).to(x.device)); vfs.append(v2.to(x.device))
         return torch.cat(outs), torch.cat(vfs)
 
     def ffn_pass(i, x):
         outs = []
         for b in range(0, x.shape[0], BS):
-            xb = x[b:b + BS]
+            xb = x[b:b + BS].to(M.layer_dev[i])
             xn = F.layer_norm(xb, (M.n_embd,), M.ln2_w[i].float(), M.ln2_b[i].float())
-            outs.append(sync(xb + M._cmix_forward(xn, M.cmix[i], cseq(), i)))
+            outs.append(sync(xb + M._cmix_forward(xn, M.cmix[i], cseq(), i)).to(x.device))
         return torch.cat(outs)
 
     for i in range(M.n_layer):
-        if len(DEVS) > 1:
+        if len(DEVS) > 1 and not ACT_CPU:
             x, vf = x.to(M.layer_dev[i]), vf.to(M.layer_dev[i])
         t, c = M.tmix[i], M.cmix[i]
         p = "blocks.%d." % i
@@ -241,10 +250,17 @@ with torch.no_grad():
         do(c, "value", p + "ffn.value.weight", "cmix", H[p + "ffn.value.weight"])
         x = ffn_pass(i, x)
         print("[gptq] слой %d/%d, %.0f с" % (i + 1, M.n_layer, time.time() - tg), flush=True)
-    x = x.to(M.ln_out_w.device)
-    xo = F.layer_norm(x, (M.n_embd,), M.ln_out_w.float(), M.ln_out_b.float()).reshape(-1, M.n_embd)
-    Hh = (xo.T @ xo).cpu()
-    del x, vf, xo
+    if ACT_CPU:
+        Hh = torch.zeros(M.n_embd, M.n_embd)
+        for b in range(0, x.shape[0], BS):
+            xo = F.layer_norm(x[b:b + BS].to(M.ln_out_w.device), (M.n_embd,), M.ln_out_w.float(), M.ln_out_b.float()).reshape(-1, M.n_embd)
+            Hh += (xo.T @ xo).cpu()
+        del x, vf, xo
+    else:
+        x = x.to(M.ln_out_w.device)
+        xo = F.layer_norm(x, (M.n_embd,), M.ln_out_w.float(), M.ln_out_b.float()).reshape(-1, M.n_embd)
+        Hh = (xo.T @ xo).cpu()
+        del x, vf, xo
     Qh = gptq(M.head_weight.float(), Hh, ap._bits_of(cfg, "head", "head.weight"), stats.get("head.weight"))
     R._rec = lambda n, x: None
     cg = cseq()
