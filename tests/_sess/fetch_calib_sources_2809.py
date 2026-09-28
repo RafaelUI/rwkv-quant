@@ -42,6 +42,13 @@ ROLE = dict(system="System", user="User", human="User", prompter="User", assista
 def chat_text(msgs, max_chars):
     out = []
     for m in msgs or []:
+        if isinstance(m, str):             # Fable: элементы -- arrow.json (JSON-строки), 28.09
+            try:
+                m = json.loads(m)
+            except ValueError:
+                continue
+        if not isinstance(m, dict):
+            continue
         role = (m.get("role") or m.get("from") or "").lower()
         if role == "system":
             continue                       # шаблонные системные подсказки -- одинаковые окна
@@ -120,13 +127,13 @@ def fetch_oasst(fs, s, p):
     with fs.open(p, "rb", block_size=8 << 20) as h:
         pf = pq.ParquetFile(h)
         for gi in range(pf.metadata.num_row_groups):
-            for r in pf.read_row_group(gi, columns=["message_id", "parent_message_id", "text", "role", "lang"]).to_pylist():
+            for r in pf.read_row_group(gi, columns=["message_id", "parent_id", "text", "role", "lang"]).to_pylist():
                 if r["lang"] != s["lang"]:
                     continue
                 if r["role"] == "prompter":
                     prom[r["message_id"]] = r["text"]
-                elif r["role"] == "assistant" and r["parent_message_id"] in prom:
-                    t = "User: %s\n\nAssistant: %s" % (prom.pop(r["parent_message_id"]).strip(), r["text"].strip())
+                elif r["role"] == "assistant" and r["parent_id"] in prom:
+                    t = "User: %s\n\nAssistant: %s" % (prom.pop(r["parent_id"]).strip(), r["text"].strip())
                     if len(t) >= MIN["oasst"]:
                         got.append(t)
                 if len(got) >= s["n"]:
