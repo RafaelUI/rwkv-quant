@@ -108,6 +108,12 @@ if os.environ.get("RWKVQ_GPTQ_EXCL_EVAL") == "1":
     print("исключение eval: чанков %d -> %d" % (len(chunks), len(keep)), flush=True)
     chunks = keep
 cal = A._windows(chunks, enc, A.SEQ_LEN, NCAL * A.SEQ_LEN)[:NCAL]
+if os.environ.get("RWKVQ_CALIB_PT"):
+    # 28.09: калибровка из файла (make_gptq_calib_2809: wiki с 20000 строки + открытый код + корпус пакета,
+    # порядок по кругу между группами -- любой префикс сбалансирован); окна по 512 -> как у _windows
+    _cp = torch.load(os.path.expanduser(os.environ["RWKVQ_CALIB_PT"]), weights_only=False)
+    cal = _cp["tokens"][:NCAL].tolist()
+    print("калибровка из %s: %d окон, состав %s" % (os.environ["RWKVQ_CALIB_PT"], len(cal), dict(__import__("collections").Counter(_cp["lang"][:NCAL]))), flush=True)
 _old = os.path.expanduser(os.environ.get("RWKVQ_EVAL_OLD", "~/Develop/WKV-kvant/eval_corpus_multiling.pt"))
 _Gev = set(tuple(w[i:i + 16]) for w in torch.load(_old)["tokens"][:, :512].tolist() for i in range(496)) if os.path.exists(_old) else set()
 if _Gev: print("пересечение калибровки GPTQ с текстовыми eval-окнами (16-граммы): %d" % sum(tuple(w[i:i + 16]) in _Gev for w in cal for i in range(len(w) - 16)), flush=True)
