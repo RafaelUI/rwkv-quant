@@ -2316,3 +2316,50 @@ README: цифры autopick -- с чистого eval (17.6 / 13.5%, Δppl +3.88
 * Серверный PYTHONPATH -- $HOME/rwkvq/rwkv-quant-git:$HOME/rwkvq; перед длинным запуском -- пробный импорт.
 * Вызов инструмента обрывается и на sleep 150 + ssh/rsync: паузы <= 120 с, долгие rsync-циклы -- в screen.
 * Своп Mac теперь до 5 ГБ (вырос за ночь); свободно на диске ~15 ГиБ.
+
+
+## 28.09 (вторая половина) — GPTQ В WRITER; ПОРЧА КУЧИ cholesky(upper=True); GPTQ НА МАСШТАБЕ ЛОМАЕТСЯ ОТ damp; КОРПУС v2
+**Встраивание (2ae5d35, 7ca8880):** calibration/gptq.py (послойный проход, цикл GPTQ на CPU как у writer, веса пройденного
+слоя освобождаются), writer._pack_gw_sb6 (упаковка вынесена, RTN побайтно прежний), quantize_file(gptq_tensors, gptq_meta),
+манифест "gptq". Гейт tests/test_quantize_gptq.py (0.1B): части при диагональной H == _gw_one побитно; 72 GPTQ-тензора из
+файла == deq GPTQ побитно, 330 прочих побайтно как без GPTQ, размер тот же, манифест. В quantize() НЕ выведен (ждёт калибровку).
+**Порча кучи:** torch.linalg.cholesky(..., upper=True) на torch 2.13 / macOS (Accelerate) пишет за свой буфер -- портил
+упакованные коды (8-10 из 72), давал segfault в MPSGraph, "objc hash table corrupted", зависание в кеше графов, segfault на выходе.
+Замена: cholesky(Ci).mT.contiguous() -- побитно тот же U (12/12). На сервере (MKL) бага нет -- серверные цифры честные.
+Найдено перебором: сверка всех упакованных кодов после КАЖДОГО шага (tests/_sess -- dbg-скрипты в /tmp, не сохранены).
+
+**GPTQ по масштабам (корпус пакета, 48 окон, damp 0.01; KL к RTN, чистый eval):**
+2.9B текст -21.1% (en -12.2) код -37.9%; 7.2B текст +0.4% (en +13.6!) код -21.4%; 13.3B текст +4.7% (en +17.7!) код -21.4%.
+Причина -- переобучение GPTQ на маленькой калибровке (24.5 тыс. токенов на вход до 16384; корпус пакета 48.7 тыс., en 16%):
+7.2B damp 0.1 / 48 окон: текст -21.0% (en -17.1, ru -23.1, sr -23.3), код -35.1%, Δppl текст +1.85 -> +1.12%;
+7.2B damp 0.01 / 82 окна: текст -4.9% (en +6.7). РЕГУЛЯРИЗАЦИЯ ВАЖНЕЕ РАЗМЕРА. 306 окон -- OOM (активации на GPU).
+Прогон 13.3B + wprop (damp 0.01) потерян на слое 37/61: убит sh цепочки -> screen уронил дочерние (см. ловушки).
+
+**Корпус v2 (решение владельца 28.09: квантуют на мощной машине; 2.9B+ не обязан влезать в 16 ГБ; корпус -- расширить):**
+tests/_sess/fetch_calib_sources_2809.py -- потоково (HfFileSystem + pyarrow, pre_buffer=False, iter_batches по 16; пик
+памяти 140-164 МБ) из FineWeb-Edu, FineWeb-2 (ru, srp_Cyrl, srp_Latn, cmn_Hani), UltraData-Code L2/L3 (6 языков),
+qwen3.8-max-distillation-50k, Fable-5.1 lite (JSON-строки в messages), oasst2 ru (столбец parent_id), novel_text zh,
+RafaelUI/russian_literature -> ~/Develop/data/calib_src (17 JSONL, manifest.json с sha; 2.3 млн токенов).
+Лицензии разные (UltraData: без перераспространения; qwen/Fable: выходы проприетарных моделей; novel_text: происхождение
+неясно) -- ЛОКАЛЬНАЯ калибровка, в пакет не класть; в пакет -- рецепт (источники + sha) и сборка при первом квантовании.
+tests/_sess/make_gptq_calib2_2809.py -> WKV-kvant/gptq_calib2_2809.pt: 600 окон (307 тыс. токенов), en30/ru20/code20/
+zh10/sr10 (кир.5+лат.5)/reason10, любой префикс держит доли; 16-граммы против обоих eval (отброшено 8 окон кода), дубли.
+gptq_srv_2809: RWKVQ_CALIB_PT (калибровка из файла), RWKVQ_ACT_CPU=1 (активации на CPU -- против OOM).
+Уборка WKV-kvant: 29 ГБ в Корзину (kl_ref на старом eval, rule_files_a .rwkvq, compression_*_e6_2109 кроме 0p1b); владелец очистил.
+
+**Идёт на сервере:** screen cc2 = ~/rwkvq/chain_calib2_2809.sh (лог chain_calib2_2809.log; пропуск фазы -- touch
+~/rwkvq/skip2_<фаза>): G -- гейт ACT_CPU 0.1B; 1 -- 7.2B damp 0.1, 150 и 600 окон; 2 -- 13.3B 150; 3 -- 1.5B/2.9B damp 0.1 и
+0.01 на 150; 4 -- 13.3B 600. Логи ~/rwkvq/gptq_<метка>.log.
+
+### 28.09 вечер (очередь)
+1. Итоги cc2: нужный размер корпуса (150 против 600) и damp по масштабам; условие включения -- ни один язык ни на одной
+   модели не хуже RTN. Сравнивать с 7.2B damp 0.1 / 48 окон корпуса пакета (текст -21.0 / код -35.1).
+2. GPTQ + autopick при новом damp; затем quantize(gptq=...) в API + device="cuda:0,cuda:1" (квантование на мощной машине).
+3. Корпус в пакет: рецепт + сборка; меняет подпись autopick -- пересчитать measure.
+4. Отпечаток L_wkvblk; пара с int6; emb-gather sb6.
+
+ЛОВУШКИ (новые):
+* torch.linalg.cholesky(upper=True) на macOS/torch 2.13 портит кучу -- только нижний фактор + .mT.contiguous().
+* Не убивать sh цепочки в screen: screen закрывает окно и роняет дочерние прогоны. Пропуск фаз -- флаг-файлами.
+* Hf parquet: row group бывает огромным (UltraData ~330 МБ) -- только pre_buffer=False + iter_batches с нужными столбцами.
+* Серверная машина: GPTQ-цикл там на GPU, H на CPU (float64 cholesky -- MKL, бага нет).
