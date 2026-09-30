@@ -38,7 +38,7 @@ for lab, name, s in MODELS:
     for key, f, base in (("comp+gptq", "gptq_%s_c2w600.json" % lab, "comp"), ("wprop+gptq", "gptq_%s_c2w600_wprop.json" % lab, "wprop"),
                          ("red+gptq", "gptq_red_%s.json" % lab, "red")):
         g = load(f)
-        if g:
+        if g and "gptq" in g["kl"]:          # идущий прогон пишет JSON с одним плечом rtn
             src[key] = agg(g, "gptq")
             r = agg(g, "rtn")
             if base in src:
