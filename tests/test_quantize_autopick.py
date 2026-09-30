@@ -37,8 +37,8 @@ def blobs(p):
     return {k: v.hexdigest() for k, v in out.items()}
 
 P, A, A2 = T + "/plain.rwkvq", T + "/auto.rwkvq", T + "/auto_json.rwkvq"
-quantize(CK, P, preset="compression", tokenizer=TOK, verbose=False, autopick=False)
-quantize(CK, A, preset="compression", tokenizer=TOK, autopick=True, autopick_budget=B, verbose=True)
+quantize(CK, P, preset="compression", tokenizer=TOK, verbose=False, autopick=False, gptq=False)
+quantize(CK, A, preset="compression", tokenizer=TOK, autopick=True, autopick_budget=B, verbose=True, gptq=False)
 mp, ma = man(P), man(A)
 ov = ma.get("autopick", {}).get("overrides", {})
 check("1 обычный файл без autopick", "autopick" not in mp)
@@ -55,17 +55,17 @@ check("2 выбранные тензоры действительно измен
 d = (os.path.getsize(A) - os.path.getsize(P)) / os.path.getsize(P)
 check("3 прирост размера <= бюджет + 0.3%%", d <= B + 0.003, "%+.3f%% (модель %+.3f%%)" % (100 * d, 100 * ma["autopick"]["bytes_frac"]))
 mj = os.path.join(ap.MEASURE_CACHE, "measure_%s.json" % ma["autopick"]["measure_signature"])
-quantize(CK, A2, preset="compression", tokenizer=TOK, autopick=True, autopick_budget=B, measure=mj, verbose=False)
+quantize(CK, A2, preset="compression", tokenizer=TOK, autopick=True, autopick_budget=B, measure=mj, verbose=False, gptq=False)
 check("4 measure=путь -> побитно тот же файл", open(A, "rb").read() == open(A2, "rb").read())
 bad = json.load(open(mj)); bad["ckpt_sig"] = "0" * 16
 json.dump(bad, open(T + "/bad.json", "w"))
 try:
-    quantize(CK, T + "/bad.rwkvq", preset="compression", tokenizer=TOK, autopick=True, measure=T + "/bad.json", verbose=False)
+    quantize(CK, T + "/bad.rwkvq", preset="compression", tokenizer=TOK, autopick=True, measure=T + "/bad.json", verbose=False, gptq=False)
     check("5 чужой чекпоинт отвергнут", False)
 except ValueError as e:
     check("5 чужой чекпоинт отвергнут", True, str(e)[:60])
 D = T + "/default.rwkvq"
-quantize(CK, D, preset="compression", tokenizer=TOK, verbose=False)
+quantize(CK, D, preset="compression", tokenizer=TOK, verbose=False, gptq=False)  # 30.09: GPTQ -- свой гейт
 check("6 compression: autopick по умолчанию включён", open(A, "rb").read() == open(D, "rb").read())
 R = T + "/red.rwkvq"
 quantize(CK, R, preset="reduction", tokenizer=TOK, verbose=False)

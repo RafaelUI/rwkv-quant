@@ -26,7 +26,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
              config: QuantConfig = None, real_gw: bool = True,
              verbose: bool = True, tokenizer=None, act_stats="auto",
              autopick=None, autopick_budget: float = 0.005,
-             measure="auto", device: str = None):
+             measure="auto", device: str = None, gptq=None, gptq_calib=None):
     """
     Quick-start: quantize(ckpt, out, tokenizer=tok, preset="compression")
     Advanced:    quantize(ckpt, out, tokenizer=tok, config=QuantConfig(proj=4, ...))
@@ -69,7 +69,19 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
       на M4, линейно по числу окон; нужна плотная модель в bf16 на device) или путь к
       JSON готового измерения (перенос с машины с большей памятью, как imatrix): чужой
       чекпоинт -- отказ, иная подпись конфига/корпуса -- предупреждение.
-    device: для измерения ("mps"/"cuda"/"cpu"; по умолчанию RWKVQ_DEVICE или mps/cpu).
+    device: для измерения и GPTQ ("mps"/"cuda"/"cpu" или список карт "cuda:0,cuda:1" -- слои по картам;
+      по умолчанию RWKVQ_DEVICE или mps/cpu).
+
+    gptq (30.09): None (умолчание) -- ВКЛЮЧЁН для preset="compression" без своего config (решение
+      владельца 30.09), иначе выключен; при неявном включении пропускается с предупреждением, если
+      плотная модель и активации калибровки не влезают (см. _gptq_skip_reason) или нет корпуса.
+      True/False -- явно. Суть: коды матриц proj/cmix/head, которые пресет пишет в sb6, считаются
+      GPTQ (компенсация ошибки округления через H^-1, calibration.gptq) на ТОЙ ЖЕ сетке -- формат и
+      кернели те же, размер файла тот же. Калибровка -- 600 окон (решение владельца: всегда), damp 0.1.
+      Цифры (KL к RTN, отложенный текст / код, 600 окон): 1.5B -42.2 / -49.9%, 2.9B -42.5 / -46.4%,
+      7.2B -28.8 / -38.5%, 13.3B -28.8 / -38.5%; вместе с autopick +0.5% к прежнему пути: 7.2B
+      -42.5 / -44.9%, 13.3B -41.3 / -47.6%. Цена -- время: 13.3B ~4.7 ч на 4x4090.
+    gptq_calib: None -- корпус пакета; путь к .pt ({"tokens": [N, T]}) или тензор [N, T] токенов.
     """
     _user_config = config is not None
     if config is None:
@@ -119,6 +131,23 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         ap_meta = _autopick(checkpoint_path, config, tokenizer, autopick_budget,
                             measure, device, verbose)
 
+    gptq_q = gptq_meta = None
+    implicit_g = gptq is None
+    if implicit_g:
+        gptq = (preset == "compression" and not _user_config)
+    if gptq and not real_gw:
+        if not implicit_g:
+            raise ValueError("gptq=True пишет коды sb6; с real_gw=False не сочетается")
+        gptq = False
+    if gptq and implicit_g:
+        why = _gptq_skip_reason(checkpoint_path, device, gptq_calib)
+        if why:
+            gptq = False
+            if verbose:
+                print("[gptq] пропущен: %s; явно -- quantize(gptq=True), на машине с большей памятью" % why)
+    if gptq:
+        gptq_q, gptq_meta = _gptq(checkpoint_path, config, tokenizer, gptq_calib, device, verbose)
+
     # В манифест едет ОПИСАНИЕ калибровки, а не только имя словаря: файл
     # должен сам отвечать на вопрос "чем это калибровалось".
     tok_label = tokenizer if isinstance(tokenizer, str) else (
@@ -133,7 +162,59 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     # РАЗ целиком -- на 16 ГБ это давало пик 9-12 ГБ и своп.
     return quantize_file(checkpoint_path, output_path, config,
                          real_gw=real_gw, verbose=verbose, tokenizer=tok_label,
-                         autopick=ap_meta)
+                         autopick=ap_meta, gptq_tensors=gptq_q, gptq_meta=gptq_meta)
+
+
+# Доля памяти под плотную модель + активации калибровки GPTQ при НЕЯВНОМ включении. Активации -- два тензора
+# [окна, 511, n_embd] fp32 на хосте (x и v_first). На M4 16 ГБ: 0.1B-1.5B проходят, 2.9B -- нет (решение
+# владельца 28.09: квантование 2.9B+ -- дело мощной машины).
+GPTQ_FIT_FRACTION = 0.6
+
+
+def _gptq_skip_reason(ckpt, device, calib):
+    """None -- можно; иначе причина пропуска неявного GPTQ."""
+    from .calibration import gptq as G
+    if calib is None and not os.path.exists(G.CALIB_FILE):
+        return "нет корпуса GPTQ пакета (%s)" % os.path.basename(G.CALIB_FILE)
+    try:
+        sd = torch.load(ckpt, map_location="cpu", mmap=True, weights_only=True)
+        C = int(sd["emb.weight"].shape[1])
+        model = os.path.getsize(ckpt)
+        del sd
+    except Exception:
+        return None
+    act = 2 * G.N_WINDOWS * (act_stats_mod.SEQ_LEN - 1) * C * 4
+    phys = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    devs = G.devices(device)
+    if devs[0].startswith("cuda") and torch.cuda.is_available():
+        card = torch.cuda.get_device_properties(devs[0]).total_memory
+        if model / len(devs) > GPTQ_FIT_FRACTION * card:
+            return "модель %.1f ГБ на %d карт(ы) по %.0f ГБ" % (model / 1e9, len(devs), card / 1e9)
+        if act > GPTQ_FIT_FRACTION * phys:
+            return "активации калибровки %.1f ГБ при памяти хоста %.0f ГБ" % (act / 1e9, phys / 1e9)
+        return None
+    if model + act > GPTQ_FIT_FRACTION * phys:
+        return "модель %.1f ГБ + активации калибровки %.1f ГБ больше %.0f%% памяти (%.0f ГБ)" % (
+            model / 1e9, act / 1e9, 100 * GPTQ_FIT_FRACTION, phys / 1e9)
+    return None
+
+
+def _gptq(ckpt, config, tokenizer, calib, device, verbose):
+    """GPTQ по итоговому config (после autopick) -> (упакованные тензоры, метаданные для манифеста)."""
+    import hashlib
+    from .calibration import gptq as G
+    if any(str(m).endswith("_aw") for m in (config.group_scale_mode or {}).values()) and not config.act_stats_path:
+        raise ValueError("gptq с AW-пресетом требует act_stats (сетка писателя строится по той же статистике)")
+    tok, label = G.calib_tokens(tokenizer, calib, G.N_WINDOWS)
+    qts = G.run(ckpt, tokenizer, config, n_windows=G.N_WINDOWS, damp=G.DAMP, device=device,
+                verbose=verbose, calib=tok)
+    if not qts:
+        if verbose:
+            print("[gptq] ни одна матрица не идёт в sb6 -- GPTQ ничего не изменил, в манифест не пишется")
+        return None, None
+    meta = dict(windows=int(tok.shape[0]), seq_len=int(tok.shape[1]), damp=G.DAMP, calib=label,
+                calib_sha=hashlib.sha1(tok.numpy().tobytes()).hexdigest()[:16], matrices=len(qts))
+    return (qts or None), meta
 
 
 # Доля памяти устройства под плотную bf16-модель при НЕЯВНОМ autopick. 0.3 осторожно: 1.5B

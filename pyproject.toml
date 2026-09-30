@@ -34,4 +34,4 @@ Homepage = "https://impulseleap.com"
 include = ["rwkv_quant*"]
 
 [tool.setuptools.package-data]
-rwkv_quant = ["data/*.txt"]
+rwkv_quant = ["data/*.txt", "data/*.jsonl"]
