@@ -1,4 +1,12 @@
-"""GPTQ на сетке asym_sb6 (28.09): компенсация ошибки округления для COMPRESSION без смены формата.
+"""GPTQ на сетке asym_sb6 (28.09) и на симметричной сетке sym (01.10): компенсация ошибки округления для
+COMPRESSION и REDUCTION без смены формата.
+
+sym (REDUCTION, решение владельца 01.10): Q6_K-подобная раскладка writer'а (_sym_one: scale на блок gs без min,
+int8-коды scale против fp16 d на суперблок из 256 // gs блоков, 6/8 бит). Сетка суперблока строится _sym_one по
+уже поправленным весам в его начале, дальше -- тот же цикл. Упаковка -- writer._pack_gw_sym. Цифры
+(прототип tests/_sess/gptq_srv_3009, 600 окон, damp 0.1, бутстрэп по окнам): KL к RTN текст / код 0.1B -22 / -28,
+0.4B -23 / -27, 1.5B -28 / -32, 2.9B -30 / -34, 7.2B -21 / -24%, значимо на каждом языке; ppl -- в шуме.
+
 
 Сетка -- ТА ЖЕ, что у writer (_gw_one: блок gs, суперблок 8, 6-битные scale/min, поиск scale; для
 asym_sb6_aw -- с весами E[x^2]). scale/min суперблока (8*gs колонок) считаются В НАЧАЛЕ суперблока по уже
@@ -77,6 +85,55 @@ def gptq_parts(W, H, bits, ex2=None, damp=0.01, gs=32, sb_bits=-6):
         W[:, b1:] -= E1 @ Hinv[b0:b1, b1:]
     cat = lambda xs: torch.cat([x.cpu() for x in xs], dim=1).contiguous()
     return dict(q=codes.cpu(), qs=cat(qs_l), qm=cat(qm_l), d=cat(d_l), dm=cat(dm_l), deq=Q)
+
+
+def gptq_parts_sym(W, H, bits, ex2=None, damp=0.1, gs=16, sb=16, search=True):
+    """sym-сетка (как writer._make_qt_gw_sym) + компенсация ошибки. W [OUT, IN] fp32 на устройстве счёта,
+    H [IN, IN] (CPU) -> {q int8 [OUT, IN], qs int8 [OUT, NB], d fp16 [OUT, NSB]} на CPU + deq [OUT, IN] fp32 на
+    устройстве W. Проверка 0: при диагональной H части == _sym_one побитно (гейт test_quantize_gptq)."""
+    OUTd, IN = W.shape
+    BL = gs * sb
+    assert IN % BL == 0, IN
+    W = W.clone()
+    H = H.double().clone()
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1.0
+    W[:, dead.to(W.device)] = 0.0
+    H += damp * torch.mean(torch.diag(H)) * torch.eye(IN, dtype=H.dtype)
+    # нижний фактор + .mT -- не cholesky(upper=True) (порча кучи на macOS, см. gptq_parts)
+    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H))).mT.contiguous().float().to(W.device)
+    Q = torch.zeros_like(W)
+    codes = torch.zeros(OUTd, IN, dtype=torch.int8, device=W.device)
+    qmax = 2 ** (bits - 1) - 1
+    qmin = -qmax - 1
+    qs_l, d_l = [], []
+    for b0 in range(0, IN, BL):
+        b1 = b0 + BL
+        W1 = W[:, b0:b1].clone()
+        E1 = torch.zeros_like(W1)
+        C1 = torch.zeros_like(W1)
+        Hi = Hinv[b0:b1, b0:b1]
+        p = gw._sym_one(W1, bits, gs, sb, ex2[b0:b1] if ex2 is not None else None, search, 0.0, True)
+        qs_l.append(p["qs"]); d_l.append(p["d"])
+        # == scale_q в _sym_one: (qs * d).half(); у вырожденного суперблока qs = 0 (nan_to_num) -> scale 0 -> nz False
+        sc = (p["qs"].float() * p["d"].float().repeat_interleave(sb, dim=1)).half().float()
+        nz = sc.abs() > 0
+        den = torch.where(nz, sc, torch.ones_like(sc))
+        for j in range(BL):
+            g = j // gs
+            w = W1[:, j]
+            c = torch.clamp(torch.round(w / den[:, g]), qmin, qmax)
+            c = torch.where(nz[:, g], c, torch.zeros_like(c))
+            qv = c * sc[:, g]
+            Q[:, b0 + j] = qv
+            C1[:, j] = c
+            e = (w - qv) / Hi[j, j]
+            W1[:, j:] -= e[:, None] * Hi[j, j:][None, :]
+            E1[:, j] = e
+        codes[:, b0:b1] = C1.to(torch.int8)
+        W[:, b1:] -= E1 @ Hinv[b0:b1, b1:]
+    cat = lambda xs: torch.cat([x.cpu() for x in xs], dim=1).contiguous()
+    return dict(q=codes.cpu(), qs=cat(qs_l), d=cat(d_l), deq=Q)
 
 
 N_WINDOWS = 600      # решение владельца 30.09: 600 окон всегда (помогает и малым: +3-4 п. на 1.5B/2.9B)
@@ -167,16 +224,37 @@ def run(ckpt, tokenizer, cfg, n_windows=N_WINDOWS, damp=DAMP, device=None, verbo
     loop_dev = lambda d: d if str(d).startswith("cuda") else "cpu"
 
     def plan(group, key):
-        """(bits, gs, sb_bits, ex2) или None, если матрица не идёт в sb6."""
+        """("sb6", bits, gs, sb_bits, ex2) / ("sym", bits, gs, search, ex2) или None, если матрица не идёт ни в
+        sb6, ни в sym (как решает writer.quantize_tensor)."""
         bits = ap._bits_of(cfg, group, key)
         gs = cfg.group_scale.get(group)
         mode = cfg.group_scale_mode.get(group, "asym")
-        if not gs or bits >= 16 or mode not in _SB_BITS or bits not in (4, 5, 6):
+        if not gs or bits >= 16:
             return None
-        ex2 = stats.get(key) if mode == "asym_sb6_aw" else None
-        if mode == "asym_sb6_aw" and ex2 is None:
+        # ex2 -- ровно как writer.quantize_tensor: sb6 -- только "asym_sb6_aw"; sym -- mode.endswith("_aw")
+        if mode in _SB_BITS and bits in (4, 5, 6):
+            kind, aw, x = "sb6", mode == "asym_sb6_aw", _SB_BITS[mode]
+        elif mode.startswith("sym") and bits in (6, 8) and not cfg.outlier_fracs.get(group, 0.0):
+            kind, aw, x = "sym", mode.endswith("_aw"), not mode.endswith("_plain")
+        else:
+            return None
+        ex2 = stats.get(key) if aw else None
+        if aw and ex2 is None:
             return None               # writer без статистики уйдёт в поиск без AW -- не подменяем
-        return bits, gs, _SB_BITS[mode], ex2
+        return kind, bits, gs, x, ex2
+
+    def solve(W, H, pl, key, group):
+        """-> (QuantizedTensor, deq) по плану."""
+        kind, bits, gs, x, ex2 = pl
+        OUTd, IN = W.shape
+        if kind == "sb6":
+            p = gptq_parts(W, H, bits, ex2, damp, gs, x)
+            Q = p.pop("deq")
+            return Wr._pack_gw_sb6(key, group, bits, OUTd, IN, gs, p), Q
+        sb = max(1, 256 // gs)
+        p = gptq_parts_sym(W, H, bits, ex2, damp, gs, sb, x)
+        Q = p.pop("deq")
+        return Wr._pack_gw_sym(key, group, bits, OUTd, IN, gs, sb, p), Q
 
     def cseq():
         # отметки done=16 ПЕРВЫМИ и не перезаписываются выбором (28.09: dict(done, **overrides)
@@ -201,13 +279,9 @@ def run(ckpt, tokenizer, cfg, n_windows=N_WINDOWS, damp=DAMP, device=None, verbo
         pl = plan(group, key)
         if pl is None:
             return
-        bits, gs, sbb, ex2 = pl
         W0 = getattr(obj, attr)
         W = W0.float().to(loop_dev(dev))
-        OUTd, IN = W.shape
-        p = gptq_parts(W, H, bits, ex2, damp, gs, sbb)
-        Q = p.pop("deq")
-        out[key] = Wr._pack_gw_sb6(key, group, bits, OUTd, IN, gs, p)
+        out[key], Q = solve(W, H, pl, key, group)
         if keep_deq:
             deqs[key] = Q.cpu()
         setattr(obj, attr, Q.to(W0.device))   # fp32: деквант без bf16-округления, как у RTN-пути
@@ -282,11 +356,8 @@ def run(ckpt, tokenizer, cfg, n_windows=N_WINDOWS, damp=DAMP, device=None, verbo
             del x, vf
             pl = plan("head", "head.weight")
             if pl is not None:
-                bits, gs, sbb, ex2 = pl
                 W = M.head_weight.float().to(loop_dev(dl))
-                p = gptq_parts(W, Hh, bits, ex2, damp, gs, sbb)
-                Q = p.pop("deq")
-                out["head.weight"] = Wr._pack_gw_sb6("head.weight", "head", bits, W.shape[0], W.shape[1], gs, p)
+                out["head.weight"], Q = solve(W, Hh, pl, "head.weight", "head")
                 if keep_deq:
                     deqs["head.weight"] = Q.cpu()
     finally:

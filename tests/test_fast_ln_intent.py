@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory() as d:
     check("2 автоподбор: рантайм", model(f2) == (True, "манифест"), model(f2))
 
     f3 = os.path.join(d, "red.rwkvq")
-    quantize(CK, f3, preset="reduction", tokenizer=TOK, verbose=False)
+    quantize(CK, f3, preset="reduction", tokenizer=TOK, verbose=False, gptq=False)
     check("3 reduction: манифест", manifest_runtime(f3) == {"fast_ln": False}, manifest_runtime(f3))
     check("3 reduction: рантайм", model(f3) == (False, "манифест"), model(f3))
 

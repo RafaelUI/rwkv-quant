@@ -72,8 +72,9 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     device: для измерения и GPTQ ("mps"/"cuda"/"cpu" или список карт "cuda:0,cuda:1" -- слои по картам;
       по умолчанию RWKVQ_DEVICE или mps/cpu).
 
-    gptq (30.09): None (умолчание) -- ВКЛЮЧЁН для preset="compression" без своего config (решение
-      владельца 30.09), иначе выключен; при неявном включении пропускается с предупреждением, если
+    gptq (30.09): None (умолчание) -- ВКЛЮЧЁН для preset="compression" (решение владельца 30.09) и
+      preset="reduction" (01.10: KL к RTN -21...-30% на 0.1B-7.2B, значимо на каждом языке; ppl в шуме --
+      выигрыш в верности bf16, важной для QLoRA-базы и векторных моделей) без своего config, иначе выключен; при неявном включении пропускается с предупреждением, если
       плотная модель и активации калибровки не влезают (см. _gptq_skip_reason) или нет корпуса.
       True/False -- явно. Суть: коды матриц proj/cmix/head, которые пресет пишет в sb6, считаются
       GPTQ (компенсация ошибки округления через H^-1, calibration.gptq) на ТОЙ ЖЕ сетке -- формат и
@@ -134,7 +135,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     gptq_q = gptq_meta = None
     implicit_g = gptq is None
     if implicit_g:
-        gptq = (preset == "compression" and not _user_config)
+        gptq = (preset in ("compression", "reduction") and not _user_config)   # reduction -- решение владельца 01.10
     if gptq and not real_gw:
         if not implicit_g:
             raise ValueError("gptq=True пишет коды sb6; с real_gw=False не сочетается")

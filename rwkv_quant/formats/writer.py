@@ -331,6 +331,13 @@ def _make_qt_gw_sym(key, group, bits, w, gs, sb, ex2, search=True):
         f"{key}: IN={IN} не кратно суперблоку gs*sb={gs * sb}")
     parts = _groupwise_sym_fake_dequant(w, bits, gs=gs, sb=sb, ex2=ex2,
                                         search=search, return_parts=True)
+    return _pack_gw_sym(key, group, bits, OUT, IN, gs, sb, parts)
+
+
+def _pack_gw_sym(key, group, bits, OUT, IN, gs, sb, parts):
+    """Упаковка частей sym (q int8 [OUT, IN] знаковые, qs int8 [OUT, NB], d fp16 [OUT, NSB]) в QuantizedTensor.
+    Вынесена из _make_qt_gw_sym (01.10), чтобы GPTQ в REDUCTION (calibration.gptq) паковал свои коды тем же
+    кодом; RTN-файл побайтно прежний (сверка md5 файла REDUCTION 0.1B до и после)."""
     q = parts["q"]                                    # int8, ЗНАКОВЫЕ коды
     codes = codes_packed = qh = qh2 = None
     if bits == 8:

@@ -68,7 +68,7 @@ D = T + "/default.rwkvq"
 quantize(CK, D, preset="compression", tokenizer=TOK, verbose=False, gptq=False)  # 30.09: GPTQ -- свой гейт
 check("6 compression: autopick по умолчанию включён", open(A, "rb").read() == open(D, "rb").read())
 R = T + "/red.rwkvq"
-quantize(CK, R, preset="reduction", tokenizer=TOK, verbose=False)
+quantize(CK, R, preset="reduction", tokenizer=TOK, verbose=False, gptq=False)
 check("6 reduction: autopick по умолчанию выключен", "autopick" not in man(R))
 print("ИТОГ:", "ЗЕЛЁНЫЙ" if fails == 0 else "КРАСНЫЙ (%d)" % fails, flush=True)
 sys.exit(1 if fails else 0)

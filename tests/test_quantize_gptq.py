@@ -10,8 +10,9 @@
 3. Качество (санитарно): на отложенном коде KL(GPTQ) < KL(RTN) через fake-путь RWKV7Ref.
 4. (30.09) Корпус пакета: calib_tokens(None) разбирает data/gptq_calib.jsonl словарём модели РОВНО в окна, что
    мерились 28-30.09 (gptq_calib2_2809.pt), если оба файла на месте; иначе -- громкий ПРОПУСК.
-6. (30.09) Умолчание: GPTQ зовётся неявно ровно для preset="compression" без своего config и с real_gw=True
+6. (30.09; 01.10 + reduction) Умолчание: GPTQ зовётся неявно ровно для preset="compression"|"reduction" без своего config и с real_gw=True
    (G.run подменён заглушкой -- проверяется решение, а не счёт); без корпуса -- пропуск, а не отказ.
+Части 2, 3, 5 -- для COMPRESSION (sb6) и (01.10) REDUCTION (sym).
 5. (30.09) Разнесение по картам: RWKVQ_DEVICE2="cuda:0,cuda:1" -- GPTQ на нём ПОБИТНО как на RWKVQ_DEVICE.
 С 30.09 часть 2 идёт через ПУБЛИЧНЫЙ путь: quantize(gptq=True, gptq_calib=окна, device=RWKVQ_DEVICE) против
 fake-пути calibration.gptq.run с теми же окнами (детерминизм проверен побитно: gptq_run_freeze_3009).
@@ -49,7 +50,15 @@ def part1():
                 assert torch.equal(a, b.to(a.dtype)), (bits, sbb, e is None, k)
             assert torch.equal(p["deq"], r["deq"]), (bits, sbb, "deq")
             n += 1
-    print("1. части GPTQ при диагональной H == _gw_one побитно: %d комбинаций" % n, flush=True)
+    m = 0
+    for bits in (6, 8):                    # 01.10: sym (REDUCTION) -- части == _sym_one побитно
+        for e, srch in ((ex, True), (None, True), (None, False)):
+            p = G.gptq_parts_sym(W.clone(), torch.diag((e if e is not None else torch.ones(1024)) * 1000.0), bits, e, 0.0, 16, 16, srch)
+            r = gw._sym_one(W.clone(), bits, 16, 16, e, srch, 0.0, True)
+            for k in ("q", "qs", "d", "deq"):
+                assert torch.equal(p[k], r[k].view(p[k].shape).to(p[k].dtype)), (bits, e is None, srch, k)
+            m += 1
+    print("1. части GPTQ при диагональной H == _gw_one (sb6) побитно: %d комбинаций; == _sym_one (sym): %d" % (n, m), flush=True)
 
 
 def _windows():
@@ -58,9 +67,9 @@ def _windows():
     return torch.tensor(A._windows(chunks, enc, A.SEQ_LEN, NW * A.SEQ_LEN)[:NW], dtype=torch.long)
 
 
-def part2():
+def part2(preset="compression"):
     _, sig = A.collect(CK, TOK)
-    cfg = copy.deepcopy(presets.COMPRESSION)
+    cfg = copy.deepcopy(presets.COMPRESSION if preset == "compression" else presets.REDUCTION)
     cfg.act_stats_path = os.path.join(A.CACHE_DIR, "act_%s.pt" % sig)
     cal = _windows()
     t0 = time.time()
@@ -71,17 +80,17 @@ def part2():
               if not (i == 0 and m == "att.output")) + 1
     assert len(qts) == exp, (len(qts), exp)
     assert all(torch.isfinite(v).all() for v in deqs.values())
-    print("2a. GPTQ (fake-путь, устройство %s): %d матриц (ожидалось %d), %.0f с" % (DEV, len(qts), exp, time.time() - t0), flush=True)
+    print("2a. [%s] GPTQ (fake-путь, устройство %s): %d матриц (ожидалось %d), %.0f с" % (preset, DEV, len(qts), exp, time.time() - t0), flush=True)
     d = tempfile.mkdtemp()
     fg, fr = os.path.join(d, "g.rwkvq"), os.path.join(d, "r.rwkvq")
     nw0 = G.N_WINDOWS
     G.N_WINDOWS = NW                       # гейт -- на NW окнах; в библиотеке всегда 600
     try:
-        api.quantize(CK, fg, preset="compression", tokenizer=TOK, autopick=False, gptq=True, gptq_calib=cal,
+        api.quantize(CK, fg, preset=preset, tokenizer=TOK, autopick=False, gptq=True, gptq_calib=cal,
                      device=DEV, verbose=False)
     finally:
         G.N_WINDOWS = nw0
-    api.quantize(CK, fr, preset="compression", tokenizer=TOK, autopick=False, gptq=False, verbose=False)
+    api.quantize(CK, fr, preset=preset, tokenizer=TOK, autopick=False, gptq=False, verbose=False)
     cg, cr = Rd.load_raw(fg), Rd.load_raw(fr)
     ng = nsame = 0
     for k, qt in cg.tensors.items():
@@ -108,9 +117,9 @@ def part2():
     exp_sha = hashlib.sha1(cal.numpy().tobytes()).hexdigest()[:16]
     assert g.get("windows") == NW and g.get("damp") == G.DAMP and g.get("calib_sha") == exp_sha and \
         g.get("matrices") == len(deqs) and "gptq" not in man_r, (g, "gptq" in man_r)
-    print("2b. quantize(gptq=True): %d GPTQ-тензоров декодируются ридером в deq fake-пути побитно; %d прочих побайтно "
+    print("2b. [%s] quantize(gptq=True): %d GPTQ-тензоров декодируются ридером в deq fake-пути побитно; %d прочих побайтно "
           "как quantize(gptq=False); размеры %.2f / %.2f МБ; манифест gptq: %s" % (
-              ng, nsame, os.path.getsize(fg) / 1e6, os.path.getsize(fr) / 1e6, g), flush=True)
+              preset, ng, nsame, os.path.getsize(fg) / 1e6, os.path.getsize(fr) / 1e6, g), flush=True)
     assert os.path.getsize(fg) == os.path.getsize(fr) or abs(os.path.getsize(fg) - os.path.getsize(fr)) < 4096
     # неявное умолчание: compression без real_gw не зовёт GPTQ; без корпуса -- пропуск с причиной, а не отказ
     assert api._gptq_skip_reason(CK, DEV, cal) is None
@@ -133,8 +142,9 @@ def part6():
     G.run = lambda *a, **k: calls.append(k.get("device")) or {}
     d = tempfile.mkdtemp()
     try:
-        cases = [("compression", {}, 1), ("reduction", {}, 0), ("compression", dict(real_gw=False), 0),
-                 ("compression", dict(config=copy.deepcopy(presets.COMPRESSION)), 0), ("reduction", dict(gptq=True), 1)]
+        cases = [("compression", {}, 1), ("reduction", {}, 1), ("compression", dict(real_gw=False), 0),
+                 ("reduction", dict(real_gw=False), 0), ("compression", dict(config=copy.deepcopy(presets.COMPRESSION)), 0),
+                 ("reduction", dict(config=copy.deepcopy(presets.REDUCTION)), 0), ("reduction", dict(gptq=False), 0)]
         for i, (pr, kw, n) in enumerate(cases):
             calls.clear()
             api.quantize(CK, os.path.join(d, "%d.rwkvq" % i), preset=pr, tokenizer=TOK, autopick=False, verbose=False, **kw)
@@ -151,7 +161,7 @@ def part6():
             pass
     finally:
         G.run, G.CALIB_FILE = run0, file0
-    print("6. умолчание GPTQ: compression -- да; reduction / real_gw=False / свой config -- нет; явный -- да; "
+    print("6. умолчание GPTQ: compression и reduction -- да; real_gw=False / свой config / gptq=False -- нет; "
           "без корпуса: неявный пропущен, явный -- отказ", flush=True)
 
 
@@ -169,7 +179,7 @@ def part5(cfg):
     assert sorted(a) == sorted(b) and not bad
 
 
-def part3(cfg, deqs):
+def part3(cfg, deqs, preset="compression"):
     from rwkv_quant.models import rwkv7_ref as R
     dev = G.devices(DEV)[0]
     M = R.RWKV7Ref(CK, device=dev, dtype=torch.bfloat16, compute_dtype=torch.float32)
@@ -191,7 +201,7 @@ def part3(cfg, deqs):
         c = copy.copy(cfg)
         c.bits_overrides = dict({k: 16 for k in deqs}, **{k: v for k, v in cfg.bits_overrides.items() if k not in deqs})
         k_g = kl(torch.log_softmax(M.forward(X, cfg=c).float(), -1))
-    print("3. KL к bf16 на 8 окнах отложенного кода: RTN %.5f, GPTQ %.5f (%+.1f%%)" % (k_rtn, k_g, 100 * (k_g / k_rtn - 1)), flush=True)
+    print("3. [%s] KL к bf16 на 8 окнах отложенного кода: RTN %.5f, GPTQ %.5f (%+.1f%%)" % (preset, k_rtn, k_g, 100 * (k_g / k_rtn - 1)), flush=True)
     assert k_g < k_rtn
 
 
@@ -199,7 +209,10 @@ if __name__ == "__main__":
     part1()
     cfg, deqs = part2()
     part3(cfg, deqs)
+    cfg_r, deqs_r = part2("reduction")     # 01.10: GPTQ в REDUCTION (sym)
+    part3(cfg_r, deqs_r, "reduction")
     part4()
     part6()
     part5(cfg)
+    part5(cfg_r)
     print("test_quantize_gptq: ЗЕЛЁНЫЙ")
