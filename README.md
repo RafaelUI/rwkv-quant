@@ -10,11 +10,127 @@ Reference machine: M4 MacBook Air 16 GB (base chip, fanless).
 
 ## Results
 
-Quality on a **multilingual held-out corpus** (38 x 512 tokens = 19 456
-predictions; Russian / English / Serbian), scored end-to-end through the
-real quantized kernel. Speed on an M4 MacBook Air 16 GB, fanless.
+Quality on **held-out text and code** that no calibration step has seen,
+scored end-to-end from the written `.rwkvq` file through the real quantized
+Metal kernels. Speed on an M4 MacBook Air 16 GB, fanless.
 
-### Quality across four scales
+### Quality across six scales (2026-10-01)
+
+Every file below is what `quantize(path, out, preset=..., tokenizer=tok)`
+writes with its defaults, nothing else set:
+
+- `reduction` runs GPTQ;
+- `compression` runs autopick and GPTQ.
+
+What both do is described under [Quick start](#quick-start).
+
+| model | build | file | vs bf16 | Δppl text [95% CI] | Δppl code [95% CI] | KL text / code |
+|---|---|---|---|---|---|---|
+| **0.1B** `g1d` | `reduction` | 191.3 MB | 2.00x | +0.48% [+0.35; +0.61] | +0.46% [+0.24; +0.65] | 0.0043 / 0.0043 |
+| | `compression` | 134.4 MB | 2.84x | +2.78% [+2.29; +3.26] | +2.68% [+2.12; +3.24] | 0.0279 / 0.0275 |
+| **0.4B** `g1d` | `reduction` | 434.1 MB | 2.08x | +0.21% [+0.10; +0.32] | +0.18% [+0.06; +0.29] | 0.0024 / 0.0022 |
+| | `compression` | 299.2 MB | 3.01x | +2.58% [+2.12; +3.05] | +2.23% [+1.63; +2.85] | 0.0260 / 0.0256 |
+| **1.5B** `g1j` | `reduction` | 1439.0 MB | 2.12x | +0.27% [+0.17; +0.37] | +0.04% [−0.07; +0.15] | 0.0017 / 0.0017 |
+| | `compression` | 996.5 MB | 3.07x | +1.97% [+1.55; +2.44] | +1.82% [+1.30; +2.35] | 0.0181 / 0.0192 |
+| **2.9B** `g1j` | `reduction` | 2743.3 MB | 2.15x | +0.09% [−0.01; +0.19] | +0.15% [+0.06; +0.25] | 0.0013 / 0.0012 |
+| | `compression` | 1891.8 MB | 3.12x | +1.32% [+1.09; +1.55] | +1.15% [+0.80; +1.50] | 0.0149 / 0.0145 |
+| **7.2B** `g1j` † | `reduction` | 6648 MB | 2.17x | +0.13% | +0.09% | 0.0009 / 0.0008 |
+| | `compression` | 4576 MB | 3.15x | +1.07% | +0.46% | 0.0096 / 0.0087 |
+| **13.3B** `g1j` † | `reduction` | 12178 MB | 2.18x | +0.07% | +0.09% | 0.0007 / 0.0006 |
+| | `compression` | 8377 MB | 3.17x | +0.58% | +0.27% | 0.0066 / 0.0061 |
+
+**How it was measured:**
+
+- **Text** — 36 windows of 512 tokens from Wikipedia, 12 each in English,
+  Russian and Serbian.
+- **Code** — 24 windows of Python and Swift. The code set is private and is
+  not published.
+- **Isolation.** Neither set shares a single 16-token sequence with the
+  activation-statistics corpus, nor with the GPTQ calibration corpus; this is
+  checked before every measurement.
+- **Δppl** is relative to the dense model (bf16 weights, fp32 activations)
+  on the same windows. The 95% intervals are from a paired bootstrap over
+  windows.
+- **KL** (nats/token, against the dense model) comes from the PyTorch
+  reference path on a 4x RTX 4090 server. Its quantized codes are identical
+  to the file's, which is checked bit for bit by a gate.
+- **† 7.2B and 13.3B** do not fit the 16 GB Mac. Their Δppl is from the same
+  server path, so it has no interval. Their file sizes are real files written
+  by the library.
+
+The real path and the server path agree:
+
+| | 0.1B | 0.4B | 1.5B | 2.9B |
+|---|---|---|---|---|
+| `reduction`, text | ±0.01 | ±0.01 | ±0.01 | ±0.01 |
+| `compression`, text | −0.06 | −0.14 | −0.14 | +0.04 |
+| `compression`, code | 0 | +0.01 | **+0.33** | +0.11 |
+
+Points of Δppl, real minus server. The `compression` differences are larger,
+and their cause is not established. The fast layer norm that `compression`
+files request is ruled out: at 1.5B, turning it off gives the same numbers
+(+1.98% / +1.82%).
+
+The files and the decoded codes are identical on both paths; the paths
+differ in kernels, accumulation precision and the embedding gather. So the
+real-path column is the one that describes what you get.
+
+What the two defaults buy over the plain presets, KL to the dense model on
+the same windows (server path):
+
+| model | `compression` text / code | `reduction` text / code |
+|---|---|---|
+| 0.1B | −62% / −63% | −22% / −28% |
+| 0.4B | −46% / −43% | −23% / −27% |
+| 1.5B | −52% / −55% | −28% / −32% |
+| 2.9B | −45% / −51% | −30% / −34% |
+| 7.2B | −43% / −45% | −21% / −24% |
+| 13.3B | −41% / −48% | −17% / −32% |
+
+The sizes are the same within 0.2%: GPTQ changes which codes are written,
+not how many. Autopick's budget is +0.5% of the file and stops below it.
+
+For `compression` the effect is large in perplexity too: 1.5B goes from
++3.91% to +2.11% on text, 0.1B from +7.80% to +2.84% (server path).
+
+For `reduction` the KL gain is significant on every language of every
+model (paired bootstrap), but the perplexity change is inside noise
+(±0.1%). The one exception is Russian at 13.3B, at +0.11% [+0.03; +0.19].
+That is one significant result in about 30 comparisons, which is what
+chance alone gives at 95%. It stays on by default because `reduction` is
+meant as the faithful copy — a base for QLoRA or an embedding model — and
+KL is the measure of that faithfulness.
+
+> **Correction (2026-10-01).** Everything below this point, under
+> [Earlier measurements](#earlier-measurements-before-2026-10-01), was scored
+> on `eval_corpus_multiling` (38 x 512). This file used to say that corpus
+> was disjoint from the activation statistics. It is not.
+>
+> - **AW statistics.** Their 23 windows contain 23.9% of the corpus's
+>   16-token sequences and touch 13 of its 38 windows.
+> - **The whole corpus.** It lies entirely inside the repository calibration
+>   text: 100% of its 16-grams.
+>
+> Sizes of the effect:
+>
+> - **AW.** The bias favours AW and was never measured. Comparisons inside
+>   those sections — which matrix, which bit width — carry the same bias on
+>   both sides.
+> - **GPTQ.** It calibrates on its own corpus, so the overlap mattered far
+>   more there. Calibrating GPTQ on the repository text inflated its text
+>   gain at 1.5B from −27% to −62% in KL.
+>
+> The table above uses neither corpus.
+
+### Earlier measurements (before 2026-10-01)
+
+Rows in this section: `g1h` checkpoints at 1.5B / 2.9B, plain presets
+without GPTQ or autopick, and the overlapping corpus described in the
+correction above. They are kept because the comparisons inside them
+(layer-0 `o_proj`, 6-bit embedding, LoRA layout) were each measured
+against a twin under the same conditions.
+
+#### Quality across four scales (2026-09-21)
 
 Same corpus, same tokenizer, same harness for every row. `reduction` is the
 near-lossless preset, `compression` trades quality for size. Sizes are the
@@ -156,6 +272,10 @@ Two things changed on 2026-08-28, and both moved every row:
    claimed. Calibrating on the text the perplexity is measured on flattered
    `reduction` by about 0.13 points and `compression` by about 0.5 points at
    1.5B.
+
+   *2026-10-01:* the shipped default still overlaps the evaluation corpus
+   (23.9% of its 16-grams; see the correction at the top of Results).
+   Current numbers use different held-out sets.
 
 Measured at 1.5B, all four corners, so neither effect has to be taken on
 trust:
@@ -415,10 +535,13 @@ Quality numbers come from `eval_corpus_multiling.pt`: 38 sequences x 512
 tokens = 19 456 scored predictions, split 20 Russian / 9 English / 9
 Serbian, tokenized once with the standard RWKV World tokenizer
 (byte-level trie, greedy longest match) and reused unchanged across every
-row. Activation statistics for the AW modes are collected on a **held-out
-corpus** — never on the text the perplexity is measured on. Numbers
-published before 2026-08-28 did not honour that rule; see the note under
-Results for the measured size of the difference. **This is not
+row.
+
+That paragraph used to say the activation statistics were collected on a
+held-out corpus. For the shipped default this is not true: it overlaps
+this evaluation corpus (see the correction at the top of Results). Since
+2026-10-01 the headline numbers use Wikipedia text and code sets that share
+no 16-gram with any calibration corpus. **This is not
 a published benchmark** — not WikiText, not LAMBADA — so absolute ppl is
 meaningful only *relative to other rows here*, on this exact corpus, with
 this exact tokenizer.
@@ -457,11 +580,58 @@ row; only the linear projections differ by scheme.
 ```python
 from rwkv_quant import quantize
 
-# near-lossless: 2.1x smaller, +0.04% ppl on 1.5B, +0.06% on 2.9B (table above)
+# near-lossless: 2.1x smaller, +0.27% ppl on 1.5B, +0.09% on 2.9B (held-out text, table above)
 quantize("model.pth", "model.rwkvq", preset="reduction", tokenizer=tok)
 
-# 3.1x smaller, +2.82% ppl on 1.5B, +1.85% on 2.9B, fastest decode
+# 3.1x smaller, +1.97% ppl on 1.5B, +1.32% on 2.9B, fastest decode
 quantize("model.pth", "model.rwkvq", preset="compression", tokenizer=tok)
+
+# on a CUDA machine, layers spread over several cards
+quantize("model.pth", "model.rwkvq", preset="compression", tokenizer=tok, device="cuda:0,cuda:1")
+```
+
+**GPTQ is on by default in both presets.** It keeps the format and the file
+size and changes only which code each weight gets. Instead of rounding every
+weight to its nearest level independently, it goes through the input
+columns of each matrix in order, and spreads each column's rounding error
+onto the columns not yet quantized, weighted by the inverse of the matrix's
+input covariance H (Frantar et al., 2022). H is measured on calibration
+text.
+
+How it fits this library:
+
+- **Same grid.** Each superblock's scales are still chosen by the preset's
+  own search (activation-weighted where the preset is), on the weights as
+  already corrected. The writer packs the result with the same code that
+  packs plain rounding.
+- **Sequential.** Layers are processed in order, so each matrix sees inputs
+  from a model whose earlier matrices are already quantized.
+- **Not the embedding.** The embedding is a table lookup and is left alone.
+
+Settings:
+
+- **Calibration** — 600 windows of 512 tokens from
+  `rwkv_quant/data/gptq_calib.jsonl` (1.3 MB). The mix is English 30%,
+  Russian 20%, code 20% (six languages), Chinese 10%, Serbian 10% (Cyrillic
+  and Latin), reasoning traces 10%. Sources: FineWeb-Edu, FineWeb-2,
+  UltraData-Code, oasst2, a public-domain Russian literature corpus,
+  novel_text, two distillation datasets, and this project's own code. The
+  text is tokenized with your tokenizer, like the activation statistics.
+- **Dampening** — `damp=0.1`. A smaller value overfits: at 0.01 and 48
+  windows, 7.2B and 13.3B came out *worse* than plain rounding on English
+  text.
+
+What it costs:
+
+- **Time.** On one RTX 4090: 1.5B ≈ 42 min, 2.9B ≈ 80 min. 7.2B ≈ 2.5 h on
+  two cards, 13.3B ≈ 4.7 h on four. Not timed on an M4 at 600 windows;
+  expect hours for 1.5B.
+- **Memory.** The dense model in memory, plus the calibration activations on
+  the host: 2 x 600 x 511 x hidden size x 4 bytes, about 5 GB at 1.5B.
+
+If the two do not fit in 60% of memory, the implicit GPTQ is skipped with a
+notice. `gptq=False` turns it off; `gptq_calib=` takes your own windows. The
+run is recorded in the file manifest.
 ```
 
 With `preset="compression"`, `quantize()` also runs **autopick** by default:
@@ -469,10 +639,14 @@ it measures how much each matrix's quantization error costs this particular
 checkpoint and moves bits to where a byte buys the most (up where it pays,
 down to no fewer than 4 bits where it does not), within a size budget of
 +0.5% of the file (`autopick_budget`, a fraction; `0` keeps the size
-unchanged). On RWKV-7 g1j 1.5B this cuts KL to the bf16 model by 17.6% on
-held-out text (Wikipedia en/ru/sr, no 16-gram shared with the calibration
-corpus) and 13.5% on held-out code; the perplexity gap goes +3.88% -> +3.25%
-on the text and +3.86% -> +3.32% on the code.
+unchanged). On RWKV-7 g1j 1.5B, without GPTQ, this cuts KL to the bf16 model
+by 17.6% on held-out text and 13.5% on held-out code. Text is Wikipedia
+en/ru/sr with no 16-gram shared with the calibration corpus. The perplexity
+gap goes +3.88% -> +3.25% on the text and +3.86% -> +3.32% on the code.
+
+Together with GPTQ the two gains nearly multiply on five of the six model
+sizes. The exception is 2.9B, where autopick adds only 5% on top of GPTQ;
+see the table at the top.
 The measurement needs the dense model in memory and takes about an hour for
 1.5B on an M4 (linear in model depth x windows; cached under
 `~/.cache/rwkv-quant/measure`). If the dense model would take more than 30%
@@ -754,8 +928,10 @@ Two consequences that are easy to miss:
   Any preset change is validated on both checkpoints before it lands.
 - Kernel dispatch tables are tuned on an M4 base chip; other Apple Silicon
   will work but may prefer different (simdgroups x rows) configs.
-- ppl deltas are measured on one held-out corpus; treat them as relative
-  quality signals, not benchmarks.
+- ppl deltas are measured on 36 windows of Wikipedia text and 24 windows of
+  code (60 x 512 tokens). Treat them as relative quality signals, not
+  benchmarks. The code set is private, so that column cannot be reproduced
+  from this repository.
 - `scripts/` and `examples/` are placeholders for now — the maintained entry
   points are `rwkv_quant.api` and the benches/gates under `tests/`.
 - CUDA backend is an empty stub; Metal is the only real inference path today.

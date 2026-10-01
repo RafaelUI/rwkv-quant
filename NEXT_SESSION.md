@@ -2501,3 +2501,22 @@ cholesky(upper=True), библиотека -- нижний фактор + .mT (�
 был на нижнем факторе -- отсюда точное совпадение.
 Очередь: README (цифры GPTQ -- с записанных файлов, реальный путь Mac, до 2.9B); 13.3B REDUCTION+GPTQ не мерен;
 гипотеза 2.9B (autopick поверх GPTQ); старое -- L_wkvblk, пара с int6, emb-gather sb6.
+
+### 01-02.10 — README НА ЧИСТЫХ НАБОРАХ; 13.3B REDUCTION+GPTQ; test_fast_ln_intent ЦЕЛ
+- 13.3B REDUCTION+GPTQ (прототип, 600 окон, 4 карты, 5.2 ч при совместной загрузке): KL текст -17.1 [-20.3; -13.7] (en -16.2,
+  ru -20.0, sr -15.2), код -31.6; ppl текст +0.07 -> +0.07%, код +0.10 -> +0.09%; РУССКИЙ ppl +0.11% [+0.03; +0.19] -- первый
+  значимый минус по ppl (одно из ~30 сравнений -- в пределах случайности на 95%). Статья раздел 14 дополнена.
+- README: Results переписан (раздел «Quality across six scales (2026-10-01)»): файлы с УМОЛЧАНИЯМИ quantize() собраны на
+  сервере (tests/_sess/make_default_files_0110.py, ~/rwkvq/files_0110/), скачаны на Mac (WKV-kvant/files_0110/, md5),
+  ppl реальным путём Metal на eval_text_heldout + eval_code_heldout (tests/_sess/real_ppl_heldout_0110.py, JSON
+  WKV-kvant/real_ppl_heldout_0110.json, бутстрэп по окнам). База (плотная модель на MPS) == серверной до 1e-6 по CE.
+  7.2B/13.3B -- серверный путь. Своп Mac за прогоны файлов ~0 (2.9B эталон +1.2 ГБ).
+- Реальный путь против серверного: reduction ±0.01 п.; compression до +0.33 п. (1.5B код). fast_ln ИСКЛЮЧЁН (1.5B с
+  fast_ln=False: +1.98 / +1.82, те же). Причина не установлена (кернели / накопление / emb-gather).
+- НАХОДКА: README врал про «непересекающуюся» AW-статистику: её 23 окна содержат 23.9% 16-грамм eval_corpus_multiling
+  (13 из 38 окон); весь eval_corpus_multiling -- внутри calib_corpus. В README -- поправка над старыми таблицами (раздел
+  «Earlier measurements»), исправлены абзацы про держание корпуса и Caveats. Quick start: цифры, GPTQ (что делает,
+  корпус и источники, damp, время, память, gptq=False), device="cuda:0,cuda:1".
+- Гипотеза 2.9B про o_proj L0 СНЯТА (он bf16 в обоих пресетах); в статье -- состав выбора autopick по моделям.
+- test_fast_ln_intent: эталон compression_0p1b_l0_2009.rwkvq ПЕРЕСОБРАН кодом 0208ec5 (git worktree) -- не исходные байты;
+  гейт пройден целиком.
