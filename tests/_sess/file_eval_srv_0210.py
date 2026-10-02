@@ -9,6 +9,16 @@ from rwkv_quant.calibration import autopick as ap
 from rwkv_quant.formats.reader import load_dequantized
 from rwkv_quant.models.rwkv7_ref import RWKV7Ref
 F, CK, PJ = sys.argv[1:4]
+FP32 = os.environ.get("RWKVQ_FILE_FP32") == "1"
+if FP32:
+    # 02.10: деквант БЕЗ финального округления в bf16 (reader округляет; fake-путь и прототип GPTQ держат fp32) --
+    # тексты функций reader берутся как есть, вычёркивается только .to(torch.bfloat16)
+    import inspect
+    from rwkv_quant.formats import reader as _rd
+    for _fn in ("_dequantize_gw_sb6", "_dequantize_gw_sym"):
+        _src = inspect.getsource(getattr(_rd, _fn)).replace(".to(torch.bfloat16)", "")
+        exec(compile(_src, _rd.__file__, "exec"), _rd.__dict__)
+    _probe = inspect.getsource(_rd._dequantize_one)
 t0 = time.time()
 sd = torch.load(CK, map_location="cpu", mmap=True, weights_only=True)
 dq = load_dequantized(F)
@@ -17,7 +27,7 @@ for k, v in sd.items():
     w = dq[k]
     if tuple(w.shape) != tuple(v.shape):
         w = w.T if (w.dim() == 2 and tuple(w.T.shape) == tuple(v.shape)) else w.reshape(v.shape)
-    out[k] = w.to(v.dtype).contiguous()
+    out[k] = (w.float() if FP32 else w.to(v.dtype)).contiguous()
 tmp = "/tmp/deq_%s.pth" % os.path.basename(F)
 torch.save(out, tmp); del out, dq
 ev = torch.load(os.path.expanduser("~/rwkvq/eval_text_heldout.pt")); cd = torch.load(os.path.expanduser("~/rwkvq/eval_code_heldout.pt"))
@@ -28,8 +38,8 @@ W = torch.tensor(wins, dtype=torch.long)
 BS = 11
 
 
-def run(path):
-    M = RWKV7Ref(path, device=DEV, dtype=torch.bfloat16, compute_dtype=torch.float32)
+def run(path, dt=torch.bfloat16):
+    M = RWKV7Ref(path, device=DEV, dtype=dt, compute_dtype=torch.float32)
     data = W[:, :-1].contiguous().to(M.devices[0])
     I = ap._Instrument(M, data)
     with torch.no_grad():
@@ -39,7 +49,7 @@ def run(path):
 
 with torch.no_grad():
     href, head_ref, kdt = run(CK)
-    hq, head_q, _ = run(tmp)
+    hq, head_q, _ = run(tmp, torch.float32 if FP32 else torch.bfloat16)
     tgt = W[:, 1:].to(hq.device)
     kl, ce = [], []
     for j in range(hq.shape[0]):
@@ -54,5 +64,5 @@ for k in ("text", "code"):
     print("%-4s KL файл %.6f, прототип %.6f (%+.2f%%) | Δppl к эталону: файл %+.3f%%, прототип %+.3f%%" % (
         k, mean(kl, k), mean(p["kl"]["gptq"], k), 100 * (mean(kl, k) / mean(p["kl"]["gptq"], k) - 1),
         100 * (math.exp(mean(ce, k) - mean(p["ce"]["ref"], k)) - 1), 100 * (math.exp(mean(p["ce"]["gptq"], k) - mean(p["ce"]["ref"], k)) - 1)), flush=True)
-json.dump(dict(kl=kl, ce=ce, kind=kind), open(os.path.expanduser("~/rwkvq/file_eval_%s.json" % os.path.basename(F)), "w"))
+json.dump(dict(kl=kl, ce=ce, kind=kind), open(os.path.expanduser("~/rwkvq/file_eval_%s%s.json" % (os.path.basename(F), "_fp32" if FP32 else "")), "w"))
 print("всего %.0f с" % (time.time() - t0))
