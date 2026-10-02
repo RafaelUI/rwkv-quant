@@ -57,6 +57,12 @@ What both do is described under [Quick start](#quick-start).
 - **† 7.2B and 13.3B** do not fit the 16 GB Mac. Their Δppl is from the same
   server path, so it has no interval. Their file sizes are real files written
   by the library.
+- **GPTQ in the † rows is the research prototype, not the library.** The
+  library's GPTQ is deterministic: two runs on two cards and a file written
+  under load matched bit for bit. A numerically equivalent implementation
+  (another Cholesky factorization, ~1e-15 apart) still lands on different
+  codes. That moved KL by ±5% and code Δppl by up to 0.35 points at 1.5B and
+  2.9B, so treat single GPTQ numbers with that margin.
 
 The real path and the server path agree:
 
@@ -66,14 +72,14 @@ The real path and the server path agree:
 | `compression`, text | −0.06 | −0.14 | −0.14 | +0.04 |
 | `compression`, code | 0 | +0.01 | **+0.33** | +0.11 |
 
-Points of Δppl, real minus server. The `compression` differences are larger,
-and their cause is not established. The fast layer norm that `compression`
-files request is ruled out: at 1.5B, turning it off gives the same numbers
-(+1.98% / +1.82%).
+Points of Δppl, real minus server. The Metal kernels are faithful: the same
+file decoded into PyTorch gives the real-path numbers within 0.02 points
+(1.5B `compression`: +1.99% / +1.84% against +1.97% / +1.82%).
 
-The files and the decoded codes are identical on both paths; the paths
-differ in kernels, accumulation precision and the embedding gather. So the
-real-path column is the one that describes what you get.
+The larger `compression` differences come from the server column. It
+measures the research prototype's GPTQ, and that lands on different codes
+than the library (see the † note). So the real-path column is the one that
+describes what you get.
 
 What the two defaults buy over the plain presets, KL to the dense model on
 the same windows (server path):
