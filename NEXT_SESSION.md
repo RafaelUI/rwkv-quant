@@ -2533,3 +2533,16 @@ cholesky(upper=True), библиотека -- нижний фактор + .mT (�
   РЕШЕНИЕ ВЛАДЕЛЬЦА: во что декодировать reader (bf16 / fp16 / fp32).
 - README: поправлены примечания (кернели верны; † строки -- прототип, погрешность реализации); статья: абзац о разбросе GPTQ.
 - Время GPTQ на M4 при 600 окнах НЕ замерено (теперь умолчание обоих пресетов).
+
+### 02.10 (вечер) — READER ДЕКОДИРУЕТ В FP16 (решение владельца; 5ae1010)
+- reader: все финальные касты bf16 -> fp16 (sb6, sym, asym, int8-строчный), outliers .to(w.dtype); dequantize_banded по умолчанию
+  fp16; Metal emb-gather больше не повторяет bf16-округление. Эталонные копии гейтов test_codec_parity и test_dense_load_parity --
+  тот же каст (арифметика не тронута). Гейты: test_codec_parity, test_emb_gather_parity, test_dense_load_parity,
+  test_gw_kernel_int6 -- зелёные.
+- ДОЛГ: артефакты ~/Develop/WKV-kvant/artifacts/*.rwkvq, на которые смотрит tests/restore_tmp.sh, УДАЛЕНЫ уборкой 29.09
+  (reduction_1p5b_1709 и др.). На эту сессию /tmp/reduction_new, reduction_2p9b_new, champion_v2 -- ссылки на files_0110
+  (1p5b/2p9b reduction, 1p5b compression). restore_tmp.sh надо перевести на живые файлы или пересобрать артефакты.
+- Эффект: torch-путь (file_eval_srv_0210, fp16-деквант): 0.1B REDUCTION файл против прототипа KL -0.03 / +0.20% (с bf16 было
+  +2.8 / +3.4%), 1.5B REDUCTION +0.10 / -0.29% (было +3.1 / +2.5%) -- REDUCTION библиотеки == прототип. COMPRESSION 1.5B
+  +0.97 / +4.12% -- без изменений (разброс GPTQ между реализациями). Реальный путь Metal: Δppl в пределах ±0.04 п. (линейные
+  слои декодируются в кернелях); README перемерен (плечи *_fp16 в real_ppl_heldout_0110.json).

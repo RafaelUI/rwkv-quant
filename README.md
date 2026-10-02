@@ -26,14 +26,14 @@ What both do is described under [Quick start](#quick-start).
 
 | model | build | file | vs bf16 | Δppl text [95% CI] | Δppl code [95% CI] | KL text / code |
 |---|---|---|---|---|---|---|
-| **0.1B** `g1d` | `reduction` | 191.3 MB | 2.00x | +0.48% [+0.35; +0.61] | +0.46% [+0.24; +0.65] | 0.0043 / 0.0043 |
-| | `compression` | 134.4 MB | 2.84x | +2.78% [+2.29; +3.26] | +2.68% [+2.12; +3.24] | 0.0279 / 0.0275 |
-| **0.4B** `g1d` | `reduction` | 434.1 MB | 2.08x | +0.21% [+0.10; +0.32] | +0.18% [+0.06; +0.29] | 0.0024 / 0.0022 |
-| | `compression` | 299.2 MB | 3.01x | +2.58% [+2.12; +3.05] | +2.23% [+1.63; +2.85] | 0.0260 / 0.0256 |
-| **1.5B** `g1j` | `reduction` | 1439.0 MB | 2.12x | +0.27% [+0.17; +0.37] | +0.04% [−0.07; +0.15] | 0.0017 / 0.0017 |
-| | `compression` | 996.5 MB | 3.07x | +1.97% [+1.55; +2.44] | +1.82% [+1.30; +2.35] | 0.0181 / 0.0192 |
-| **2.9B** `g1j` | `reduction` | 2743.3 MB | 2.15x | +0.09% [−0.01; +0.19] | +0.15% [+0.06; +0.25] | 0.0013 / 0.0012 |
-| | `compression` | 1891.8 MB | 3.12x | +1.32% [+1.09; +1.55] | +1.15% [+0.80; +1.50] | 0.0149 / 0.0145 |
+| **0.1B** `g1d` | `reduction` | 191.3 MB | 2.00x | +0.47% [+0.34; +0.60] | +0.47% [+0.27; +0.67] | 0.0043 / 0.0043 |
+| | `compression` | 134.4 MB | 2.84x | +2.77% [+2.28; +3.24] | +2.70% [+2.14; +3.26] | 0.0279 / 0.0275 |
+| **0.4B** `g1d` | `reduction` | 434.1 MB | 2.08x | +0.20% [+0.10; +0.31] | +0.18% [+0.07; +0.29] | 0.0024 / 0.0022 |
+| | `compression` | 299.2 MB | 3.01x | +2.57% [+2.11; +3.05] | +2.22% [+1.63; +2.84] | 0.0260 / 0.0256 |
+| **1.5B** `g1j` | `reduction` | 1439.0 MB | 2.12x | +0.27% [+0.17; +0.37] | +0.04% [−0.06; +0.15] | 0.0017 / 0.0017 |
+| | `compression` | 996.5 MB | 3.07x | +1.98% [+1.54; +2.44] | +1.82% [+1.28; +2.35] | 0.0181 / 0.0192 |
+| **2.9B** `g1j` | `reduction` | 2743.3 MB | 2.15x | +0.09% [−0.01; +0.19] | +0.16% [+0.06; +0.25] | 0.0013 / 0.0012 |
+| | `compression` | 1891.8 MB | 3.12x | +1.32% [+1.09; +1.56] | +1.14% [+0.80; +1.50] | 0.0149 / 0.0145 |
 | **7.2B** `g1j` † | `reduction` | 6648 MB | 2.17x | +0.13% | +0.09% | 0.0009 / 0.0008 |
 | | `compression` | 4576 MB | 3.15x | +1.07% | +0.46% | 0.0096 / 0.0087 |
 | **13.3B** `g1j` † | `reduction` | 12178 MB | 2.18x | +0.07% | +0.09% | 0.0007 / 0.0006 |
@@ -57,6 +57,12 @@ What both do is described under [Quick start](#quick-start).
 - **† 7.2B and 13.3B** do not fit the 16 GB Mac. Their Δppl is from the same
   server path, so it has no interval. Their file sizes are real files written
   by the library.
+- **Decoding precision (2026-10-02).** The reader now decodes quantized
+  tensors to fp16 instead of bf16. Before, the extra bf16 rounding of 8-bit
+  values added 2–3% KL for PyTorch users of `load_dequantized`; with fp16 the
+  library file matches the measured research numbers within 0.3% KL.
+  On the Metal path it changes Δppl by at most 0.04 points, because the
+  linear layers decode inside the kernels; the rows above are re-measured.
 - **GPTQ in the † rows is the research prototype, not the library.** The
   library's GPTQ is deterministic: two runs on two cards and a file written
   under load matched bit for bit. A numerically equivalent implementation
