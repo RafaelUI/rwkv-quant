@@ -3,9 +3,17 @@
   - load_raw(path)         -> QuantizedCheckpoint как есть (для backends/,
                                которые будут делать реальный low-bit инференс
                                напрямую на codes/scale, без деквантования)
-  - load_dequantized(path) -> обычный bf16 state_dict, готовый для
-                               RWKV7Ref(...) -- нужен для валидации/сравнения
-                               ppl квантованной модели с оригиналом.
+  - load_dequantized(path) -> state_dict, готовый для RWKV7Ref(...) -- нужен для
+                               валидации/сравнения ppl квантованной модели с
+                               оригиналом. Квантованные тензоры -- в FP16, плотные
+                               (bits >= 16) -- как записаны.
+
+FP16, А НЕ BF16 (02.10, решение владельца). Деквант = код x масштаб в fp32; прежде он
+округлялся в bf16 (7 бит мантиссы), и у 8-битных кодов эта вторая ошибка достигала ~1/4
+шага сетки: +2-3% KL к bf16 у REDUCTION (1.5B: файл в torch +3.1% KL к fake-пути, в fp32
++0.5%). fp16 (10 бит) в 8 раз точнее при той же памяти; диапазон (до 65504) весам не
+тесен, а масштабы формата и так fp16. bf16-округление жило и в Metal-пути: плотная
+таблица эмбеддинга и LoRA шли через этот reader, emb-gather повторял оба округления.
 
 TORCH-FREE ДВОЙНИК (04.08). Нормативная реализация того же декванта без
 torch -- codec.dequant_sb6 / dequant_asym / dequant_rtn; именно с неё
@@ -122,10 +130,10 @@ def _dequantize_one(qt) -> torch.Tensor:
         return _dequantize_gw_sym(qt)
     if qt.gw_mode == "asym":
         return _dequantize_gw_asym(qt)
-    w = (int8_codes(qt).float() * qt.scale.float()).to(torch.bfloat16)
+    w = (int8_codes(qt).float() * qt.scale.float()).to(torch.float16)
     if qt.outlier_indices is not None and qt.outlier_indices.numel() > 0:
         rows, cols = qt.outlier_indices[:, 0].long(), qt.outlier_indices[:, 1].long()
-        w[rows, cols] = qt.outlier_values
+        w[rows, cols] = qt.outlier_values.to(w.dtype)
     return w
 
 
@@ -182,13 +190,13 @@ def can_band(qt) -> bool:
     return oi is None or oi.numel() == 0
 
 
-def dequantize_banded(qt, dtype=torch.bfloat16, chunk_mb=None) -> torch.Tensor:
+def dequantize_banded(qt, dtype=torch.float16, chunk_mb=None) -> torch.Tensor:
     """То же, что `_dequantize_one(qt).to(dtype)`, но результат собирается
     полосами строк сразу в `dtype`, поэтому пик равен результату плюс одна
     полоса, а не нескольким полноразмерным fp32-копиям.
 
     Каст внутрь НЕ переносится: полоса считается ровно тем же кодом и в тех
-    же fp32/bf16, что и целый тензор, и только потом округляется. Иначе это
+    же fp32/fp16, что и целый тензор, и только потом округляется. Иначе это
     была бы другая схема, а не оптимизация (закон 15)."""
     if not can_band(qt):
         return _dequantize_one(qt).to(dtype)
@@ -227,10 +235,10 @@ def _dequantize_gw_sb6(qt) -> torch.Tensor:
         # in-place по q законен -- он наш, выше он создан .to(float32).
         q = q.view(OUT, NB, gs)
         q.mul_(scale[..., None]).add_(mn[..., None])
-        return q.view(OUT, IN).to(torch.bfloat16)
+        return q.view(OUT, IN).to(torch.float16)
     scale_c = scale.repeat_interleave(gs, dim=1)              # ragged: NB*gs > IN
     mn_c = mn.repeat_interleave(gs, dim=1)
-    return (q * scale_c + mn_c).to(torch.bfloat16)
+    return (q * scale_c + mn_c).to(torch.float16)
 
 
 def _dequantize_gw_sym(qt) -> torch.Tensor:
@@ -254,8 +262,8 @@ def _dequantize_gw_sym(qt) -> torch.Tensor:
     if NB * gs == IN:
         q = q.view(OUT, NB, gs)
         q.mul_(scale[..., None])                               # см. sb6
-        return q.view(OUT, IN).to(torch.bfloat16)
-    return (q * scale.repeat_interleave(gs, dim=1)).to(torch.bfloat16)
+        return q.view(OUT, IN).to(torch.float16)
+    return (q * scale.repeat_interleave(gs, dim=1)).to(torch.float16)
 
 
 def _dequantize_gw_asym(qt) -> torch.Tensor:
@@ -266,10 +274,10 @@ def _dequantize_gw_asym(qt) -> torch.Tensor:
         NB = IN // gs
         q = q.view(OUT, NB, gs)
         q.mul_(qt.gw_scale[..., None]).add_(qt.gw_min[..., None])
-        return q.view(OUT, IN).to(torch.bfloat16)
+        return q.view(OUT, IN).to(torch.float16)
     # ragged (blocks.N.att.w1 [2048, 96] при gs=64 -- блоков ceil, не floor):
     # broadcast тут не выражается, идём прежним путём с развёрнутой индексацией
     idx = torch.arange(IN) // gs
     scale_c = qt.gw_scale[:, idx]
     mn_c = qt.gw_min[:, idx]
-    return (q * scale_c + mn_c).to(torch.bfloat16)
+    return (q * scale_c + mn_c).to(torch.float16)

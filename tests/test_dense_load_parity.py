@@ -44,6 +44,9 @@ from rwkv_quant.formats.schema import (int8_codes, unpack6,  # noqa: E402
 
 
 # --- ЗАМОРОЖЕННАЯ КОПИЯ ПРЕЖНЕГО КОДА (reader.py до правки памяти) ---------
+# 02.10: единственная правка копии -- финальный каст bf16 -> fp16 (решение владельца:
+# reader декодирует в fp16). Арифметика до каста не тронута; гейт по-прежнему охраняет
+# равенство пути полосами и прежнего кода, теперь при fp16-выходе обоих.
 
 def _old_sb6(qt):
     OUT, IN = qt.shape
@@ -61,7 +64,7 @@ def _old_sb6(qt):
     scale = (qs * d).half().float().clamp_min(1e-8)
     mn = (qm * dm).half().float()
     return (q * scale.repeat_interleave(gs, dim=1)
-            + mn.repeat_interleave(gs, dim=1)).to(torch.bfloat16)
+            + mn.repeat_interleave(gs, dim=1)).to(torch.float16)
 
 
 def _old_sym(qt):
@@ -78,7 +81,7 @@ def _old_sym(qt):
         q = (q - 32).to(torch.float32)
     d = qt.gw_d.float().repeat_interleave(qt.gw_sb, dim=1)
     scale = (qt.gw_qs.float() * d).half().float()
-    return (q * scale.repeat_interleave(gs, dim=1)).to(torch.bfloat16)
+    return (q * scale.repeat_interleave(gs, dim=1)).to(torch.float16)
 
 
 def _old_asym(qt):
@@ -86,7 +89,7 @@ def _old_asym(qt):
     gs = qt.gw_gs
     q = qt.codes.to(torch.float32)
     idx = torch.arange(IN) // gs
-    return (q * qt.gw_scale[:, idx] + qt.gw_min[:, idx]).to(torch.bfloat16)
+    return (q * qt.gw_scale[:, idx] + qt.gw_min[:, idx]).to(torch.float16)
 
 
 def _old_dequantize_one(qt):
@@ -98,11 +101,11 @@ def _old_dequantize_one(qt):
         return _old_sym(qt)
     if qt.gw_mode == "asym":
         return _old_asym(qt)
-    w = (int8_codes(qt).float() * qt.scale.float()).to(torch.bfloat16)
+    w = (int8_codes(qt).float() * qt.scale.float()).to(torch.float16)
     if qt.outlier_indices is not None and qt.outlier_indices.numel() > 0:
         rows = qt.outlier_indices[:, 0].long()
         cols = qt.outlier_indices[:, 1].long()
-        w[rows, cols] = qt.outlier_values
+        w[rows, cols] = qt.outlier_values.to(w.dtype)
     return w
 
 

@@ -188,12 +188,11 @@ def _dense(qt) -> mx.array:
 # an array during function transformations" (проверено). Значит буферы
 # обязаны жить в MLX целиком.
 #
-# ТОЖДЕСТВО. Плотный путь считает в fp32, округляет в BFLOAT16
-# (reader._dequantize_gw_sym) и лишь потом кладёт результат в fp16
-# (dequantize_banded). То есть таблица несёт точность bf16 в fp16-
-# контейнере. Здесь повторены ОБА округления: пропустить bf16 значило бы
-# сделать gather ТОЧНЕЕ эталона, а это смена чисел, требующая ppl-гейта,
-# а не оптимизация памяти. Гейт равенства -- tests/test_emb_gather_parity.py.
+# ТОЖДЕСТВО. Плотный путь считает в fp32 и округляет ОДИН раз -- в fp16
+# (reader._dequantize_gw_sym с 02.10; до того -- сперва в bf16, потом в fp16, и
+# здесь повторялись оба округления). Смена чисел, а не оптимизация: решение
+# владельца 02.10, ppl-замер в NEXT_SESSION. Гейт равенства обоих путей --
+# tests/test_emb_gather_parity.py.
 #
 # УМОЛЧАНИЕ ВКЛЮЧЕНО 26.08 РЕШЕНИЕМ ВЛАДЕЛЬЦА. Замерено на ОБОИХ
 # масштабах (bench_emb_gather_ab + bench_load_mem, чередование, прогретый
@@ -244,7 +243,7 @@ class SymGatherEmb:
         scale = (qs * d).astype(mx.float16).astype(mx.float32)
         w = c.reshape(c.shape[:-1] + (self.nb, self.gs)) * scale[..., None]
         w = w.reshape(c.shape)
-        return w.astype(mx.bfloat16).astype(mx.float16)
+        return w.astype(mx.float16)
 
 
 def _emb_table(qt):

@@ -128,6 +128,8 @@ def _ref_int8_codes(qt):
     return _ref_unpack_int4(qt.codes_packed, qt.shape[1])
 
 
+# 02.10: финальный каст эталонов bf16 -> fp16 (решение владельца: reader декодирует в fp16);
+# арифметика эталонов не тронута.
 def _ref_dequantize_one(qt):
     """Деквант ЦЕЛИКОМ на прежнем torch-коде, включая распаковку. Нужен,
     чтобы доказать: перевод schema-упаковщиков на numpy-обёртки не сдвинул
@@ -150,16 +152,16 @@ def _ref_dequantize_one(qt):
         scale = (qs * d).half().float().clamp_min(1e-8)
         mn = (qm * dm).half().float()
         return (q * scale.repeat_interleave(gs, dim=1)
-                + mn.repeat_interleave(gs, dim=1)).to(torch.bfloat16)
+                + mn.repeat_interleave(gs, dim=1)).to(torch.float16)
     if qt.gw_mode == "asym":
         OUT, IN = qt.shape
         idx = torch.arange(IN) // qt.gw_gs
         return (qt.codes.to(torch.float32) * qt.gw_scale[:, idx]
-                + qt.gw_min[:, idx]).to(torch.bfloat16)
-    w = (_ref_int8_codes(qt).float() * qt.scale.float()).to(torch.bfloat16)
+                + qt.gw_min[:, idx]).to(torch.float16)
+    w = (_ref_int8_codes(qt).float() * qt.scale.float()).to(torch.float16)
     if qt.outlier_indices is not None and qt.outlier_indices.numel() > 0:
         rows, cols = qt.outlier_indices[:, 0].long(), qt.outlier_indices[:, 1].long()
-        w[rows, cols] = qt.outlier_values
+        w[rows, cols] = qt.outlier_values.to(w.dtype)
     return w
 
 
@@ -194,7 +196,7 @@ def codec_dequantize_one(qt):
             # выбросы хранятся в bf16 -- роундтрип через float32 точен
             outlier_values=(qt.outlier_values.float().numpy()
                             if has_out else None))
-    return torch.from_numpy(w).to(torch.bfloat16)
+    return torch.from_numpy(w).to(torch.float16)
 
 
 # ---------------- 1. роундтрипы ----------------
