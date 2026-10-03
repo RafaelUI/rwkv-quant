@@ -636,10 +636,25 @@ Settings:
 What it costs:
 
 - **Time.** On one RTX 4090: 1.5B ≈ 42 min, 2.9B ≈ 80 min. 7.2B ≈ 2.5 h on
-  two cards, 13.3B ≈ 4.7 h on four. Not timed on an M4 at 600 windows;
-  expect hours for 1.5B.
+  two cards, 13.3B ≈ 4.7 h on four.
+- **Time on a MacBook Air M4 16 GB** (fanless, `reduction`, whole
+  `quantize()` call):
+
+  | model | time | peak memory footprint |
+  |---|---|---|
+  | 0.1B | 17 min | 7.7 GB |
+  | 0.4B | 49 min | 8.9 GB |
+  | 1.5B | 2 h 26 min | 19.5 GB |
+
+  GPTQ is almost all of it. At 1.5B the footprint exceeds RAM; macOS
+  absorbed it with memory compression. Time per layer stayed flat
+  (≈ 6 min), and swap ended lower than it started. The files score the
+  same as the server-built ones within the implementation spread described
+  above (1.5B: +0.20% / +0.06% against +0.27% / +0.04%).
 - **Memory.** The dense model in memory, plus the calibration activations on
   the host: 2 x 600 x 511 x hidden size x 4 bytes, about 5 GB at 1.5B.
+  That is the estimate the skip check uses. On MPS the measured peak
+  footprint is 2.4–3.4x larger (table above).
 
 If the two do not fit in 60% of memory, the implicit GPTQ is skipped with a
 notice. `gptq=False` turns it off; `gptq_calib=` takes your own windows. The
