@@ -8,7 +8,10 @@
                                оригиналом. Квантованные тензоры -- в FP16, плотные
                                (bits >= 16) -- как записаны.
 
-FP16, А НЕ BF16 (02.10, решение владельца). Деквант = код x масштаб в fp32; прежде он
+FP16, А НЕ BF16 (02.10, решение владельца). _dequantize_one(qt, dtype=...) даёт и иной
+выходной тип (03.10: float32 -- для гейтов, сверяющих с fake-путём writer'а, который
+округляет плотный fake-деквант в bf16 ОДИН раз из fp32; fp32 -> fp16 -> bf16 дал бы
+двойное округление). Деквант = код x масштаб в fp32; прежде он
 округлялся в bf16 (7 бит мантиссы), и у 8-битных кодов эта вторая ошибка достигала ~1/4
 шага сетки: +2-3% KL к bf16 у REDUCTION (1.5B: файл в torch +3.1% KL к fake-пути, в fp32
 +0.5%). fp16 (10 бит) в 8 раз точнее при той же памяти; диапазон (до 65504) весам не
@@ -121,16 +124,16 @@ def config_from_json(d):
     return cfg
 
 
-def _dequantize_one(qt) -> torch.Tensor:
+def _dequantize_one(qt, dtype=torch.float16) -> torch.Tensor:
     if qt.bits >= 16:
         return qt.dense
     if qt.gw_mode == "sb6":
-        return _dequantize_gw_sb6(qt)
+        return _dequantize_gw_sb6(qt, dtype)
     if qt.gw_mode == "sym":
-        return _dequantize_gw_sym(qt)
+        return _dequantize_gw_sym(qt, dtype)
     if qt.gw_mode == "asym":
-        return _dequantize_gw_asym(qt)
-    w = (int8_codes(qt).float() * qt.scale.float()).to(torch.float16)
+        return _dequantize_gw_asym(qt, dtype)
+    w = (int8_codes(qt).float() * qt.scale.float()).to(dtype)
     if qt.outlier_indices is not None and qt.outlier_indices.numel() > 0:
         rows, cols = qt.outlier_indices[:, 0].long(), qt.outlier_indices[:, 1].long()
         w[rows, cols] = qt.outlier_values.to(w.dtype)
@@ -211,7 +214,7 @@ def dequantize_banded(qt, dtype=torch.float16, chunk_mb=None) -> torch.Tensor:
     return out
 
 
-def _dequantize_gw_sb6(qt) -> torch.Tensor:
+def _dequantize_gw_sb6(qt, dtype=torch.float16) -> torch.Tensor:
     """Формат v2: восстановление в точности по формуле кернеля --
     s = half(qs * float(d_half)), m = half(qm * float(dm_half)),
     w = q * s + m; clamp scale как в writer (см. NaN-примечание там)."""
@@ -235,13 +238,13 @@ def _dequantize_gw_sb6(qt) -> torch.Tensor:
         # in-place по q законен -- он наш, выше он создан .to(float32).
         q = q.view(OUT, NB, gs)
         q.mul_(scale[..., None]).add_(mn[..., None])
-        return q.view(OUT, IN).to(torch.float16)
+        return q.view(OUT, IN).to(dtype)
     scale_c = scale.repeat_interleave(gs, dim=1)              # ragged: NB*gs > IN
     mn_c = mn.repeat_interleave(gs, dim=1)
-    return (q * scale_c + mn_c).to(torch.float16)
+    return (q * scale_c + mn_c).to(dtype)
 
 
-def _dequantize_gw_sym(qt) -> torch.Tensor:
+def _dequantize_gw_sym(qt, dtype=torch.float16) -> torch.Tensor:
     """Q6_K-раскладка: s = half(qs * d), w = q * s. Min нет, поэтому нет
     ни clamp_min для scale, ни второй пары квальных скаляров -- у
     вырожденного блока и scale, и коды нулевые (см. codec.dequant_sym).
@@ -262,11 +265,11 @@ def _dequantize_gw_sym(qt) -> torch.Tensor:
     if NB * gs == IN:
         q = q.view(OUT, NB, gs)
         q.mul_(scale[..., None])                               # см. sb6
-        return q.view(OUT, IN).to(torch.float16)
-    return (q * scale.repeat_interleave(gs, dim=1)).to(torch.float16)
+        return q.view(OUT, IN).to(dtype)
+    return (q * scale.repeat_interleave(gs, dim=1)).to(dtype)
 
 
-def _dequantize_gw_asym(qt) -> torch.Tensor:
+def _dequantize_gw_asym(qt, dtype=torch.float16) -> torch.Tensor:
     OUT, IN = qt.shape
     gs = qt.gw_gs
     q = qt.codes.to(torch.float32)          # uint8-контейнер, unsigned коды
@@ -274,10 +277,10 @@ def _dequantize_gw_asym(qt) -> torch.Tensor:
         NB = IN // gs
         q = q.view(OUT, NB, gs)
         q.mul_(qt.gw_scale[..., None]).add_(qt.gw_min[..., None])
-        return q.view(OUT, IN).to(torch.float16)
+        return q.view(OUT, IN).to(dtype)
     # ragged (blocks.N.att.w1 [2048, 96] при gs=64 -- блоков ceil, не floor):
     # broadcast тут не выражается, идём прежним путём с развёрнутой индексацией
     idx = torch.arange(IN) // gs
     scale_c = qt.gw_scale[:, idx]
     mn_c = qt.gw_min[:, idx]
-    return (q * scale_c + mn_c).to(torch.float16)
+    return (q * scale_c + mn_c).to(dtype)

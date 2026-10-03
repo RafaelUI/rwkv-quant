@@ -31,7 +31,10 @@ CK = {"1p5b": ("/Users/s/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth",
 recipe, scale = sys.argv[1], sys.argv[2]
 ckpt, stats, chans = CK[scale]
 os.environ["RWKVQ_ACT_STATS"] = stats
-out = "%s/%s_%s_1709.rwkvq" % (A, recipe, scale)
+# 03.10: суффикс -- из RWKVQ_ART_SUFFIX (артефакты _1709 удалены уборкой 29.09; пересборка нынешним кодом
+# получает НОВОЕ имя, закон 30). GPTQ при пересборке НЕ включается: рецепты -- RTN, как 17.09.
+SUF = os.environ.get("RWKVQ_ART_SUFFIX", "_1709")
+out = "%s/%s_%s%s.rwkvq" % (A, recipe, scale, SUF)
 assert not os.path.exists(out), "уже есть: " + out
 import torch
 import rwkv_quant
@@ -50,7 +53,7 @@ print("рецепт", recipe, "config", config, flush=True)
 sw = os.popen("sysctl -n vm.swapusage").read().strip()
 t0 = time.time()
 rwkv_quant.quantize(ckpt, out, preset="reduction", config=config, real_gw=True,
-                    verbose=True, tokenizer=TOK, act_stats=stats)
+                    verbose=True, tokenizer=TOK, act_stats=stats, gptq=False)
 dt = time.time() - t0
 h = hashlib.md5()
 with open(out, "rb") as f:

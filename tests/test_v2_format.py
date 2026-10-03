@@ -50,7 +50,8 @@ def main():
         real = quantize_tensor(key, w, CHAMPION, real_gw=True)
         assert fake.bits == 16 and fake.dense is not None, (cls, key)
         assert real.gw_mode in ("sb6", "asym"), (cls, key, real.gw_mode, real.bits)
-        deq = _dequantize_one(real)
+        # 03.10: reader по умолчанию даёт fp16; fake-путь округляет fp32 -> bf16 один раз -- сверяем так же
+        deq = _dequantize_one(real, torch.float32).to(fake.dense.dtype)
         same = torch.equal(fake.dense, deq)
         md = (fake.dense.float() - deq.float()).abs().max().item()
         nbytes = sum(t.numel() * t.element_size()
