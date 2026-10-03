@@ -118,9 +118,9 @@ def test_torch_free(out, new):
     for key, meta in manifest["tensors"].items():
         got = codec.dequant_key(manifest, arrays, key)
         ref = _dequantize_one(new.tensors[key])
-        # codec отдаёт float32, reader -- bf16; сводим к bf16 (для dense
-        # это тождество: он и хранится в bf16)
-        got_bf = torch.from_numpy(np.ascontiguousarray(got)).to(torch.bfloat16)
+        # codec отдаёт float32; reader -- fp16 для квантованных (с 03.10, нормативный каст) и
+        # тип хранения для dense (bf16). Сводим к типу reader -- для dense это тождество.
+        got_bf = torch.from_numpy(np.ascontiguousarray(got)).to(ref.dtype)
         ok = got_bf.shape == ref.shape and bool((got_bf == ref).all())
         k = meta["kind"]
         kinds.setdefault(k, [0, 0])

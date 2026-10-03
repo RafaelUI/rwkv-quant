@@ -110,7 +110,7 @@ def test_pack_roundtrip():
                                     ("asym_sb6_aw", True, ex2)):
                 qt = writer._make_qt_gw_sb6("k", "cmix", bits, w, 32, e,
                                             search=search)
-                deq = _dequantize_one(qt)                       # bf16
+                deq = _dequantize_one(qt, torch.float32).to(torch.bfloat16)  # 03.10: reader по умолчанию fp16; fake-путь -- один каст fp32 -> bf16
                 fake = gw.groupwise_fake_dequant(
                     w, bits, 32, sb=8, sb_bits=(-6 if search else 6),
                     ex2=e).to(torch.bfloat16)                   # как в writer

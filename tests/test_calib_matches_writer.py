@@ -101,7 +101,7 @@ def test_matches_real_pack(w):
             cfg = _cfg(bits, mode)
             a = fake_quant.q(w, "cmix", cfg, KEY)
             qt = writer.quantize_tensor(KEY, w, cfg, real_gw=True)
-            b = _dequantize_one(qt)
+            b = _dequantize_one(qt, torch.float32).to(a.dtype)   # 03.10: reader по умолчанию fp16; q() -- один каст fp32 -> тип w
             d = (a.float() - b.float()).abs().max().item()
             worst = max(worst, d)
             assert d == 0.0, f"{mode} bits={bits}: max|Δ|={d}"

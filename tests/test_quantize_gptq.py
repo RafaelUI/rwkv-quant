@@ -95,7 +95,7 @@ def part2(preset="compression"):
     ng = nsame = 0
     for k, qt in cg.tensors.items():
         if k in deqs:
-            got = Rd._dequantize_one(qt)
+            got = Rd._dequantize_one(qt, torch.float32)   # 03.10: reader по умолчанию fp16; сверка -- одним кастом fp32 -> bf16
             assert torch.isfinite(got).all(), k
             assert torch.equal(got.to(torch.bfloat16), deqs[k].to(torch.bfloat16)), k
             ng += 1

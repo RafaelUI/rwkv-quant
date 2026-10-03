@@ -111,7 +111,7 @@ def run_key(sd, key, group, stats_path):
                      and real.gw_qh is not None and real.gw_qh2 is not None)
             check(f"{tag}: буферы", want8 if bits == 8 else want6)
 
-            deq_r = _dequantize_one(real)
+            deq_r = _dequantize_one(real, torch.float32).to(torch.bfloat16)  # 03.10: reader по умолчанию fp16; fake-путь -- один каст fp32 -> bf16
             check(f"{tag}: упаковщик == fake", torch.equal(deq_r, fake.dense),
                   "" if torch.equal(deq_r, fake.dense) else
                   f"max|Δ|={float((deq_r.float()-fake.dense.float()).abs().max()):.3e}, "
@@ -161,7 +161,7 @@ def run_container(sd, stats_path, tmp="/tmp/sym_packer_gate.rwkvq"):
               and m["n_blocks"] == int(m["shape"][1]) // 16,
               f"kind={m['kind']} n_blocks={m['n_blocks']}")
         got = torch.from_numpy(
-            codec.dequant_key(manifest, arrays, key)).to(torch.bfloat16)
+            codec.dequant_key(manifest, arrays, key)).to(torch.float16)  # 03.10: нормативный каст -- fp16, как reader
         check(f"{key}: роундтрип codec (torch-free)", torch.equal(got, want))
     del arrays
     os.remove(tmp)
