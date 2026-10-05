@@ -45,6 +45,7 @@ import numpy as np
 import mlx.core as mx
 
 from .quant_linear_gw import GEMM_MIN_BATCH_NB, _gw_kernel_cache
+from .quant_linear_gw import HOST_BAND_MB, RKV_SHARE, _mx_rows
 
 # порядок регистров -> порядок колонок внутри ПАРЫ блоков по 16
 _PAIR_REGS = ["l0", "l1", "h0", "h1", "l2", "l3", "h2", "h3"]
@@ -784,11 +785,17 @@ class SymQuantLinear:
         else:
             assert bits == 6 and codes_packed is not None
             NP = IN // 32
-            blk = np.concatenate(
-                [np.asarray(codes_packed).reshape(OUT, NP, 16),
-                 np.asarray(qh).reshape(OUT, NP, 4),
-                 np.asarray(qh2).reshape(OUT, NP, 4)], axis=2)
-        self.qblk = mx.array(np.ascontiguousarray(blk.reshape(OUT, -1)))
+            parts = [np.asarray(codes_packed).reshape(OUT, NP, 16),
+                     np.asarray(qh).reshape(OUT, NP, 4),
+                     np.asarray(qh2).reshape(OUT, NP, 4)]
+            blk = None
+        if blk is None:
+            self.qblk = _mx_rows(
+                lambda a, b: np.concatenate([p[a:b] for p in parts], axis=2)
+                .reshape(b - a, -1), OUT,
+                max(1, (HOST_BAND_MB << 20) // (NP * 24)))
+        else:
+            self.qblk = mx.array(np.ascontiguousarray(blk.reshape(OUT, -1)))
         self.qs = mx.array(np.ascontiguousarray(
             np.asarray(qs).view(np.uint8)))                 # int8 as bytes
         self.d = mx.array(np.ascontiguousarray(np.asarray(d)))
@@ -796,6 +803,18 @@ class SymQuantLinear:
         # (NSG, RS) в обход _cfg -- только для свипа. В проде None: конфиг
         # обязан выбираться таблицей, а не тем, что кто-то забыл сбросить.
         self.cfg_override = None
+
+    def _adopt(self, parent, row0):
+        """См. GwQuantLinear._adopt: буферами владеет фьюз, здесь срезы."""
+        for n in ("qblk", "qs", "d"):
+            self.__dict__.pop(n, None)
+        self.__dict__["_fz"] = (parent, row0)
+
+    def __getattr__(self, name):
+        fz = self.__dict__.get("_fz")
+        if fz is not None and name in ("qblk", "qs", "d"):
+            return getattr(fz[0], name)[fz[1]:fz[1] + self.out_features]
+        raise AttributeError(name)
 
     def _dequant_w(self, dtype=mx.float16):
         """sym -> плотная [OUT, IN] ОДНИМ кернелем (транзиент на вызов).
@@ -971,6 +990,9 @@ class SymQuantLinearFused:
         self.d = mx.concatenate([l.d for l in lins], axis=0)
         mx.eval(self.qblk, self.qs, self.d)
         self.cfg_override = None
+        if RKV_SHARE:
+            for i, l in enumerate(lins):
+                l._adopt(self, i * self.out_per)
 
     def __call__(self, xstack):
         # xstack: [K, IN] fp32

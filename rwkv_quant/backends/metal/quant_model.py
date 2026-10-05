@@ -33,13 +33,16 @@ T==CHUNK за вызов) — следующий шаг, для scripts/generate
 import os
 import sys
 
+import numpy as np
 import mlx.core as mx
 import torch
 
 from ...formats.reader import _dequantize_one, dequantize_banded  # noqa: F401
+from ...formats import reader as _reader
 from .quant_linear import QuantLinear  # noqa: F401 (v1, референс)
 from .quant_linear_v2 import QuantLinearV2
 from .quant_linear_gw import GwQuantLinear, GwQuantLinearFused
+from .quant_linear_gw import RKV_SHARE
 from .quant_linear_sym import SymQuantLinear, SymQuantLinearFused
 from .fused_tail import wkv_tail, can_fuse_tail
 from .fused_prewkv import (l2_norm, prewkv_ref, prewkv_kernel,
@@ -165,9 +168,25 @@ def _dense(qt) -> mx.array:
         t = qt.dense
         dt = (torch.float16 if t.ndim == 2 and min(t.shape) >= 32
               else torch.float32)
+        if t.ndim == 2 and t.numel() * 2 > (HOST_BAND_MB << 20):
+            rows = max(1, (HOST_BAND_MB << 20) // (int(t.shape[1]) * 2))
+            return _mx_rows(lambda a, b: t[a:b].to(dt).numpy(),
+                            int(t.shape[0]), rows)
         return mx.array(t.to(dt).numpy())
     dt = (torch.float16 if len(qt.shape) == 2 and min(qt.shape) >= 32
           else torch.float32)
+    if _reader.can_band(qt):
+        OUT, IN = qt.shape
+        # Полоса считается ТЕМ ЖЕ кодом, что у reader.dequantize_banded, и
+        # округляется так же (закон 15); деквант построчный, поэтому ширина
+        # полосы на результат не влияет (bits_ref_0510: бит-в-бит). Полоса
+        # уже, чем у читалки: её fp32-транзиенты и есть то, что оседает в
+        # куче хоста.
+        rows = max(1, (HOST_BAND_MB << 20) // (IN * 4))
+        if rows < OUT:
+            return _mx_rows(
+                lambda a, b: _dequantize_one(_reader._RowBand(qt, a, b))
+                .to(dt).numpy(), OUT, rows)
     return mx.array(dequantize_banded(qt, dt).numpy())
 
 
@@ -211,6 +230,30 @@ def _dense(qt) -> mx.array:
 # RWKVQ_EMB_GATHER=0 выключает обратно; переключение рантайм-флагом в
 # ОДНОМ процессе -- закон 27.
 EMB_GATHER = os.environ.get("RWKVQ_EMB_GATHER", "1") != "0"
+
+# 05.10 (mem_probe*_0510, 7.2B COMPRESSION): после сборки модели в куче хоста
+# оставалось 1048 МБ "Malloc Large (empty)" -- освобождённые крупные
+# транзиенты (плотный эмбеддинг 512 МиБ целиком в torch, интерлив головы),
+# которые аллокатор macOS системе НЕ возвращает (malloc_zone_pressure_relief
+# отдаёт 0). Поэтому крупные тензоры уходят в MLX ПОЛОСАМИ строк: в куче
+# хоста живёт одна полоса, а склейка идёт уже в памяти MLX, которую
+# mx.clear_cache() системе отдаёт. Результат бит-в-бит тот же.
+HOST_BAND_MB = int(os.environ.get("RWKVQ_HOST_BAND_MB", "16"))
+
+
+def _mx_rows(make, OUT, rows):
+    """make(a, b) -> numpy-полоса строк [a, b). Склейка в MLX."""
+    if rows >= OUT:
+        return mx.array(np.ascontiguousarray(make(0, OUT)))
+    parts = []
+    for a in range(0, OUT, rows):
+        p = mx.array(np.ascontiguousarray(make(a, min(a + rows, OUT))))
+        mx.eval(p)
+        parts.append(p)
+    out = mx.concatenate(parts, axis=0)
+    mx.eval(out)
+    del parts
+    return out
 
 
 class SymGatherEmb:
@@ -304,6 +347,8 @@ def drop_lora_dense(model):
         if getattr(tm, "_lq_A", None) is None:
             raise RuntimeError("сначала _build_lora_q: нечего оставлять "
                                "вместо плотных копий")
+        if LORA_Q == "glue" and tm._lq_glue is None:
+            tm._build_lora_glue()
         tm._lora_shapes = [(tuple(A.shape), tuple(B.shape))
                            for _, A, B, _ in tm._lora_specs()]
         for attr in ("w_lora_A", "w_lora_B_w", "a_lora_A", "a_lora_B_w",
@@ -547,6 +592,10 @@ class QuantTMix:
             self.v_proj = _linear(g(ap+"value.weight")); self.o_proj = _linear(g(ap+"output.weight"))
             self.ln_x_w, self.ln_x_b = _dense(g(ap+"ln_x.weight")), _dense(g(ap+"ln_x.bias"))
         self._fused_built = False
+        if RKV_SHARE:
+            # фьюз владеет буферами r/k/v -- строим сразу: граф префилла,
+            # скомпилированный ДО первого декода, иначе удержал бы оригиналы
+            self._build_rkv_fused()
 
     def __call__(self, x, v_first):
         B, T, D = x.shape
@@ -629,26 +678,40 @@ class QuantTMix:
                       for _, A, _, _ in specs]
         self._lq_B = [mx.quantize(B, group_size=LORA_GS_UP, bits=bits)
                       for _, _, B, _ in specs]
-        # склейка: [R, 2D] = [A | A*c], группы не пересекают границу D
-        # (gs=64 делит D), поэтому левая половина квантуется ровно так же,
-        # как в варианте "sep".
-        rows = []
-        for _, A, _, c in specs:
-            c32 = c.reshape(1, -1).astype(mx.float32)
-            rows.append(mx.concatenate(
-                [A.astype(mx.float32), A.astype(mx.float32) * c32], axis=1))
-        glue = mx.contiguous(mx.concatenate(rows, axis=0))          # [R, 2D]
-        self._lq_glue = mx.quantize(glue, group_size=LORA_GS_DOWN, bits=bits)
         self._lq_slices = []
         off = 0
         for _, A, _, _ in specs:
             r = int(A.shape[0])
             self._lq_slices.append((off, off + r))
             off += r
-        del glue, rows
-        for tr in (self._lq_A + self._lq_B + [self._lq_glue]):
+        for tr in (self._lq_A + self._lq_B):
             ev.extend(tr)
         mx.eval(ev)
+        # 05.10: склейка строится ТОЛЬКО для режима "glue". Прежде она
+        # строилась всегда, а умолчание -- "sep", то есть [R, 2D] на слой
+        # (233 МиБ на 7.2B, mem_probe3_0510) лежали в памяти непрочитанными.
+        # Переключение LORA_Q в рантайме цело: _lora достраивает её сам.
+        if LORA_Q == "glue":
+            self._build_lora_glue()
+
+    def _build_lora_glue(self):
+        """Склейка [R, 2D] = [A | A*c] для режима "glue": группы не
+        пересекают границу D (gs=64 делит D), поэтому левая половина
+        квантуется ровно так же, как в варианте "sep". Нужны плотные A."""
+        if getattr(self, "_dense_lora_dropped", False):
+            raise RuntimeError(
+                "режим glue после drop_lora_dense: плотных A уже нет -- "
+                "включайте glue ДО освобождения")
+        rows = []
+        for _, A, _, c in self._lora_specs():
+            c32 = c.reshape(1, -1).astype(mx.float32)
+            rows.append(mx.concatenate(
+                [A.astype(mx.float32), A.astype(mx.float32) * c32], axis=1))
+        glue = mx.contiguous(mx.concatenate(rows, axis=0))          # [R, 2D]
+        self._lq_glue = mx.quantize(glue, group_size=LORA_GS_DOWN,
+                                    bits=LORA_QBITS)
+        del glue, rows
+        mx.eval(list(self._lq_glue))
 
     def _lora(self, xw, xa, xv, xg, x, xx):
         """Все LoRA-ветки слоя: возвращает (y_w, y_a, y_v, y_g) -- выходы
@@ -681,6 +744,8 @@ class QuantTMix:
         xin = {"w": xw, "a": xa, "v": xv, "g": xg}
         if mode == "glue":
             z = mx.concatenate([x, xx], axis=-1).astype(mx.float16)
+            if self._lq_glue is None:
+                self._build_lora_glue()
             wq, sc, bi = self._lq_glue
             hcat = mx.quantized_matmul(z, wq, scales=sc, biases=bi,
                                        transpose=True, group_size=LORA_GS_DOWN,
@@ -826,6 +891,8 @@ class QuantTMix:
         # GwQuantLinear (формат нетронут, математика строки бит-в-бит).
         # Цена: копия буферов (~8.7MB/слой) поверх оригиналов -- оригиналы
         # нужны GEMM-префиллу и нефьюзнутому пути.
+        if RKV_SHARE and "_rkv_fused" in self.__dict__:
+            return                                   # построен в конструкторе
         self._rkv_fused = None
         self._rkv_idx = mx.array([0, 2, 3])          # (xr, xk, xv) из xs
         lins = [self.r_proj, self.k_proj, self.v_proj]
@@ -1128,6 +1195,8 @@ class QuantRWKV7:
             for i in range(self.n_layer)
         ]
         self._materialize()
+        # полосы и склейки сборки лежат в кеше MLX -- вернуть их системе
+        mx.clear_cache()
 
     def _materialize(self):
         """Принудительный eval всех параметров. КРИТИЧНО для mx.compile:

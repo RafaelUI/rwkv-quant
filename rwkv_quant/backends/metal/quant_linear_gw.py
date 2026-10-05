@@ -17,6 +17,8 @@ per-row у biased v1-раскладки.
 
 Скелет threadgroup'а -- как в quant_linear_v2 packed: R строк на группу из
 TG потоков, страйд по блокам, simd_sum-редукция."""
+import os
+
 import numpy as np
 import torch
 import mlx.core as mx
@@ -414,6 +416,27 @@ GUARD_TAIL        for (uint n = 0; n < NN; n++) {
 # через __getattr__ для _dequant_w/бенчей).
 
 K3 = True
+
+# хост -> MLX полосами строк (см. quant_model.HOST_BAND_MB: крупные
+# транзиенты numpy аллокатор macOS системе не возвращает)
+HOST_BAND_MB = int(os.environ.get("RWKVQ_HOST_BAND_MB", "16"))
+# r/k/v-фьюз ВЛАДЕЕТ буферами, отдельные проекции читают его срезы (без
+# второй копии). По умолчанию выключено -- см. GwQuantLinear._adopt.
+RKV_SHARE = os.environ.get("RWKVQ_RKV_SHARE", "0") != "0"
+
+
+def _mx_rows(make, OUT, rows):
+    if rows >= OUT:
+        return mx.array(np.ascontiguousarray(make(0, OUT)))
+    parts = []
+    for a in range(0, OUT, rows):
+        p = mx.array(np.ascontiguousarray(make(a, min(a + rows, OUT))))
+        mx.eval(p)
+        parts.append(p)
+    out = mx.concatenate(parts, axis=0)
+    mx.eval(out)
+    del parts
+    return out
 # Плотный деквант префилла однопроходным кернелем (gw_dequant_kernel.py),
 # включён 17.09. RWKVQ_GW_DQ_REF=1 -- откат на цепочку MLX для A/B.
 DEQUANT_REF = __import__("os").environ.get("RWKVQ_GW_DQ_REF") == "1"
@@ -777,8 +800,10 @@ class GwQuantLinear:
                 parts.append(qh_np.reshape(OUT, self.NB, 4))
             if self.xbits >= 2:
                 parts.append(qh2_np.reshape(OUT, self.NB, 4))
-            self.qblk = mx.array(np.ascontiguousarray(
-                np.concatenate(parts, axis=2).reshape(OUT, -1)))
+            row_b = self.NB * (16 + 4 * self.xbits)
+            self.qblk = _mx_rows(
+                lambda a, b: np.concatenate([p[a:b] for p in parts], axis=2)
+                .reshape(b - a, -1), OUT, max(1, (HOST_BAND_MB << 20) // row_b))
             self.qsqm = mx.array(np.ascontiguousarray(
                 np.stack([qs_np, qm_np.view(np.uint8)], axis=-1)
                 .reshape(OUT, -1)))
@@ -796,7 +821,21 @@ class GwQuantLinear:
             self.qh2 = (mx.array(qh2_np) if self.xbits >= 2
                         else mx.zeros((1,), dtype=mx.uint8))
 
+    def _adopt(self, parent, row0):
+        """Отдать свои буферы фьюзу: qblk / qsqm / ddm дальше читаются
+        срезом строк родителя. Память 1x вместо 2x; цена -- срез (копия
+        строк) на каждый НЕфьюзнутый вызов: GEMM-префилл и нефьюзнутый
+        декод. Байты те же, выход бит-в-бит."""
+        if not self.__dict__.get("_k3"):
+            return
+        for n in ("qblk", "qsqm", "ddm"):
+            self.__dict__.pop(n, None)
+        self.__dict__["_fz"] = (parent, row0)
+
     def __getattr__(self, name):
+        fz = self.__dict__.get("_fz")
+        if fz is not None and name in ("qblk", "qsqm", "ddm"):
+            return getattr(fz[0], name)[fz[1]:fz[1] + self.out_features]
         # ленивые view старых буферов из интерлива (только k3-режим)
         if name in GwQuantLinear._COMPAT and self.__dict__.get("_k3"):
             OUT, IN = self.out_features, self.in_features
@@ -995,6 +1034,9 @@ class GwQuantLinearFused:
             self.qsqm = mx.concatenate([l.qsqm for l in lins], axis=0)
             self.ddm = mx.concatenate([l.ddm for l in lins], axis=0)
             mx.eval(self.qblk, self.qsqm, self.ddm)
+            if RKV_SHARE:
+                for i, l in enumerate(lins):
+                    l._adopt(self, i * self.out_per)
         else:
             self.codes = mx.concatenate([l.codes for l in lins], axis=0)
             self.qs = mx.concatenate([l.qs for l in lins], axis=0)
