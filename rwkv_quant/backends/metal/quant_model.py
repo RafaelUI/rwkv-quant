@@ -111,7 +111,19 @@ DECODE_VIEWS = os.environ.get("RWKVQ_DECODE_VIEWS", "0") != "0"
 # (не значимо, без размена по языкам), +56 МБ резидентно при живых обеих
 # копиях. Восемь бит, а не шесть: по времени они неразличимы (16.65
 # против 16.70 мс/ток), а по ppl шесть вшестеро хуже (+0.072%).
-LORA_Q = "sep"
+#
+# 06.10 (решение владельца): КВАНТОВАННЫЕ ВЕТКИ -- НАМЕРЕНИЕ ФАЙЛА, как fast_ln. Умолчание
+# модуля теперь "auto": модель решает сама (QuantRWKV7.lora_q: аргумент -> runtime.lora_q
+# манифеста -> пресет -> ...), и включённое намерение означает LORA_Q_AUTO_MODE. COMPRESSION --
+# да, REDUCTION -- нет. Почему: это другое квантование, и на декоде оно стоит reduction
+# +3.1% / +6.5% / +6.0% KL к bf16 на тексте (1.5B / 0.4B / 0.1B) и +4.4% на 2.9B, значимо на
+# всех четырёх (прибор статьи, tests/_sess/p5_loraq_eval_0610.py), при том что префилл и числа
+# качества сняты на точном декванте файла; у compression это +0.2% (1.5B) / +1.1% (0.1B).
+# Явное значение ("sep" / "glue" / None) -- ПРИНУДИТЕЛЬНО для всех моделей процесса, как
+# раньше: A/B-инструменты и гейты, которые переключают флаг сами, работают без правок и не
+# становятся пустыми на reduction-файлах.
+LORA_Q = "auto"
+LORA_Q_AUTO_MODE = "sep"
 LORA_QBITS = 8
 LORA_GS_DOWN = 64     # группы вдоль D (2048 -- кратно всегда)
 LORA_GS_UP = 32       # группы вдоль ранга (96/64/256 -- 32 делит все три)
@@ -332,7 +344,7 @@ def drop_lora_dense(model):
         if getattr(tm, "_lq_A", None) is None:
             raise RuntimeError("сначала _build_lora_q: нечего оставлять "
                                "вместо плотных копий")
-        if LORA_Q == "glue" and tm._lq_glue is None:
+        if tm._lq_mode() == "glue" and tm._lq_glue is None:
             tm._build_lora_glue()
         tm._lora_shapes = [(tuple(A.shape), tuple(B.shape))
                            for _, A, B, _ in tm._lora_specs()]
@@ -449,6 +461,26 @@ def preset_of(ckpt):
     from rwkv_quant.presets import PRESETS
     hits = [n for n, p in PRESETS.items() if repr(p) == repr(cfg)]
     return hits[0] if len(hits) == 1 else None
+
+
+def resolve_lora_q(ckpt, arg=None, preset=None):
+    """(включено ли, источник) для квантованных LoRA на декоде. Порядок, как у fast_ln:
+    явный аргумент -> runtime.lora_q манифеста -> пресет файла (compression -- да, reduction --
+    нет) -> runtime.fast_ln == False (файлы 22.09-06.10: у них «верность bf16» записана только
+    этим полем, а preset_of теряет файл при любой правке presets.py) -> исторические конфиги
+    compression -> умолчание (да, как было до 06.10)."""
+    rt = getattr(ckpt, "runtime", None) or {}
+    if arg is not None:
+        return bool(arg), "аргумент"
+    if "lora_q" in rt:
+        return bool(rt["lora_q"]), "манифест"
+    if preset in ("compression", "reduction"):
+        return preset == "compression", "пресет"
+    if rt.get("fast_ln") is False:
+        return False, "манифест (fast_ln=False)"
+    if getattr(ckpt, "config_repr", "") in LEGACY_COMPRESSION_REPRS:
+        return True, "история compression"
+    return True, "умолчание"
 
 
 # 22.09: repr() COMPRESSION в прежних редакциях presets.py -- для файлов,
@@ -676,7 +708,7 @@ class QuantTMix:
         # строилась всегда, а умолчание -- "sep", то есть [R, 2D] на слой
         # (233 МиБ на 7.2B, mem_probe3_0510) лежали в памяти непрочитанными.
         # Переключение LORA_Q в рантайме цело: _lora достраивает её сам.
-        if LORA_Q == "glue":
+        if self._lq_mode() == "glue":
             self._build_lora_glue()
 
     def _build_lora_glue(self):
@@ -698,6 +730,15 @@ class QuantTMix:
         del glue, rows
         mx.eval(list(self._lq_glue))
 
+    lora_q_on = True        # намерение модели (QuantRWKV7.lora_q); действует при LORA_Q == "auto"
+
+    def _lq_mode(self):
+        """Режим квантованных LoRA для ЭТОЙ модели: модульный LORA_Q, если он задан явно
+        (принудительно), иначе намерение файла."""
+        if LORA_Q == "auto":
+            return LORA_Q_AUTO_MODE if self.lora_q_on else None
+        return LORA_Q
+
     def _lora(self, xw, xa, xv, xg, x, xx):
         """Все LoRA-ветки слоя: возвращает (y_w, y_a, y_v, y_g) -- выходы
         ПОСЛЕ up-проекции, ДО прибавления bias и внешних нелинейностей.
@@ -706,7 +747,7 @@ class QuantTMix:
         Одна реализация на все три пути (prefill __call__, forward_stateful,
         фьюзнутый): иначе правка, внесённая в один, в остальные не переезжает
         сама собой -- закон 23."""
-        mode = LORA_Q
+        mode = self._lq_mode()
         if (mode and LORA_Q_DECODE_ONLY
                 and not getattr(self, "_dense_lora_dropped", False)
                 and x.size // x.shape[-1] > 1):
@@ -904,7 +945,7 @@ class QuantTMix:
         wkv_state, shift_state = state
         B, T, D = x.shape
         H, S = self.H, self.S
-        if (DECODE_VIEWS and B * T == 1 and LORA_Q
+        if (DECODE_VIEWS and B * T == 1 and self._lq_mode()
                 and self._rkv_fused is not None):
             return self._forward_decode_views(x, v_first, state)
 
@@ -924,7 +965,12 @@ class QuantTMix:
             k = self.k_proj(xk).reshape(B, T, H, S)
             v = self.v_proj(xv).reshape(B, T, H, S)
 
-        if LORA_Q:
+        if LORA_Q is not None:
+            # 06.10: условие -- МОДУЛЬНЫЙ флаг, а не намерение модели. С выключенным намерением
+            # (reduction) _lora считает ветки плотно и порознь -- ровно тот путь, которым до
+            # 06.10 шёл префилл (LORA_Q_DECODE_ONLY): префилл reduction остаётся бит-в-бит, а
+            # декод считает ТЕМИ ЖЕ операциями, что префилл. Стеки wav ниже -- только при явном
+            # LORA_Q = None (прежнее fp16-плечо инструментов), иначе они строились бы зря.
             # квантованные ветки: батченые стеки wav не строятся и не
             # читаются -- у них паддинг ранга v (64 -> 96), то есть лишние
             # байты, ради которых батч и заводился, когда байты были fp16
@@ -1123,7 +1169,7 @@ class QuantRWKV7:
     """RWKV-7 x070 forward (prefill, T произвольный) на .rwkvq через MLX.
     Строится напрямую из QuantizedCheckpoint (formats.reader.load_raw)."""
 
-    def __init__(self, ckpt, fast_ln=None):
+    def __init__(self, ckpt, fast_ln=None, lora_q=None):
         # ckpt: rwkv_quant.formats.schema.QuantizedCheckpoint
         #
         # FAST_LN РЕШАЕТСЯ НА МОДЕЛИ, А НЕ НА ПРОЦЕССЕ. Порядок:
@@ -1157,6 +1203,8 @@ class QuantRWKV7:
         if fast_ln is None:
             self.fast_ln_source = "умолчание"
         self.fast_ln = fast_ln
+        # 06.10: то же для квантованных LoRA на декоде -- см. resolve_lora_q и комментарий у LORA_Q.
+        self.lora_q, self.lora_q_source = resolve_lora_q(ckpt, lora_q, self.preset)
         self.naming = ckpt.naming
         self.n_layer = ckpt.n_layer
         self.n_embd = ckpt.n_embd
@@ -1179,6 +1227,8 @@ class QuantRWKV7:
                                  self.head_size, fast_ln=self.fast_ln)
             for i in range(self.n_layer)
         ]
+        for b in self.blocks:
+            b.tmix.lora_q_on = self.lora_q
         self._materialize()
         # полосы и склейки сборки лежат в кеше MLX -- вернуть их системе
         mx.clear_cache()

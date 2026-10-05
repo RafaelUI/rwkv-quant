@@ -136,11 +136,7 @@ def save_rwkvq(ckpt: QuantizedCheckpoint, output_path: str,
         "config": config_to_json(config) if config is not None else None,
         # 22.09: намерение рантайма. Пересохранение сохраняет прочитанное
         # (config_from_json его не несёт), новая сборка берёт из конфига.
-        "runtime": (getattr(ckpt, "runtime", None)
-                    or ({"fast_ln": bool(config.runtime_fast_ln)}
-                        if config is not None
-                        and getattr(config, "runtime_fast_ln", None) is not None
-                        else None)),
+        "runtime": getattr(ckpt, "runtime", None) or _runtime_of(config),
         "tokenizer": tokenizer if tokenizer is not None
         else getattr(ckpt, "tokenizer", None),
         "tensors": manifest_t,
@@ -398,6 +394,17 @@ def _make_qt(key, group, bits, shape, codes, scale, oi=None, ov=None):
     return QuantizedTensor(key=key, group=group, bits=bits, shape=tuple(shape),
                            codes=codes, scale=scale,
                            outlier_indices=oi, outlier_values=ov)
+
+
+def _runtime_of(config):
+    """Намерение рантайма из конфига: только заданные поля; ни одного -- None (поле в манифест
+    не пишется, байты файлов со своим конфигом прежние). 06.10: добавлено lora_q."""
+    rt = {}
+    for field, attr in (("fast_ln", "runtime_fast_ln"), ("lora_q", "runtime_lora_q")):
+        v = getattr(config, attr, None) if config is not None else None
+        if v is not None:
+            rt[field] = bool(v)
+    return rt or None
 
 
 def _is_quantized(key, group, ndim):

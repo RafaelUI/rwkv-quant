@@ -201,5 +201,10 @@ COMPRESSION = QuantConfig(
 # автоподбора от COMPRESSION остаётся compression-файлом.
 COMPRESSION.runtime_fast_ln = True
 REDUCTION.runtime_fast_ln = False
+# 06.10 (решение владельца): квантованные LoRA на декоде (quant_model.LORA_Q) -- та же развилка.
+# REDUCTION -- нет: +3-6% KL к bf16 на декоде на всех масштабах 0.1B-2.9B (значимо), префилл и
+# декод считали бы разными весами. COMPRESSION -- да: +0.2-1.1% KL за ~0.6 мс/ток.
+COMPRESSION.runtime_lora_q = True
+REDUCTION.runtime_lora_q = False
 
 PRESETS = {"reduction": REDUCTION, "compression": COMPRESSION}

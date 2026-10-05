@@ -22,6 +22,16 @@ writes with its defaults, nothing else set:
 - `reduction` runs GPTQ;
 - `compression` runs autopick and GPTQ.
 
+The two presets also differ in one runtime choice on Apple Silicon, recorded
+in the file manifest (`runtime.lora_q`). `compression` decodes token by token
+with the LoRA branches re-quantized to 8 bits, which is slightly faster;
+`reduction` decodes with the exact weights stored in the file, so prefill and
+token-by-token decode compute the same model. The re-quantized branches cost
+`reduction` 3-6% of KL to bf16 on every scale from 0.1B to 2.9B and buy under
+1% of decode speed (0.14 ms/token on 1.5B), so they are off there; for
+`compression` the same change is 0.2-1.1% of KL. `QuantRWKV7(ckpt,
+lora_q=True/False)` overrides the file's choice.
+
 What both do is described under [Quick start](#quick-start).
 
 | model | build | file | vs bf16 | Δppl text [95% CI] | Δppl code [95% CI] | KL text / code |

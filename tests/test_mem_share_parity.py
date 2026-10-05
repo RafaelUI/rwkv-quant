@@ -265,6 +265,7 @@ def mutations():
 
 
 def main():
+    Q.LORA_Q = "sep"   # 06.10: умолчание модуля -- "auto" (намерение файла, у reduction выключено); P4 написан под sep -- принудительно
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     paths = args or DEFAULT
     mutate = "--mutate" in sys.argv

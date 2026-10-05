@@ -104,7 +104,7 @@ class QuantizedCheckpoint:
     config: object = None          # сам QuantConfig: в манифест едет структурой
     tokenizer: str = None          # ссылка на словарь, если известна
     runtime: dict = None           # намерение рантайма из манифеста (22.09),
-                                   # {"fast_ln": bool}; у старых файлов нет
+                                   # {"fast_ln": bool, "lora_q": bool (06.10)}; у старых файлов нет
     # ВНИМАНИЕ: файлы прежней (pickle) эры разворачиваются в этот же класс,
     # и у них последних двух атрибутов в __dict__ просто нет -- читать их
     # только через getattr(ckpt, ..., None).

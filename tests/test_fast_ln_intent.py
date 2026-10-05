@@ -54,19 +54,19 @@ check("намерение пресетов", COMPRESSION.runtime_fast_ln is True
 with tempfile.TemporaryDirectory() as d:
     f1 = os.path.join(d, "c.rwkvq")
     quantize(CK, f1, preset="compression", tokenizer=TOK, verbose=False, autopick=False, gptq=False)
-    check("1 compression: манифест", manifest_runtime(f1) == {"fast_ln": True}, manifest_runtime(f1))
+    check("1 compression: манифест", manifest_runtime(f1) == {"fast_ln": True, "lora_q": True}, manifest_runtime(f1))
     check("1 compression: рантайм", model(f1) == (True, "манифест"), model(f1))
 
     cfg = copy.deepcopy(COMPRESSION)
     cfg.bits_overrides = dict({"blocks.3.att.value.weight": 6}, **cfg.bits_overrides)
     f2 = os.path.join(d, "r.rwkvq")
     quantize(CK, f2, config=cfg, tokenizer=TOK, verbose=False)
-    check("2 автоподбор: манифест", manifest_runtime(f2) == {"fast_ln": True}, manifest_runtime(f2))
+    check("2 автоподбор: манифест", manifest_runtime(f2) == {"fast_ln": True, "lora_q": True}, manifest_runtime(f2))
     check("2 автоподбор: рантайм", model(f2) == (True, "манифест"), model(f2))
 
     f3 = os.path.join(d, "red.rwkvq")
     quantize(CK, f3, preset="reduction", tokenizer=TOK, verbose=False, gptq=False)
-    check("3 reduction: манифест", manifest_runtime(f3) == {"fast_ln": False}, manifest_runtime(f3))
+    check("3 reduction: манифест", manifest_runtime(f3) == {"fast_ln": False, "lora_q": False}, manifest_runtime(f3))
     check("3 reduction: рантайм", model(f3) == (False, "манифест"), model(f3))
 
     own = QuantConfig(proj=6, cmix=6, emb_head=8, w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16)
@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory() as d:
 
     f7 = os.path.join(d, "rt.rwkvq")
     save_rwkvq(load_raw(f2), f7)
-    check("7 пересохранение сохраняет runtime", manifest_runtime(f7) == {"fast_ln": True}, manifest_runtime(f7))
+    check("7 пересохранение сохраняет runtime", manifest_runtime(f7) == {"fast_ln": True, "lora_q": True}, manifest_runtime(f7))
 
 check("5 файл 20.09: история compression", model(OLD) == (True, "история compression"), model(OLD))
 print("\nГЕЙТ ПРОЙДЕН" if not bad else "\nГЕЙТ КРАСНЫЙ: %s" % bad)

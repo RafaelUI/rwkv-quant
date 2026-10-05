@@ -95,6 +95,8 @@ class QuantConfig:
         # СОЗНАТЕЛЬНО НЕ В repr(): repr -- ключ preset_of() и золота
         # group_split, и флаг не должен сдвигать ни то, ни другое.
         self.runtime_fast_ln = None
+        # 06.10: то же для квантованных LoRA на декоде ("runtime": {"lora_q": ...}); тоже вне repr().
+        self.runtime_lora_q = None
         # 06.10 (решение владельца: отказ). strict=False -- только для чтения манифестов
         # уже записанных файлов (reader.config_from_json): там конфиг -- запись о прошлом,
         # а не заказ на квантование.
