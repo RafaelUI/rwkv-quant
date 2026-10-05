@@ -26,12 +26,23 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
              config: QuantConfig = None, real_gw: bool = True,
              verbose: bool = True, tokenizer=None, act_stats="auto",
              autopick=None, autopick_budget: float = 0.005,
-             measure="auto", device: str = None, gptq=None, gptq_calib=None):
+             measure="auto", device: str = None, gptq=None, gptq_calib=None,
+             allow_per_row: bool = False):
     """
     Quick-start: quantize(ckpt, out, tokenizer=tok, preset="compression")
-    Advanced:    quantize(ckpt, out, tokenizer=tok, config=QuantConfig(proj=4, ...))
+    Advanced:    cfg = copy.deepcopy(rwkv_quant.presets.COMPRESSION); cfg.bits["proj"] = 5
+                 quantize(ckpt, out, tokenizer=tok, config=cfg)
 
     preset игнорируется, если передан config.
+
+    СВОЙ config -- ОТ ПРЕСЕТА, А НЕ С НУЛЯ. QuantConfig(proj=4, cmix=4, ...) "только биты" не
+    задаёт group_scale, и такие группы уходят в построчный RTN. Ниже 8 бит это либо сломанный
+    файл (0.1B: cmix=4 построчно -- KL 2.8, прежний пример отсюда давал 3.1), либо пустая трата
+    (коды 5-7 бит лежат целым байтом: размер как у 8 бит, качество хуже). Поэтому quantize()
+    ОТКАЗЫВАЕТ (ValueError до любой работы), если конфиг отправляет хоть одну матрицу в
+    построчный путь ниже 8 бит. Варианты: копия пресета с правкой bits (как выше); свои
+    group_scale / group_scale_mode; 8 бит; или allow_per_row=True -- осознанно, для
+    исследований (поведение и байты прежние).
 
     real_gw=True (по умолчанию) -- реальная упаковка sb6, файл сжимается.
     real_gw=False -- fake-quant для измерения ppl: та же математика ошибки,
@@ -94,6 +105,9 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         config = copy.deepcopy(PRESETS[preset])
     else:
         config = copy.deepcopy(config)
+
+    if not allow_per_row:
+        _refuse_per_row(checkpoint_path, config)
 
     calib_sig = None
     needs_aw = any(str(m).endswith("_aw")
@@ -164,6 +178,30 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     return quantize_file(checkpoint_path, output_path, config,
                          real_gw=real_gw, verbose=verbose, tokenizer=tok_label,
                          autopick=ap_meta, gptq_tensors=gptq_q, gptq_meta=gptq_meta)
+
+
+def _refuse_per_row(ckpt, config):
+    """Отказ ДО любой работы, если config шлёт матрицы в построчный RTN ниже 8 бит (06.10,
+    решение владельца: отказ, а не предупреждение). Гейт: tests/test_per_row_refusal.py."""
+    from .formats import writer as _w
+    bad = _w.per_row_low_bits(ckpt, config)
+    if not bad:
+        return
+    by = {}
+    for key, group, bits in bad:
+        by.setdefault((group, bits), []).append(key)
+    what = ", ".join("%s=%d (%d матриц, напр. %s)" % (g, b, len(ks), ks[0])
+                     for (g, b), ks in sorted(by.items()))
+    raise ValueError(
+        "конфиг отправляет матрицы в построчный RTN ниже %d бит: %s.\n"
+        "У этих групп нет group_scale, а построчная схема ниже %d бит либо ломает модель "
+        "(4 бита: KL к bf16 0.2-2.8 на группу), либо ничего не экономит (5-7 бит хранятся "
+        "целым байтом -- размер как у 8).\n"
+        "  * от пресета: cfg = copy.deepcopy(rwkv_quant.presets.COMPRESSION); cfg.bits[\"proj\"] = 5;\n"
+        "  * или задайте group_scale / group_scale_mode для этих групп (см. presets.py);\n"
+        "  * или поднимите их до 8 бит;\n"
+        "  * осознанно построчно: quantize(..., allow_per_row=True)."
+        % (_w.PER_ROW_MIN_BITS, what, _w.PER_ROW_MIN_BITS))
 
 
 # Доля памяти под плотную модель + активации калибровки GPTQ при НЕЯВНОМ включении. Активации -- два тензора

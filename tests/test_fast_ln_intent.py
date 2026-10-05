@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory() as d:
 
     own = QuantConfig(proj=6, cmix=6, emb_head=8, w_lora=6, a_lora=6, v_lora=6, g_lora=8, small=16)
     f4 = os.path.join(d, "own.rwkvq")
-    quantize(CK, f4, config=own, tokenizer=TOK, verbose=False, act_stats=None)
+    quantize(CK, f4, config=own, tokenizer=TOK, verbose=False, act_stats=None, allow_per_row=True)   # 06.10: построчно < 8 бит -- только явно
     check("4 свой конфиг: поля нет", manifest_runtime(f4) is None, manifest_runtime(f4))
     check("4 свой конфиг: умолчание", model(f4)[1] == "умолчание", model(f4))
 

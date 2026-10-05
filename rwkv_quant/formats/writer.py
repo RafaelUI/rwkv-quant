@@ -400,18 +400,61 @@ def _make_qt(key, group, bits, shape, codes, scale, oi=None, ov=None):
                            outlier_indices=oi, outlier_values=ov)
 
 
-def _quantize_impl(key: str, w: torch.Tensor, cfg: QuantConfig,
-                    real_gw: bool = False) -> QuantizedTensor:
-    group = _match_group(key)
-    if group is None or w.dim() < 2 or key.endswith(_LORA_BIAS_SUFFIXES):
-        return QuantizedTensor(key=key, group=group or "other", bits=16, shape=tuple(w.shape),
-                                dense=w.to(torch.bfloat16).clone().contiguous())
+def _is_quantized(key, group, ndim):
+    """Идёт ли тензор в квантование вообще (иначе -- плотный bf16). Одно определение на
+    писателя и на предполётную проверку per_row_low_bits (закон 23)."""
+    return not (group is None or ndim < 2 or key.endswith(_LORA_BIAS_SUFFIXES))
 
+
+def _bits_of(key, group, cfg):
+    """Битность тензора: групповая, поверх неё bits_overrides (подстрока, первое побеждает)."""
     bits = cfg.bits[group]
     for pat, b in getattr(cfg, "bits_overrides", {}).items():
         if pat in key:
             bits = b
             break
+    return bits
+
+
+# Построчный RTN (группа без group_scale) осмыслен только от 8 бит. Замер 06.10 на 0.1B
+# (tests/_sess/p1_cfg_grid_0610.py, KL к bf16): одна группа построчно @8 / @6 / @5 / @4 --
+# proj 0.0012 / 0.015 / 0.078 / 0.39, cmix 0.0015 / 0.026 / 0.12 / 2.77; при этом коды 5-7 бит
+# лежат целым байтом, то есть файл того же размера, что @8. Ниже 8 -- либо сломано, либо даром.
+PER_ROW_MIN_BITS = 8
+
+
+def _open_sd(checkpoint_path):
+    if checkpoint_path.endswith(".pth"):
+        return torch.load(checkpoint_path, map_location="cpu", mmap=True)
+    from safetensors.torch import load_file
+    path = checkpoint_path
+    if os.path.isdir(path):
+        path = os.path.join(path, "model.safetensors")
+    return load_file(path)
+
+
+def per_row_low_bits(checkpoint_path: str, cfg: QuantConfig):
+    """Тензоры, которые cfg отправит в построчный RTN ниже PER_ROW_MIN_BITS:
+    [(ключ, группа, биты)]. Выбор ветки -- теми же функциями, что у _quantize_impl."""
+    out = []
+    for key, w in _open_sd(checkpoint_path).items():
+        group = _match_group(key)
+        if not _is_quantized(key, group, w.dim()):
+            continue
+        bits = _bits_of(key, group, cfg)
+        if bits < PER_ROW_MIN_BITS and not getattr(cfg, "group_scale", {}).get(group):
+            out.append((key, group, bits))
+    return out
+
+
+def _quantize_impl(key: str, w: torch.Tensor, cfg: QuantConfig,
+                    real_gw: bool = False) -> QuantizedTensor:
+    group = _match_group(key)
+    if not _is_quantized(key, group, w.dim()):
+        return QuantizedTensor(key=key, group=group or "other", bits=16, shape=tuple(w.shape),
+                                dense=w.to(torch.bfloat16).clone().contiguous())
+
+    bits = _bits_of(key, group, cfg)
     sp = getattr(cfg, "act_stats_path", None)
     # gw-ветка РАНЬШЕ act_stats: иначе группа с group_scale и статистикой
     # ушла бы в per-row-AW и до блочного пути не дошла. AW внутри gw --
@@ -565,14 +608,7 @@ def quantize_file(checkpoint_path: str, output_path: str, config: QuantConfig,
     """
     if gptq_tensors and not real_gw:
         raise ValueError("gptq_tensors -- реальная упаковка sb6; с real_gw=False не сочетается")
-    if checkpoint_path.endswith(".pth"):
-        sd = torch.load(checkpoint_path, map_location="cpu", mmap=True)
-    else:
-        from safetensors.torch import load_file
-        path = checkpoint_path
-        if os.path.isdir(path):
-            path = os.path.join(path, "model.safetensors")
-        sd = load_file(path)
+    sd = _open_sd(checkpoint_path)
 
     meta = detect_meta(checkpoint_path, sd)
     if verbose:

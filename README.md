@@ -733,8 +733,25 @@ logits, state = model.step(token_ids, state)   # prefill AND decode
 
 Presets are calibrated on `rwkv7-g1h-1.5b` — see
 [Why presets aren't universal](#why-quantization-sensitivity-doesnt-transfer-across-scale).
-For a checkpoint-specific config run `calibrate()` or build a `QuantConfig`
-by hand (per-group bits, group scale sizes, scale modes, clipping).
+For a checkpoint-specific config run `calibrate()`, or start from a preset
+and change what you need:
+
+```python
+import copy
+from rwkv_quant import quantize, presets
+
+cfg = copy.deepcopy(presets.COMPRESSION)
+cfg.bits["proj"] = 5
+quantize("model.pth", "model.rwkvq", tokenizer=tok, config=cfg)
+```
+
+Do not build a bits-only config such as `QuantConfig(proj=4, cmix=4)`. A group
+without `group_scale` falls back to per-row rounding, which is only sound at
+8 bits: at 4 bits it breaks the model (KL to bf16 of 2.8 nats for `cmix` alone
+on 0.1B), and 5-7 bit codes are stored one per byte, so the file is as large
+as at 8 bits and worse. `quantize()` refuses such a config with a `ValueError`
+before doing any work. `allow_per_row=True` overrides the check for research
+use.
 
 ## Format
 
