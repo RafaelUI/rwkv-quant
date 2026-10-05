@@ -183,7 +183,11 @@ def calib_tokens(tokenizer, calib=None, n_windows=N_WINDOWS, seq_len=A.SEQ_LEN):
             calib = calib["tokens"] if isinstance(calib, dict) else calib
         tok = torch.as_tensor(calib, dtype=torch.long)[:n_windows, :seq_len].cpu().contiguous()
     if tok.dim() != 2 or tok.shape[0] < n_windows or tok.shape[1] < 2:
-        raise ValueError("калибровка GPTQ: нужно %d окон, есть %s" % (n_windows, tuple(tok.shape)))
+        raise ValueError(
+            "калибровка GPTQ: нужен тензор токенов [N, T] с N >= %d окон и T >= 2, передано %s. "
+            "Берутся первые %d окон и первые %d токенов каждого; число окон фиксировано, меньший "
+            "набор не принимается (без gptq_calib используется корпус пакета)."
+            % (n_windows, tuple(tok.shape), n_windows, seq_len))
     return tok, label
 
 

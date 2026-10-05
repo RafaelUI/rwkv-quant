@@ -98,6 +98,8 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
       7.2B -28.8 / -38.5%, 13.3B -28.8 / -38.5%; вместе с autopick +0.5% к прежнему пути: 7.2B
       -42.5 / -44.9%, 13.3B -41.3 / -47.6%. Цена -- время: 13.3B ~4.7 ч на 4x4090.
     gptq_calib: None -- корпус пакета; путь к .pt ({"tokens": [N, T]}) или тензор [N, T] токенов.
+        Свой набор -- НЕ МЕНЬШЕ 600 окон: берутся первые 600 окон и первые 512 токенов каждого,
+        на меньшем наборе ValueError (число окон фиксировано решением владельца).
     """
     _user_config = config is not None
     if config is None:

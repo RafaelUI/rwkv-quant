@@ -667,8 +667,11 @@ What it costs:
   footprint is 2.4–3.4x larger (table above).
 
 If the two do not fit in 60% of memory, the implicit GPTQ is skipped with a
-notice. `gptq=False` turns it off; `gptq_calib=` takes your own windows. The
-run is recorded in the file manifest.
+notice. `gptq=False` turns it off; `gptq_calib=` takes your own windows: a
+`[N, T]` token tensor, or a `.pt` file holding one under `"tokens"`. It needs
+at least 600 of them — the first 600 windows and the first 512 tokens of each
+are used, and a smaller set is rejected with a `ValueError`. The run is
+recorded in the file manifest.
 ```
 
 With `preset="compression"`, `quantize()` also runs **autopick** by default:
