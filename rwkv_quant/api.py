@@ -42,7 +42,11 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     ОТКАЗЫВАЕТ (ValueError до любой работы), если конфиг отправляет хоть одну матрицу в
     построчный путь ниже 8 бит. Варианты: копия пресета с правкой bits (как выше); свои
     group_scale / group_scale_mode; 8 бит; или allow_per_row=True -- осознанно, для
-    исследований (поведение и байты прежние).
+    исследований (поведение и байты прежние). Конфиг, выданный calibrate(), проходит без
+    флага: его построчные точки измерены против бюджета.
+    Там же отказ на неизвестное имя группы (QuantConfig(prooj=4) раньше молча давал файл
+    целиком в bf16) и на group_scale_mode без group_scale (режим молча игнорировался) --
+    QuantConfig.validate(), зовётся и конструктором.
 
     real_gw=True (по умолчанию) -- реальная упаковка sb6, файл сжимается.
     real_gw=False -- fake-quant для измерения ppl: та же математика ошибки,
@@ -106,7 +110,8 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     else:
         config = copy.deepcopy(config)
 
-    if not allow_per_row:
+    _validate_config(config)
+    if not allow_per_row and not _is_calibrated(config):
         _refuse_per_row(checkpoint_path, config)
 
     calib_sig = None
@@ -178,6 +183,20 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     return quantize_file(checkpoint_path, output_path, config,
                          real_gw=real_gw, verbose=verbose, tokenizer=tok_label,
                          autopick=ap_meta, gptq_tensors=gptq_q, gptq_meta=gptq_meta)
+
+
+def _validate_config(config):
+    """Итоговый конфиг (после копии): неизвестные группы и режим без group_scale -- отказ.
+    Конструктор QuantConfig проверяет то же, но поля -- словари, их правят и после сборки."""
+    config.validate()
+
+
+def _is_calibrated(config):
+    """Конфиг выдан calibrate(): его построчные точки (rtn@4 у LoRA-групп -- самый дешёвый
+    кандидат schema_space) ИЗМЕРЕНЫ против бюджета ppl, это не «только биты» вслепую.
+    Без этого исключения цепочка calibrate() -> quantize(config=) упиралась в отказ
+    (поймано 06.10: 0.1B, w_lora -> rtn@4 при +0.46% ppl)."""
+    return bool(getattr(config, "calibration_report", None))
 
 
 def _refuse_per_row(ckpt, config):

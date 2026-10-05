@@ -120,6 +120,7 @@ def config_from_json(d):
         group_scale=d.get("group_scale"),
         group_scale_mode=d.get("group_scale_mode"),
         act_stats_path=d.get("act_stats_path"),
+        strict=False,       # манифест -- запись о прошлом: читаем как есть, без отказов (06.10)
         **d.get("bits", {}))
     return cfg
 

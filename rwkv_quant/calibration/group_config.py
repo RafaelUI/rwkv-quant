@@ -62,7 +62,7 @@ def expand_aliases(d):
 class QuantConfig:
     def __init__(self, clip_percentiles=None, outlier_fracs=None,
                  bits_overrides=None, group_scale=None, group_scale_mode=None,
-                 act_stats_path=None,
+                 act_stats_path=None, strict=True,
                  **bits_per_group):
         self.bits = {g: 16 for g in GROUPS}
         self.bits.update(expand_aliases(bits_per_group))
@@ -95,6 +95,38 @@ class QuantConfig:
         # СОЗНАТЕЛЬНО НЕ В repr(): repr -- ключ preset_of() и золота
         # group_split, и флаг не должен сдвигать ни то, ни другое.
         self.runtime_fast_ln = None
+        # 06.10 (решение владельца: отказ). strict=False -- только для чтения манифестов
+        # уже записанных файлов (reader.config_from_json): там конфиг -- запись о прошлом,
+        # а не заказ на квантование.
+        if strict:
+            self.validate()
+
+    # Словарные поля с ключами-группами (после expand_aliases -- только настоящие группы).
+    _NAME_FIELDS = ("bits", "clip_percentiles", "outlier_fracs", "group_scale", "group_scale_mode")
+
+    def _check_names(self):
+        bad = ["%s[%r]" % (f, k) for f in self._NAME_FIELDS for k in (getattr(self, f) or {}) if k not in GROUPS]
+        if bad:
+            raise ValueError(
+                "QuantConfig: неизвестная группа: %s. Группы: %s; псевдонимы (только в конструкторе): %s. "
+                "Раньше такое имя принималось молча и ни на что не влияло -- группа оставалась bf16."
+                % (", ".join(bad), ", ".join(GROUPS), ", ".join(GROUP_ALIASES)))
+
+    def _check_modes(self):
+        bad = sorted(g for g in (self.group_scale_mode or {}) if not (self.group_scale or {}).get(g))
+        if bad:
+            raise ValueError(
+                "QuantConfig: group_scale_mode задан без group_scale для: %s. Режим действует только "
+                "вместе с размером блока (group_scale); без него он молча игнорировался, и группа "
+                "уходила в построчный RTN." % ", ".join(bad))
+
+    def validate(self):
+        """ValueError на конфиге, который раньше молча делал не то, что написано: неизвестное имя
+        группы (опечатка -> группа оставалась bf16) и режим без group_scale (игнорировался).
+        Зовётся конструктором и quantize() (на итоговом конфиге: поля -- обычные словари, их
+        правят и после сборки). Гейт: tests/test_config_validation.py."""
+        self._check_names()
+        self._check_modes()
 
     def __repr__(self):
         # emb и head схлопываются обратно в emb_head, когда совпадают: так
