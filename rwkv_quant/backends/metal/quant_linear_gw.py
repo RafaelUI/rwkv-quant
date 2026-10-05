@@ -425,6 +425,17 @@ HOST_BAND_MB = int(os.environ.get("RWKVQ_HOST_BAND_MB", "16"))
 RKV_SHARE = os.environ.get("RWKVQ_RKV_SHARE", "0") != "0"
 
 
+def _view_ok(buf):
+    """Срез строк в MLX -- ВИД на буфер родителя со смещением, не копия
+    (share_cost_0510: неслитый декод не замедлился). У видов в MLX есть
+    известный класс ошибок на буферах больше 2^31 элементов (ml-explore/mlx
+    #4548: int32-индексация по data_size вида). Наши буферы фьюза меньше на
+    два порядка; предусловие закреплено явно, чтобы рост формата его не
+    обошёл молча."""
+    assert buf.size < (1 << 31), ("буфер фьюза %d элементов: виды MLX "
+                                  "небезопасны выше 2^31" % buf.size)
+
+
 def _mx_rows(make, OUT, rows):
     if rows >= OUT:
         return mx.array(np.ascontiguousarray(make(0, OUT)))
@@ -828,6 +839,7 @@ class GwQuantLinear:
         декод. Байты те же, выход бит-в-бит."""
         if not self.__dict__.get("_k3"):
             return
+        _view_ok(parent.qblk)
         for n in ("qblk", "qsqm", "ddm"):
             self.__dict__.pop(n, None)
         self.__dict__["_fz"] = (parent, row0)

@@ -42,7 +42,7 @@ from ...formats import reader as _reader
 from .quant_linear import QuantLinear  # noqa: F401 (v1, референс)
 from .quant_linear_v2 import QuantLinearV2
 from .quant_linear_gw import GwQuantLinear, GwQuantLinearFused
-from .quant_linear_gw import RKV_SHARE
+from . import quant_linear_gw as _gw
 from .quant_linear_sym import SymQuantLinear, SymQuantLinearFused
 from .fused_tail import wkv_tail, can_fuse_tail
 from .fused_prewkv import (l2_norm, prewkv_ref, prewkv_kernel,
@@ -168,9 +168,9 @@ def _dense(qt) -> mx.array:
         t = qt.dense
         dt = (torch.float16 if t.ndim == 2 and min(t.shape) >= 32
               else torch.float32)
-        if t.ndim == 2 and t.numel() * 2 > (HOST_BAND_MB << 20):
-            rows = max(1, (HOST_BAND_MB << 20) // (int(t.shape[1]) * 2))
-            return _mx_rows(lambda a, b: t[a:b].to(dt).numpy(),
+        if t.ndim == 2 and t.numel() * 2 > (_gw.HOST_BAND_MB << 20):
+            rows = max(1, (_gw.HOST_BAND_MB << 20) // (int(t.shape[1]) * 2))
+            return _gw._mx_rows(lambda a, b: t[a:b].to(dt).numpy(),
                             int(t.shape[0]), rows)
         return mx.array(t.to(dt).numpy())
     dt = (torch.float16 if len(qt.shape) == 2 and min(qt.shape) >= 32
@@ -182,9 +182,9 @@ def _dense(qt) -> mx.array:
         # полосы на результат не влияет (bits_ref_0510: бит-в-бит). Полоса
         # уже, чем у читалки: её fp32-транзиенты и есть то, что оседает в
         # куче хоста.
-        rows = max(1, (HOST_BAND_MB << 20) // (IN * 4))
+        rows = max(1, (_gw.HOST_BAND_MB << 20) // (IN * 4))
         if rows < OUT:
-            return _mx_rows(
+            return _gw._mx_rows(
                 lambda a, b: _dequantize_one(_reader._RowBand(qt, a, b))
                 .to(dt).numpy(), OUT, rows)
     return mx.array(dequantize_banded(qt, dt).numpy())
@@ -238,22 +238,7 @@ EMB_GATHER = os.environ.get("RWKVQ_EMB_GATHER", "1") != "0"
 # отдаёт 0). Поэтому крупные тензоры уходят в MLX ПОЛОСАМИ строк: в куче
 # хоста живёт одна полоса, а склейка идёт уже в памяти MLX, которую
 # mx.clear_cache() системе отдаёт. Результат бит-в-бит тот же.
-HOST_BAND_MB = int(os.environ.get("RWKVQ_HOST_BAND_MB", "16"))
-
-
-def _mx_rows(make, OUT, rows):
-    """make(a, b) -> numpy-полоса строк [a, b). Склейка в MLX."""
-    if rows >= OUT:
-        return mx.array(np.ascontiguousarray(make(0, OUT)))
-    parts = []
-    for a in range(0, OUT, rows):
-        p = mx.array(np.ascontiguousarray(make(a, min(a + rows, OUT))))
-        mx.eval(p)
-        parts.append(p)
-    out = mx.concatenate(parts, axis=0)
-    mx.eval(out)
-    del parts
-    return out
+# Реализация и оба переключателя -- в quant_linear_gw (_mx_rows, HOST_BAND_MB), читаются через модуль.
 
 
 class SymGatherEmb:
@@ -592,7 +577,7 @@ class QuantTMix:
             self.v_proj = _linear(g(ap+"value.weight")); self.o_proj = _linear(g(ap+"output.weight"))
             self.ln_x_w, self.ln_x_b = _dense(g(ap+"ln_x.weight")), _dense(g(ap+"ln_x.bias"))
         self._fused_built = False
-        if RKV_SHARE:
+        if _gw.RKV_SHARE:
             # фьюз владеет буферами r/k/v -- строим сразу: граф префилла,
             # скомпилированный ДО первого декода, иначе удержал бы оригиналы
             self._build_rkv_fused()
@@ -891,7 +876,7 @@ class QuantTMix:
         # GwQuantLinear (формат нетронут, математика строки бит-в-бит).
         # Цена: копия буферов (~8.7MB/слой) поверх оригиналов -- оригиналы
         # нужны GEMM-префиллу и нефьюзнутому пути.
-        if RKV_SHARE and "_rkv_fused" in self.__dict__:
+        if _gw.RKV_SHARE and "_rkv_fused" in self.__dict__:
             return                                   # построен в конструкторе
         self._rkv_fused = None
         self._rkv_idx = mx.array([0, 2, 3])          # (xr, xk, xv) из xs

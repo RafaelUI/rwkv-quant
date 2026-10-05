@@ -45,7 +45,7 @@ import numpy as np
 import mlx.core as mx
 
 from .quant_linear_gw import GEMM_MIN_BATCH_NB, _gw_kernel_cache
-from .quant_linear_gw import HOST_BAND_MB, RKV_SHARE, _mx_rows
+from . import quant_linear_gw as _gw
 
 # порядок регистров -> порядок колонок внутри ПАРЫ блоков по 16
 _PAIR_REGS = ["l0", "l1", "h0", "h1", "l2", "l3", "h2", "h3"]
@@ -790,10 +790,10 @@ class SymQuantLinear:
                      np.asarray(qh2).reshape(OUT, NP, 4)]
             blk = None
         if blk is None:
-            self.qblk = _mx_rows(
+            self.qblk = _gw._mx_rows(
                 lambda a, b: np.concatenate([p[a:b] for p in parts], axis=2)
                 .reshape(b - a, -1), OUT,
-                max(1, (HOST_BAND_MB << 20) // (NP * 24)))
+                max(1, (_gw.HOST_BAND_MB << 20) // (NP * 24)))
         else:
             self.qblk = mx.array(np.ascontiguousarray(blk.reshape(OUT, -1)))
         self.qs = mx.array(np.ascontiguousarray(
@@ -806,6 +806,7 @@ class SymQuantLinear:
 
     def _adopt(self, parent, row0):
         """См. GwQuantLinear._adopt: буферами владеет фьюз, здесь срезы."""
+        _gw._view_ok(parent.qblk)
         for n in ("qblk", "qs", "d"):
             self.__dict__.pop(n, None)
         self.__dict__["_fz"] = (parent, row0)
@@ -990,7 +991,7 @@ class SymQuantLinearFused:
         self.d = mx.concatenate([l.d for l in lins], axis=0)
         mx.eval(self.qblk, self.qs, self.d)
         self.cfg_override = None
-        if RKV_SHARE:
+        if _gw.RKV_SHARE:
             for i, l in enumerate(lins):
                 l._adopt(self, i * self.out_per)
 
