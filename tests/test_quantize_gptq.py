@@ -34,6 +34,16 @@ CALIB_PT = os.path.expanduser(os.environ.get("RWKVQ_CALIB_PT", "~/Develop/WKV-kv
 PARTS = ("q", "qs", "qm", "d", "dm")
 
 
+_TMP = []
+
+
+def _tmpdir():
+    """06.10: было tempfile.mkdtemp() без уборки -- каждый запуск оставлял в /tmp ~2.2 ГБ .rwkvq (за пять дней 14 ГБ,
+    диск Mac дошёл до 4.9 ГиБ). TemporaryDirectory убирает каталог при выходе из процесса, в том числе после падения."""
+    t = tempfile.TemporaryDirectory(prefix="rq_gptq_gate_"); _TMP.append(t)
+    return t.name
+
+
 def part1():
     torch.manual_seed(zlib.crc32(b"gptq_diag"))
     W = torch.randn(48, 1024) * 0.02
@@ -81,7 +91,7 @@ def part2(preset="compression"):
     assert len(qts) == exp, (len(qts), exp)
     assert all(torch.isfinite(v).all() for v in deqs.values())
     print("2a. [%s] GPTQ (fake-путь, устройство %s): %d матриц (ожидалось %d), %.0f с" % (preset, DEV, len(qts), exp, time.time() - t0), flush=True)
-    d = tempfile.mkdtemp()
+    d = _tmpdir()
     fg, fr = os.path.join(d, "g.rwkvq"), os.path.join(d, "r.rwkvq")
     nw0 = G.N_WINDOWS
     G.N_WINDOWS = NW                       # гейт -- на NW окнах; в библиотеке всегда 600
@@ -140,7 +150,7 @@ def part6():
     calls = []
     run0, file0 = G.run, G.CALIB_FILE
     G.run = lambda *a, **k: calls.append(k.get("device")) or {}
-    d = tempfile.mkdtemp()
+    d = _tmpdir()
     try:
         cases = [("compression", {}, 1), ("reduction", {}, 1), ("compression", dict(real_gw=False), 0),
                  ("reduction", dict(real_gw=False), 0), ("compression", dict(config=copy.deepcopy(presets.COMPRESSION)), 0),
