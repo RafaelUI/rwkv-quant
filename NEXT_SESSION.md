@@ -3026,3 +3026,42 @@ gptq_calib >= 600 окон не в README; mlx / rwkv-metal обязательн
   test_fast_ln_parity, test_prewkv_parity; шесть кодов 1 -- IndexError на sys.argv (гейты с аргументами: k3_from_canonical,
   manifest_selfdesc, measure_multidev, mlx_affine_repack, rwkvq_container, wkv_var_model; с аргументами НЕ запускались).
   После этого -- git push (слово владельца) и перевод серверного клона с bundle на GitHub.
+
+### 06.10 (ночь) — СОСТОЯНИЕ НА КОНЕЦ СЕССИИ: ОПУБЛИКОВАНО, СЕРВЕР НА GitHub, ОТКАЗЫ ПРОВЕРЕНЫ НА CUDA
+- **Опубликовано.** main == origin/main (github.com/RafaelUI/rwkv-quant), 09b8a7e на момент push. Версия в pyproject.toml
+  всё ещё 0.2.1 -- на PyPI НЕ выпускалось; перед выпуском поднять (поведение изменилось: отказы, lora_q у reduction, ключ
+  кеша, зависимости только для macOS).
+- **Сервер.** ~/rwkvq/rwkv-quant-git: origin -> GitHub (прежний bundle оставлен как remote `bundle`), fast-forward до
+  09b8a7e, дерево чистое. ДОСТАВКА ТЕПЕРЬ -- git push на Mac + git pull --ff-only на сервере, bundle больше не нужен.
+  Рабочий ~/venv не менялся: rwkv_quant там не установлен, а берётся из клона через PYTHONPATH; torch 2.13.0.
+  Старые кеши ~/.cache/rwkv-quant на сервере подписаны по-старому и не читаются; измерения 7.2B / 13.3B -- через
+  measure=путь (несовпадение подписи -- предупреждение).
+- **Отказы на CUDA** (tests/_sess/api_misuse_0610.py из обновлённого клона, 51 случай, /tmp/api_misuse_cuda2.log на
+  сервере): все отказы до начала работы срабатывают как на Mac; gptq_calib с токенами вне vocab -- ValueError (раньше
+  поток аппаратных assert'ов CUDA). Принято три, все ожидаемо: чужой словарь в пределах vocab, gptq=True без целей (с
+  предупреждением), allow_per_row=True. По-прежнему посреди работы: биты 3 / 7 в sb6 и неизвестный режим
+  (NotImplementedError из писателя), group_scale 33 (AssertionError); device с опечаткой -- текст torch.
+- **ЧТО ОСТАЛОСЬ.**
+  1. Гейты с аргументами за сессию НЕ запускались, а код под ними менялся и уже опубликован: test_manifest_selfdesc <файл>,
+     test_rwkvq_container <файл> [<out>], test_mlx_affine_repack <файл>, test_wkv_var_model {ru60m|1.5b},
+     test_k3_from_canonical <файл> <сайдкар>, test_measure_multidev <ckpt> <tok> (сервер, две карты). 03.10 первые три
+     гонялись на 0.1B compression / reduction (строки 2564-2588).
+  2. Открыто, не разбиралось: calibrate() не укладывается в свой бюджет (композит +8.9..+10.4% при ppl_threshold_pct = 5
+     на 0.1B-2.9B, tests/_sess/p_calib_rtn4_0610.py).
+  3. Ранняя проверка пар режим / биты и кратности group_scale ширине (сейчас падают из писателя посреди работы): нужна
+     одна таблица поддержки, общая для писателя и предполётной проверки (закон 23).
+  4. Кто пробует импортировать mlx в пути reduction на двух картах (замечено на старом колесе, после quantize в
+     sys.modules был 'mlx').
+  5. Необязательно: autopick для reduction (см. запись «день»).
+  6. Уборка (удаляет владелец). Сервер: /tmp/rq_venv_p4, /tmp/rq_venv_p4b, /tmp/rq_venv_p4c, /tmp/rq_p4*, /tmp/p_calib_*,
+     /tmp/rq_misuse_*, /tmp/api_misuse_cuda*. Mac: /tmp/rq_wt_*, /tmp/rq_mis_*, /tmp/rq_misuse_*, /tmp/rq_p4whl_*,
+     /tmp/p_calib_rtn4_*.rwkvq, 14 старых /tmp/tmp*, журналы гейтов и проб, Корзина.
+- **Ловушки, найденные за сессию.**
+  * Два процесса в один журнал дают мусор (так был испорчен первый прогон гейта подписи): перед перезапуском убедиться
+    по ps, что прежний завершён, или писать в новый файл.
+  * Пресеты несут шаблоны bits_overrides под ОБА именования ключей -- «шаблон не совпал» для них норма.
+  * GPTQ обрабатывает и sb6 (compression), и sym* (reduction): любой признак «GPTQ нечего делать» сверять с gptq.run.plan.
+  * LORA_Q = "auto": модуль-флаг, выставленный явно, принудителен для всех моделей процесса; флаг читается при
+    трассировке mx.compile -- на живой модели не переключается, для A/B строить две модели.
+  * torch 2.14 на CUDA без python3-dev: TORCH_DISABLE_NATIVE_JIT=1 (рабочий venv сервера на 2.13.0 не задет).
+  * ssh с nohup ... & без `< /dev/null` держит вызов до тайм-аута.
