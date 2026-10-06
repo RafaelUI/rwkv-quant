@@ -2974,3 +2974,14 @@ gptq_calib >= 600 окон не в README; mlx / rwkv-metal обязательн
   В ПОРЯДКЕ: нет чекпоинта, tokenizer None / нет файла / число / id за vocab / пустой, опечатка в пресете, «только биты»,
   опечатка в группе, нет act_stats, gptq + real_gw=False, 8 окон, нет measure, чужой measure, лишний аргумент, generate с
   пустым промптом, n <= 0. На CUDA скрипт НЕ гонялся.
+
+### 06.10 (день) — ОТКАЗ autopick НА РАСКЛАДКЕ НЕ sb6; calibrate БЕЗ rtn@4 -- ИССЛЕДОВАНИЕ
+- **Отказ (решение владельца).** quantize(..., autopick=True) на конфиге, где proj / cmix / emb / head не в asym_sb6* на
+  4-6 битах, -- ValueError ДО любой работы (api._refuse_autopick / _autopick_unsupported). Было: preset="reduction" +
+  autopick=True проходил измерение (час на 1.5B) и падал в писателе NotImplementedError «mode=sym_aw bits=7» -- autopick
+  назначает биты по лестнице sb6 (4 / 5 / 6 -> bf16). Неявный autopick (compression) не задет. Гейт
+  tests/test_autopick_refusal.py --mutate: 4 свойства, 2 мутации пойманы; bits_ref без изменений. README и docstring.
+- **НЕОБЯЗАТЕЛЬНОЕ ОТДЕЛЬНОЕ ИССЛЕДОВАНИЕ (не делалось, не блокирует ничего): autopick для reduction.** Нужна лестница под
+  sym-режимы (у sym_aw реализованы 6 и 8 бит), своя модель байт (сейчас (b + 0.5) / 8 -- под шкалы sb6) и закон уровней r
+  для этих режимов (R_LEVEL мерился на sb6); и сначала замер, даёт ли перераспределение хоть что-то пресету, который и так
+  почти без потерь (KL 0.0017 на 1.5B). Без такого замера заводить не стоит.

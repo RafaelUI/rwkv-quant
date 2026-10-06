@@ -74,7 +74,9 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         38%, top-1 на 0.78 п.п. (NEXT_SESSION, раздел 9).
 
     autopick (24.09): None (умолчание) -- ВКЛЮЧЁН для preset="compression" без своего
-      config (решение владельца 24.09; проверен только там), иначе выключен; при неявном
+      config (решение владельца 24.09; проверен только там), иначе выключен. autopick=True на
+      раскладке не sb6 (preset="reduction", построчные группы) -- ValueError до измерения
+      (06.10; раньше падало NotImplementedError после него). При неявном
       включении пропускается с предупреждением, если плотная bf16-модель не влезает в
       половину памяти устройства (измерению нужна плотная модель). True/False -- явно.
       Суть: перераспределить биты по матрицам по
@@ -118,6 +120,8 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     _validate_config(config)
     if not allow_per_row and not _is_calibrated(config):
         _refuse_per_row(checkpoint_path, config)
+    if autopick:
+        _refuse_autopick(config)
 
     calib_sig = None
     needs_aw = any(str(m).endswith("_aw")
@@ -153,6 +157,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
             print("[autopick] пропущен: плотная bf16-модель больше половины памяти устройства; "
                   "measure -- на машине с большей памятью, затем quantize(measure=путь)")
     if autopick:
+        _refuse_autopick(config)
         ap_meta = _autopick(checkpoint_path, config, tokenizer, autopick_budget,
                             measure, device, verbose)
 
@@ -188,6 +193,41 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     return quantize_file(checkpoint_path, output_path, config,
                          real_gw=real_gw, verbose=verbose, tokenizer=tok_label,
                          autopick=ap_meta, gptq_tensors=gptq_q, gptq_meta=gptq_meta)
+
+
+# Группы, которым autopick переназначает биты (calibration.autopick.R_LEVEL), и раскладка, под
+# которую он сделан: лестница 4 / 5 / 6 бит -> bf16 в режимах asym_sb6*, байты (b + 0.5) / 8.
+_AUTOPICK_GROUPS = ("proj", "cmix", "emb", "head")
+_AUTOPICK_BITS = (4, 5, 6)
+
+
+def _autopick_unsupported(config):
+    """[(группа, режим, биты)] -- группы, на которых autopick работать не умеет."""
+    bad = []
+    for g in _AUTOPICK_GROUPS:
+        b = config.bits.get(g, 16)
+        if b >= 16:
+            continue
+        mode = (config.group_scale_mode or {}).get(g)
+        if not (config.group_scale or {}).get(g) or not str(mode).startswith("asym_sb6") or b not in _AUTOPICK_BITS:
+            bad.append((g, mode, b))
+    return bad
+
+
+def _refuse_autopick(config):
+    """Отказ ДО измерения (06.10, решение владельца). autopick назначает матрицам биты по лестнице
+    sb6 (4 / 5 / 6 -> bf16). На другой раскладке он выдаёт нереализуемые точки: preset="reduction"
+    (sym_aw, 8 бит) + autopick=True падал NotImplementedError «mode=sym_aw bits=7» уже ПОСЛЕ
+    измерения (час на 1.5B). Поддержка autopick для reduction -- отдельное необязательное
+    исследование (NEXT_SESSION, 06.10). Гейт: tests/test_autopick_refusal.py."""
+    bad = _autopick_unsupported(config)
+    if bad:
+        raise ValueError(
+            "autopick=True не поддерживается для этого конфига: он переназначает биты по лестнице "
+            "sb6 (режимы asym_sb6*, 4-6 бит), а здесь %s. Автоподбор сделан и проверен для "
+            "preset=\"compression\" (там он включён по умолчанию); для preset=\"reduction\" и своих "
+            "раскладок уберите autopick=True."
+            % ", ".join("%s: режим %s, %d бит" % (g, m or "построчный", b) for g, m, b in bad))
 
 
 def _validate_config(config):

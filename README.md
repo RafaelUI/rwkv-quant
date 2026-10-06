@@ -711,7 +711,10 @@ The measurement needs the dense model in memory and takes about an hour for
 `~/.cache/rwkv-quant/measure`). If the dense model would take more than 30%
 of the device memory, autopick is skipped with a notice: measure on a bigger
 machine and pass the JSON with `measure="path/to/measure_<sig>.json"`.
-`autopick=False` turns it off; the choice is recorded in the file manifest.
+`autopick=False` turns it off; the choice is recorded in the file manifest. Autopick
+works on the `compression` layout only (4-6 bit sb6 groups): `autopick=True`
+with `preset="reduction"` or a per-row config is rejected with a `ValueError`
+before the measurement starts.
 
 `tokenizer` is required, and not for metadata. Both presets use
 activation-weighted (AW) scale search: the scale for each group is chosen
