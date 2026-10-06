@@ -122,6 +122,29 @@ class QuantConfig:
                 "вместе с размером блока (group_scale); без него он молча игнорировался, и группа "
                 "уходила в построчный RTN." % ", ".join(bad))
 
+    def _check_values(self):
+        """Значения, которые раньше либо молча делали не то (биты 12 построчно -- файл как при 8;
+        4.0; clip_percentiles=250), либо роняли писатель посреди работы невнятной ошибкой
+        (биты строкой, отрицательный group_scale, outlier_fracs=1.5). 06.10."""
+        def is_int(v):
+            return isinstance(v, int) and not isinstance(v, bool)
+        bad = []
+        for where, d in (("bits", self.bits), ("bits_overrides", getattr(self, "bits_overrides", None) or {})):
+            for k, b in d.items():
+                if not is_int(b) or not (1 <= b <= 8 or b == 16):
+                    bad.append("%s[%r] = %r (нужно целое 1..8 или 16 = bf16)" % (where, k, b))
+        for k, v in (self.group_scale or {}).items():
+            if not is_int(v) or v < 0:
+                bad.append("group_scale[%r] = %r (нужно целое >= 0)" % (k, v))
+        for k, v in (self.clip_percentiles or {}).items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 < v <= 100):
+                bad.append("clip_percentiles[%r] = %r (нужен процентиль в (0, 100])" % (k, v))
+        for k, v in (self.outlier_fracs or {}).items():
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not (0 <= v < 1):
+                bad.append("outlier_fracs[%r] = %r (нужна доля в [0, 1))" % (k, v))
+        if bad:
+            raise ValueError("QuantConfig: недопустимые значения: " + "; ".join(bad))
+
     def validate(self):
         """ValueError на конфиге, который раньше молча делал не то, что написано: неизвестное имя
         группы (опечатка -> группа оставалась bf16) и режим без group_scale (игнорировался).
@@ -129,6 +152,7 @@ class QuantConfig:
         правят и после сборки). Гейт: tests/test_config_validation.py."""
         self._check_names()
         self._check_modes()
+        self._check_values()
 
     def __repr__(self):
         # emb и head схлопываются обратно в emb_head, когда совпадают: так

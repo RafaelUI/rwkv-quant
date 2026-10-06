@@ -2997,3 +2997,28 @@ gptq_calib >= 600 окон не в README; mlx / rwkv-metal обязательн
   при любой ширине; конфиг с calibration_report получает тот же отказ; мутация «rtn@4 возвращён» поймана.
 - **ОТКРЫТО, не разбиралось:** calibrate() не укладывается в свой бюджет -- при ppl_threshold_pct = 5 итоговый композит
   +8.9..+10.4% на всех четырёх масштабах (доводка поднимает LoRA, small, местами cmix и останавливается).
+
+### 06.10 (день, 3) — ОТКАЗЫ НА НЕВЕРНОЕ ИСПОЛЬЗОВАНИЕ API (решение владельца)
+- **Сделано** (гейт tests/test_api_misuse.py, 11 свойств; до и после -- tests/_sess/api_misuse_0610.py на колесе):
+  * api._preflight_args, ДО любой работы: типы checkpoint_path / output_path / config / device / act_stats; чекпоинт
+    существует; каталог выхода существует и доступен на запись (было: ошибка записи ПОСЛЕ всей работы); output_path не
+    тот же файл, что чекпоинт (было: затирался); чекпоинт читается и опознаётся как RWKV-7 (writer.detect_meta);
+  * QuantConfig._check_values (в validate): биты и bits_overrides -- целое 1..8 или 16; group_scale -- целое >= 0;
+    clip_percentiles в (0, 100]; outlier_fracs в [0, 1). Было: 12 построчно -- файл как при 8; 4.0 и 250 принимались;
+  * writer.unmatched_overrides + api._refuse_unmatched_overrides: шаблон bits_overrides без совпадений -- отказ.
+    ВАЖНО: пресеты несут шаблоны под ОБА именования ключей ('blocks.0.tmix.o_proj.weight', 'cmix.key.weight' не
+    совпадают на world-чекпоинтах) -- шаблоны самих пресетов из проверки исключены;
+  * api._check_act_stats: явный act_stats обязан покрывать AW-матрицы чекпоинта (кроме emb) -- иначе отказ (было: AW
+    молча вырождался, groupwise.get_ex2 -> None);
+  * GPTQ: токены калибровки вне vocab -- ValueError (было: на MPS мусор и записанный файл, на CUDA аппаратные assert'ы);
+    gptq_calib не тензором -- TypeError; gptq=True на конфиге без целей -- warnings.warn и пропуск (было: полный проход,
+    955 с на 0.1B). МОЯ ОШИБКА ПО ДОРОГЕ: первая редакция признака цели знала только asym_sb6* и пропускала бы GPTQ у
+    reduction (sym_aw) -- поймано повторным прогоном api_misuse до коммита; признак теперь как у gptq.run.plan (sb6 или
+    sym*), свойство M9 держит оба пресета целями;
+  * токенизатор: путь к не-словарю -- TokenizerRequired; не целые id -- TypeError;
+  * Metal: QuantRWKV7 не от QuantizedCheckpoint -- TypeError; generate: id вне словаря / отрицательный -- ValueError,
+    текст -- TypeError (generate._check_prompt); forward_stateful: idx не [B, T], states None или чужой длины, батч
+    состояния != батчу idx -- ошибки при трассировке (под mx.compile проверка раз на форму, на токен не стоит ничего).
+- **Не сделано сознательно:** недопустимые пары режим / биты (NotImplementedError из писателя посреди работы -- громко,
+  таблицы поддержки в одном месте нет); group_scale, не делящий ширину (AssertionError с понятным текстом, тоже посреди
+  работы); чужой словарь в пределах vocab (неотличим); device с опечаткой -- текст torch.

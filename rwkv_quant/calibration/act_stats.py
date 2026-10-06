@@ -79,7 +79,13 @@ def _encoder(tokenizer):
             raise TokenizerRequired(
                 "tokenizer=%r понят как путь к словарю RWKV World, но такого файла нет. "
                 "Передайте путь к rwkv_vocab_*.txt или готовый объект с .encode." % (tokenizer,))
-        return WorldTokenizer(p).encode
+        try:
+            return WorldTokenizer(p).encode
+        except Exception as e:
+            raise TokenizerRequired(
+                "tokenizer=%r -- файл есть, но это не словарь RWKV World (строки вида "
+                "«id токен длина»): %s: %s. Передайте rwkv_vocab_*.txt или готовый объект с .encode."
+                % (tokenizer, type(e).__name__, str(e)[:120])) from e
     if hasattr(tokenizer, "encode"):
         return tokenizer.encode
     raise TokenizerRequired("не понимаю tokenizer=%r" % (tokenizer,))
@@ -149,7 +155,12 @@ def calib_windows(tokenizer, corpus_path=CORPUS, seq_len=SEQ_LEN, budget=TOKEN_B
         raise RuntimeError(
             "калибровочный корпус не дал ни одного окна на %d токенов -- "
             "проверьте токенизатор" % seq_len)
-    data = torch.tensor(wins, dtype=torch.int32)
+    try:
+        data = torch.tensor(wins, dtype=torch.int32)
+    except (ValueError, TypeError, RuntimeError) as e:
+        raise TypeError(
+            "токенизатор должен возвращать список целых id токенов, а вернул что-то другое "
+            "(например строки): %s" % str(e)[:120]) from e
     _TOK_MEMO[key] = (tokenizer, data, len(chunks))
     return data
 

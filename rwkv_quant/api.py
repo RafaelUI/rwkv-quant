@@ -35,6 +35,15 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
 
     preset игнорируется, если передан config.
 
+    ПРОВЕРКИ ДО НАЧАЛА РАБОТЫ (06.10; гейт tests/test_api_misuse.py). Отказ сразу, а не после
+    часов счёта и не молча: каталога выходного файла нет; output_path -- сам чекпоинт (затёрся
+    бы); чекпоинт не читается или не RWKV-7; config не QuantConfig; значения QuantConfig вне
+    допустимого (биты -- целое 1..8 или 16); шаблон bits_overrides не совпал ни с одной
+    матрицей (шаблоны самих пресетов под другое именование ключей не считаются); явный
+    act_stats не покрывает AW-матрицы этого чекпоинта; gptq_calib с токенами вне словаря.
+    gptq=True на конфиге без целей GPTQ (нет proj / cmix / head в asym_sb6* или sym*) --
+    предупреждение и пропуск вместо полного прохода.
+
     СВОЙ config -- ОТ ПРЕСЕТА, А НЕ С НУЛЯ. QuantConfig(proj=4, cmix=4, ...) "только биты" не
     задаёт group_scale, и такие группы уходят в построчный RTN. Ниже 8 бит это либо сломанный
     файл (0.1B: cmix=4 построчно -- KL 2.8, прежний пример отсюда давал 3.1), либо пустая трата
@@ -106,6 +115,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         Свой набор -- НЕ МЕНЬШЕ 600 окон: берутся первые 600 окон и первые 512 токенов каждого,
         на меньшем наборе ValueError (число окон фиксировано решением владельца).
     """
+    _preflight_args(checkpoint_path, output_path, config, act_stats, device)
     _user_config = config is not None
     if config is None:
         if preset not in PRESETS:
@@ -122,6 +132,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         _refuse_per_row(checkpoint_path, config)
     if autopick:
         _refuse_autopick(config)
+    _refuse_unmatched_overrides(checkpoint_path, config)
 
     calib_sig = None
     needs_aw = any(str(m).endswith("_aw")
@@ -145,6 +156,8 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     else:
         if not os.path.exists(act_stats):
             raise FileNotFoundError("act_stats=%r не существует" % act_stats)
+        if needs_aw:
+            _check_act_stats(act_stats, checkpoint_path, config)
         config.act_stats_path = act_stats
 
     ap_meta = None
@@ -165,6 +178,14 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     implicit_g = gptq is None
     if implicit_g:
         gptq = (preset in ("compression", "reduction") and not _user_config)   # reduction -- решение владельца 01.10
+    if gptq and not _gptq_has_targets(config):
+        # 06.10: раньше шёл полный проход (16 минут на 0.1B на Mac) и только потом сообщал,
+        # что менять нечего
+        if not implicit_g:
+            import warnings
+            warnings.warn("gptq=True пропущен: в конфиге нет групп proj / cmix / head с group_scale в "
+                          "режимах asym_sb6* или sym*, а другие GPTQ не обрабатывает", stacklevel=2)
+        gptq = False
     if gptq and not real_gw:
         if not implicit_g:
             raise ValueError("gptq=True пишет коды sb6; с real_gw=False не сочетается")
@@ -228,6 +249,105 @@ def _refuse_autopick(config):
             "preset=\"compression\" (там он включён по умолчанию); для preset=\"reduction\" и своих "
             "раскладок уберите autopick=True."
             % ", ".join("%s: режим %s, %d бит" % (g, m or "построчный", b) for g, m, b in bad))
+
+
+def _preflight_args(ckpt, out, config, act_stats, device):
+    """Проверки аргументов ДО любой работы (06.10, проверка «неверным использованием»): то, что
+    раньше всплывало невнятной ошибкой из недр или -- хуже -- после часов счёта."""
+    for name, v in (("checkpoint_path", ckpt), ("output_path", out)):
+        if not isinstance(v, (str, os.PathLike)):
+            raise TypeError("%s должен быть путём (str), а получен %s" % (name, type(v).__name__))
+    if config is not None and not isinstance(config, QuantConfig):
+        raise TypeError(
+            "config должен быть QuantConfig, а получен %s. Имя пресета передаётся как "
+            "preset=\"compression\"; свой конфиг -- QuantConfig(...) или копия "
+            "rwkv_quant.presets.COMPRESSION." % type(config).__name__)
+    if device is not None and not isinstance(device, (str, list, tuple)):
+        raise TypeError("device должен быть строкой (\"mps\", \"cuda:0\", \"cuda:0,cuda:1\") "
+                        "или списком таких строк, а получен %s" % type(device).__name__)
+    if not (act_stats is None or isinstance(act_stats, (str, os.PathLike))):
+        raise TypeError("act_stats: \"auto\", None или путь к файлу статистики, а получен %s"
+                        % type(act_stats).__name__)
+    ckpt, out = os.fspath(ckpt), os.fspath(out)
+    if not os.path.exists(ckpt):
+        raise FileNotFoundError("чекпоинт не найден: %s" % ckpt)
+    outdir = os.path.dirname(os.path.abspath(out))
+    if not os.path.isdir(outdir):
+        raise FileNotFoundError(
+            "каталога для выходного файла нет: %s (проверено до начала работы -- создайте его)" % outdir)
+    if not os.access(outdir, os.W_OK):
+        raise PermissionError("в каталог выходного файла нельзя писать: %s" % outdir)
+    src = os.path.join(ckpt, "model.safetensors") if os.path.isdir(ckpt) else ckpt
+    if os.path.exists(out) and os.path.exists(src) and os.path.samefile(src, out):
+        raise ValueError("output_path совпадает с чекпоинтом (%s): квантованный файл затёр бы "
+                         "исходную модель. Укажите другой путь." % out)
+    from .formats import writer as _w
+    try:
+        sd = _w._open_sd(ckpt)
+    except Exception as e:
+        raise ValueError(
+            "не удалось прочитать чекпоинт %s: ожидается .pth (torch) либо файл или каталог "
+            "safetensors. (%s: %s)" % (ckpt, type(e).__name__, str(e).split("\n")[0][:120])) from e
+    try:
+        _w.detect_meta(ckpt, sd)
+    except Exception as e:
+        raise ValueError(
+            "%s не похож на чекпоинт RWKV-7: по именам и формам тензоров не удалось определить "
+            "число слоёв и размерности. (%s: %s)" % (ckpt, type(e).__name__, str(e)[:80])) from e
+
+
+def _refuse_unmatched_overrides(ckpt, config):
+    from .formats import writer as _w
+    # Пресеты несут шаблоны под ОБА именования ключей (world и custom): на любом чекпоинте часть
+    # их шаблонов законно не совпадает. Опечатку от чужого именования по шаблону не отличить,
+    # поэтому шаблоны самих пресетов из проверки исключены.
+    known = {p for c in PRESETS.values() for p in (getattr(c, "bits_overrides", None) or {})}
+    bad = [p for p in _w.unmatched_overrides(ckpt, config) if p not in known]
+    if bad:
+        raise ValueError(
+            "bits_overrides: шаблон не совпал ни с одной квантуемой матрицей чекпоинта: %s. "
+            "Шаблон -- подстрока имени тензора (например \"blocks.3.att.key.weight\"); "
+            "несовпавший шаблон раньше молча ничего не делал."
+            % ", ".join(repr(p) for p in bad[:8]))
+
+
+def _check_act_stats(path, ckpt, config):
+    """Явно переданный файл статистики обязан покрывать AW-матрицы ЭТОГО чекпоинта: иначе
+    AW-режимы молча вырождаются в невзвешенные (groupwise.get_ex2 возвращает None), а файл
+    пишется как ни в чём не бывало."""
+    from .formats import writer as _w
+    from .calibration import groupwise as _gw
+    try:
+        stats = _gw.load_act_stats(path)
+        ok = isinstance(stats, dict)
+    except Exception as e:
+        raise ValueError("act_stats=%r не читается как файл статистики активаций (%s: %s)"
+                         % (path, type(e).__name__, str(e)[:100])) from e
+    aw = {g for g, m in (config.group_scale_mode or {}).items() if str(m).endswith("_aw")} - {"emb"}
+    need, miss = 0, []
+    for key, w in _w._open_sd(ckpt).items():
+        g = _w._match_group(key)
+        if g in aw and _w._is_quantized(key, g, w.dim()):
+            need += 1
+            if not ok or _gw.get_ex2(path, key, w) is None:
+                miss.append(key)
+    if miss:
+        raise ValueError(
+            "act_stats=%r не подходит к этому чекпоинту: статистики нет (или она другой ширины) "
+            "для %d из %d матриц AW-групп, например %s. Файл от другой модели или не того "
+            "формата; с act_stats=\"auto\" библиотека соберёт статистику сама."
+            % (path, len(miss), need, miss[0]))
+
+
+def _gptq_has_targets(config):
+    """Может ли GPTQ хоть что-то сделать с конфигом: группа proj / cmix / head с group_scale в
+    режиме sb6 (compression) или sym* (reduction) -- по тому же признаку, что gptq.run.plan.
+    Битность здесь НЕ проверяется (её правят bits_overrides): False -- только когда наверняка нечего."""
+    from .calibration import gptq as G
+    def ok(g):
+        mode = str((config.group_scale_mode or {}).get(g, "asym"))
+        return bool((config.group_scale or {}).get(g)) and (mode in G._SB_BITS or mode.startswith("sym"))
+    return any(ok(g) for g in ("proj", "cmix", "head"))
 
 
 def _validate_config(config):
@@ -301,6 +421,14 @@ def _gptq(ckpt, config, tokenizer, calib, device, verbose):
     if any(str(m).endswith("_aw") for m in (config.group_scale_mode or {}).values()) and not config.act_stats_path:
         raise ValueError("gptq с AW-пресетом требует act_stats (сетка писателя строится по той же статистике)")
     tok, label = G.calib_tokens(tokenizer, calib, G.N_WINDOWS)
+    from .formats import writer as _w
+    vocab = _w.detect_meta(ckpt, _w._open_sd(ckpt))["vocab_size"]
+    lo, hi = int(tok.min()), int(tok.max())
+    if lo < 0 or hi >= vocab:
+        # у act_stats такая проверка была, у GPTQ нет: на MPS выход за vocab молча читал мусор
+        # (файл записывался), на CUDA сыпал аппаратными ошибками
+        raise ValueError("калибровка GPTQ: токены вне словаря чекпоинта (id от %d до %d при vocab %d) "
+                         "-- окна разобраны не тем словарём" % (lo, hi, vocab))
     qts = G.run(ckpt, tokenizer, config, n_windows=G.N_WINDOWS, damp=G.DAMP, device=device,
                 verbose=verbose, calib=tok)
     if not qts:

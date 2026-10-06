@@ -26,7 +26,25 @@ def greedy(logits):
     return mx.argmax(logits, axis=-1)
 
 
+def _check_prompt(model, prompt):
+    """Промпт -- токены в пределах словаря (06.10): id за vocab или отрицательный раньше молча
+    читал мусор из таблицы эмбеддингов и генерация «работала»."""
+    if isinstance(prompt, (str, bytes)):
+        raise TypeError("prompt -- список id токенов, а не текст: токенизируйте его своим словарём")
+    if isinstance(prompt, mx.array):
+        ids = prompt.reshape(-1).tolist()
+    else:
+        ids = list(prompt)
+    V = getattr(model, "vocab_size", None)
+    for t in ids:
+        if isinstance(t, bool) or not isinstance(t, int):
+            raise TypeError("prompt -- список целых id токенов, а в нём %r" % (t,))
+        if t < 0 or (V is not None and t >= V):
+            raise ValueError("prompt: id токена %d вне словаря модели (0..%s)" % (t, (V - 1) if V else "?"))
+
+
 def _prefill(model, prompt, state):
+    _check_prompt(model, prompt)
     p = mx.array(prompt, dtype=mx.int32).reshape(1, -1)
     if p.shape[1] < 1:
         raise ValueError("prompt пуст: нужен хотя бы один токен")

@@ -1171,6 +1171,10 @@ class QuantRWKV7:
 
     def __init__(self, ckpt, fast_ln=None, lora_q=None):
         # ckpt: rwkv_quant.formats.schema.QuantizedCheckpoint
+        if not (hasattr(ckpt, "tensors") and hasattr(ckpt, "naming")):
+            raise TypeError(
+                "QuantRWKV7 ждёт QuantizedCheckpoint -- результат "
+                "rwkv_quant.formats.reader.load_raw(путь к .rwkvq), а получен %s" % type(ckpt).__name__)
         #
         # FAST_LN РЕШАЕТСЯ НА МОДЕЛИ, А НЕ НА ПРОЦЕССЕ. Порядок:
         # явный аргумент -> пресет файла -> модульное умолчание FAST_LN.
@@ -1340,6 +1344,17 @@ class QuantRWKV7:
         (logits [B, 1, V]) -- для prefill в генерации, где нужен лишь
         следующий токен, это убирает (T-1)/T работы head'а (65536x2048 на
         1.5B). Дефолт False сохраняет полные логиты (ppl, тесты)."""
+        # 06.10: проверки форм. Под mx.compile они выполняются при трассировке (раз на форму),
+        # на декод по токену не стоят ничего.
+        if idx.ndim != 2:
+            raise ValueError("idx должен быть [B, T], а получен массив формы %s" % (tuple(idx.shape),))
+        if states is None or len(states) != len(self.blocks):
+            raise TypeError("states: нужен список состояний слоёв из init_state(B) или из прошлого "
+                            "вызова (%d слоёв), а получено %s"
+                            % (len(self.blocks), "None" if states is None else "список длины %d" % len(states)))
+        if states[0][0].shape[0] != idx.shape[0]:
+            raise ValueError("состояние собрано под батч %d, а idx -- под батч %d: init_state(B) "
+                             "должен совпадать с B у idx" % (states[0][0].shape[0], idx.shape[0]))
         x = self.emb_weight[idx]
         x = _layer_norm(x, self.ln0_w, self.ln0_b, fast=self.fast_ln)
         v_first = None

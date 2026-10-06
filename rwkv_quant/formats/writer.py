@@ -454,6 +454,16 @@ def per_row_low_bits(checkpoint_path: str, cfg: QuantConfig):
     return out
 
 
+def unmatched_overrides(checkpoint_path: str, cfg: QuantConfig):
+    """Шаблоны bits_overrides, не совпавшие НИ С ОДНИМ квантуемым тензором чекпоинта: опечатка в
+    шаблоне раньше молча ничего не делала (06.10) -- тот же класс, что опечатка в имени группы."""
+    pats = list(getattr(cfg, "bits_overrides", None) or {})
+    if not pats:
+        return []
+    keys = [k for k, w in _open_sd(checkpoint_path).items() if _is_quantized(k, _match_group(k), w.dim())]
+    return [p for p in pats if not any(p in k for k in keys)]
+
+
 def _quantize_impl(key: str, w: torch.Tensor, cfg: QuantConfig,
                     real_gw: bool = False) -> QuantizedTensor:
     group = _match_group(key)

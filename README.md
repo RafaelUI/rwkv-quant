@@ -799,6 +799,18 @@ is not among its candidates. An unknown group name
 (`QuantConfig(prooj=4)`) and a `group_scale_mode` without a `group_scale` are
 errors too — both used to be accepted silently and ignored.
 
+`quantize()` checks its arguments before it starts working, so a mistake costs
+seconds rather than a finished run. It raises when the output directory does
+not exist, when the output path is the checkpoint itself, when the checkpoint
+is not an RWKV-7 model, when a `bits_overrides` pattern matches no matrix,
+when an explicit `act_stats` file does not cover this checkpoint, when
+`gptq_calib` holds token ids outside the vocabulary, and on out-of-range
+values in `QuantConfig` (bits other than 1-8 or 16, percentiles outside
+(0, 100], outlier fractions outside [0, 1)). `gptq=True` on a config GPTQ has
+nothing to do with is skipped with a warning instead of running the full pass.
+One thing it cannot catch: a vocabulary that is not the checkpoint's own but
+whose ids all fall inside the model's range.
+
 ## Format
 
 `.rwkvq` stores two block layouts, chosen per parameter group.

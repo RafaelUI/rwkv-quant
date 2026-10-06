@@ -181,7 +181,16 @@ def calib_tokens(tokenizer, calib=None, n_windows=N_WINDOWS, seq_len=A.SEQ_LEN):
             label = "file:%s" % os.path.basename(calib)
             calib = torch.load(os.path.expanduser(calib), map_location="cpu", weights_only=False)
             calib = calib["tokens"] if isinstance(calib, dict) else calib
-        tok = torch.as_tensor(calib, dtype=torch.long)[:n_windows, :seq_len].cpu().contiguous()
+        try:
+            tok = torch.as_tensor(calib, dtype=torch.long)
+        except (ValueError, TypeError, RuntimeError) as e:
+            raise TypeError(
+                "gptq_calib: нужен тензор ТОКЕНОВ [N, T] (или список списков целых id, или путь к "
+                ".pt с таким тензором), а не текст: токенизируйте окна своим словарём. (%s)"
+                % str(e)[:100]) from e
+        if tok.dim() == 2:
+            tok = tok[:n_windows, :seq_len]
+        tok = tok.cpu().contiguous()
     if tok.dim() != 2 or tok.shape[0] < n_windows or tok.shape[1] < 2:
         raise ValueError(
             "калибровка GPTQ: нужен тензор токенов [N, T] с N >= %d окон и T >= 2, передано %s. "
