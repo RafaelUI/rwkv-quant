@@ -15,13 +15,17 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
 ]
+# 06.10: mlx и rwkv-metal -- только на macOS. На Linux mlx ставится, но не импортируется
+# (нет libmlx.so), а rwkv-metal тянет его в __init__; quantize() на CUDA не берёт из них ничего
+# (проверено на сервере: sys.modules пуст). Для пользователя Mac набор зависимостей прежний.
 dependencies = [
-    "mlx>=0.31",
+    "mlx>=0.31; sys_platform == 'darwin'",
     "numpy",
     "torch",
     "safetensors",
-    "rwkv-metal>=0.1.3",
+    "rwkv-metal>=0.1.3; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

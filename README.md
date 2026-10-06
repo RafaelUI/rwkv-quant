@@ -599,6 +599,25 @@ row; only the linear projections differ by scheme.
 
 ## Quick start
 
+### Installing
+
+```
+pip install rwkv-quant
+```
+
+- **macOS (Apple Silicon)** gets everything: `quantize()`, the `.rwkvq` reader
+  and the Metal inference backend. `mlx` and `rwkv-metal` are installed as
+  dependencies.
+- **Linux** gets `quantize()` and the file format only — the part that runs
+  on CUDA or CPU through PyTorch. `mlx` and `rwkv-metal` are not installed
+  there (they are macOS-only dependencies), and there is no inference backend
+  for Linux yet. Nothing in the `quantize()` path imports them.
+- With PyTorch 2.14 on Linux, the dense reference model can fail inside
+  PyTorch with `fatal error: Python.h: No such file or directory`: that
+  release compiles one of its own kernels on first use and needs the Python
+  headers (`python3-dev`). Install them, or set `TORCH_DISABLE_NATIVE_JIT=1`.
+  PyTorch 2.13 is not affected.
+
 ```python
 from rwkv_quant import quantize
 
@@ -701,11 +720,19 @@ channels. Collecting that statistic means running the model over some
 text, and the text has to be split with the same vocabulary the
 checkpoint was trained on — which is a property of your model, not of
 this library. Pass anything with an `.encode` method, a callable, or a
-path to a vocabulary file.
+path to an RWKV World vocabulary file (`rwkv_vocab_*.txt`). A path is parsed
+by `rwkv-metal`'s tokenizer on macOS and by an identical bundled copy
+elsewhere, so it works on Linux too. A vocabulary that is not the
+checkpoint's own cannot always be detected: ids beyond the model's vocabulary
+are rejected, but a different vocabulary with ids in range is accepted and
+silently yields wrong statistics.
 
 Everything else is automatic: `quantize()` tokenizes the calibration
 corpus shipped in `rwkv_quant/data/calib_corpus.txt`, collects the
-statistics itself and caches them under `~/.cache/rwkv-quant`. Budget
+statistics itself and caches them under `~/.cache/rwkv-quant`. The cache
+key is the checkpoint plus the tokens of the calibration windows, so one
+vocabulary passed as a path, a function or an object shares one entry, and
+two different vocabularies never share one. Budget
 about six minutes for a 1.5B checkpoint on the first call and nothing on
 later ones. The collection pass needs the dense model in memory (~3 GB
 for 1.5B, ~6 GB for 2.9B); it runs before quantization and frees the

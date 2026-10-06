@@ -2921,3 +2921,56 @@ gptq_calib >= 600 окон не в README; mlx / rwkv-metal обязательн
 - Полный прогон гейтов после правки lora_q (/tmp/gates_all_after_lq.log, 58 гейтов, 20:28-21:08): 50 кодов 0, справочные код 2
   (test_fast_ln_parity, test_prewkv_parity), шесть кодов 1 -- те же гейты без аргументов. После отказов QuantConfig
   (/tmp/gates_all_after_v.log, 57 гейтов) -- та же картина.
+
+### 06.10 (ночь-утро; по часам 06.10) — пп. 2, 3, 4 ПРОВЕРКИ API ЗАКРЫТЫ; УТЕЧКА В ГЕЙТЕ; ПРОВЕРКА «НЕВЕРНЫМ ИСПОЛЬЗОВАНИЕМ» (решений нет)
+- **П. 3 (601a5db).** gptq_calib: README, docstring и текст ValueError говорят прямо -- не меньше 600 окон, берутся первые
+  600 x 512. Поведение не менялось.
+- **Утечка (c5872fc).** tests/test_quantize_gptq.py делал tempfile.mkdtemp() без уборки: ~2.2 ГБ .rwkvq в /tmp за запуск
+  (30 каталогов /tmp/tmp* с 01.10 = 14 ГБ, диск Mac дошёл до 4.9 ГиБ). Теперь TemporaryDirectory.
+- **П. 2, подпись кеша -- вариант А (решение владельца).** act_stats._signature: чекпоинт + ХЕШ ТОКЕНОВ калибровочных окон
+  (calib_windows / tokens_sha; память токенизации в процессе _TOK_MEMO), вместо файла корпуса + type(tokenizer).__name__.
+  autopick._signature: вместо имени типа -- хеш токенов окон измерения (_measure_windows / _tokens_term). Ключи сменились У
+  ВСЕХ: старые act_*.pt и measure_*.json лежат на диске, но не читаются; измерение, снятое до 06.10, передаётся через
+  measure=путь (несовпадение подписи -- предупреждение, текст дополнен). Новые подписи 0.1B g1d, мировой словарь: act
+  379430d2b0ca73a8 (было 19fa07321aa994e0 для формы «путь»). В манифесте НОВЫХ сборок меняются tokenizer «(calib ...)»,
+  config.act_stats_path, autopick.measure_signature. Записанные файлы не тронуты.
+  Гейт tests/test_calib_signature.py --mutate: 6 свойств (4 формы одного словаря -- одна подпись act и measure; разные
+  словари одной формы -- разные; сквозное: чужой кеш не подставляется; зависимость от чекпоинта / seq_len / бюджета;
+  манифест путь == объект; кеш под старым ключом не читается), 4 мутации пойманы. Замечание: бюджет ниже 13.8k токенов
+  подпись не меняет -- первый круг по 27 чанкам безусловен, окна те же.
+  bits_ref_0510 на трёх файлах == состоянию после lora_q. test_autopick_measure, test_quantize_autopick,
+  test_act_stats_auto и ещё девять гейтов вокруг -- коды 0.
+- **П. 4, зависимости (решение владельца).** pyproject: mlx и rwkv-metal -- только sys_platform == 'darwin', классификатор
+  Linux. rwkv_quant/world_tokenizer.py -- КОПИЯ rwkv_metal/tokenizer/world_tokenizer.py; act_stats._encoder берёт
+  rwkv_metal, если он импортируется, иначе копию; несуществующий путь -- TokenizerRequired. Гейт
+  tests/test_world_tokenizer_copy.py --mutate: 4 свойства (текст копии == оригиналу, токены на корпусе, работа без
+  rwkv_metal, маркеры в pyproject), 3 мутации пойманы.
+  Сервер, свежие venv (ensurepip нет: venv --without-pip + pip --python из рабочего venv):
+  * старое колесо (/tmp/rq_venv_p4b): pip ставит mlx 0.32.3 + rwkv-metal 0.3.2 + torch 2.14.1, но import mlx.core падает
+    (libmlx.so нет) -> import rwkv_metal падает -> tokenizer=путь при пустом кеше -- TokenizerRequired (при готовом кеше
+    проходил -- маскировка);
+  * новое колесо (/tmp/rq_venv_p4c): стоят только numpy / safetensors / torch / rwkv-quant; tokenizer=путь идёт копией;
+    quantize(compression, cuda:0, без GPTQ, пустой кеш) -- 103 с, 133.9 МБ; из mlx / rwkv_metal не загружено ничего;
+  * torch 2.14.1 на CUDA: RWKV7Ref._wkv7 (vv @ kk) уходит в torch/_native (triton), тот компилирует драйвер и требует
+    Python.h (python3.10-dev на сервере нет) -> CalledProcessError в measure / GPTQ. TORCH_DISABLE_NATIVE_JIT=1 лечит.
+    Рабочий ~/venv -- torch 2.13.0, там не проявляется. С переменной: compression по умолчанию (autopick + GPTQ) на cuda:0 --
+    625 с, 134.4 МБ; reduction на cuda:0,cuda:1 -- 461 с, 191.3 МБ. После второго в sys.modules был 'mlx' (старое
+    колесо) -- кто пробует импорт, не разобрано.
+- **Документация.** README: раздел Installing (macOS / Linux / torch 2.14), токенизатор путём, ключ кеша; docstring
+  quantize() -- то же.
+- **Проверка «неверным использованием»** (tests/_sess/api_misuse_0610.py, колесо, cwd=/tmp, 0.1B, Mac; 65 случаев,
+  журнал /tmp/api_misuse_mac.json). ПОВЕДЕНИЕ НЕ МЕНЯЛ -- ждёт решения владельца.
+  МОЛЧА НЕ ТО: выход == входной чекпоинт (перезаписан); act_stats -- файл не того формата (принят); bits_overrides с
+  шаблоном без совпадений (принят); биты 12 построчно (принят, файл как при 8); биты 4.0, clip_percentiles=250 (приняты);
+  gptq_calib с токенами за vocab (принят, 363 с, файл записан -- у act_stats такая проверка есть, у GPTQ нет); generate с
+  id за vocab и с отрицательным id (возвращает токены); step с состоянием от другого батча (возвращает логиты); чужой
+  словарь в пределах vocab (неотличим).
+  ПОЗДНО ИЛИ ДОРОГО: каталога выхода нет -- ошибка записи ПОСЛЕ всей работы; gptq=True с конфигом без sb6 -- 955 с полного
+  прохода впустую; preset="reduction" + autopick=True -- NotImplementedError (sym_aw bits=7) ПОСЛЕ измерения.
+  НЕВНЯТНЫЕ ТЕКСТЫ: не-RWKV .pth (max() iterable argument is empty); текстовый файл как чекпоинт (SafetensorError);
+  путь к не-словарю (invalid literal for int); токенизатор со строками / gptq_calib списком строк (too many dimensions
+  'str'); config словарём или строкой (AttributeError validate); биты строкой; group_scale отрицательный; outlier_fracs
+  1.5; act_stats=True; device=0; QuantRWKV7 от строки; step с одномерными ids или state=None.
+  В ПОРЯДКЕ: нет чекпоинта, tokenizer None / нет файла / число / id за vocab / пустой, опечатка в пресете, «только биты»,
+  опечатка в группе, нет act_stats, gptq + real_gw=False, 8 окон, нет measure, чужой measure, лишний аргумент, generate с
+  пустым промптом, n <= 0. На CUDA скрипт НЕ гонялся.

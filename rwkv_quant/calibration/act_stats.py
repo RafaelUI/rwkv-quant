@@ -66,17 +66,20 @@ def _encoder(tokenizer):
     # чанк корпуса попадает туда как ИМЯ КОДИРОВКИ, и наружу приходит
     # LookupError с текстом чанка вместо внятного отказа.
     if isinstance(tokenizer, (str, os.PathLike)):
-        # Путь к словарю. Своего токенизатора у rwkv-quant НЕТ и заводить
-        # его -- значит держать вторую копию чужой реализации (закон 23);
-        # поэтому пробуем соседний пакет и, если его нет, честно говорим.
+        # Путь к словарю RWKV World. Сначала соседний пакет (на Mac он обязателен и остаётся
+        # единственным источником); где его нет или он не импортируется (Linux: mlx без
+        # libmlx.so) -- своя копия того же файла, rwkv_quant/world_tokenizer.py (06.10;
+        # тождественность копии -- tests/test_world_tokenizer_copy.py).
         try:
             from rwkv_metal.tokenizer.world_tokenizer import WorldTokenizer
-        except ImportError as e:
+        except ImportError:
+            from ..world_tokenizer import WorldTokenizer
+        p = os.fspath(tokenizer)
+        if not os.path.isfile(p):
             raise TokenizerRequired(
-                "передан путь к словарю (%s), но разобрать его нечем: "
-                "rwkv-quant не везёт своего токенизатора. Передайте готовый "
-                "объект с .encode." % tokenizer) from e
-        return WorldTokenizer(os.fspath(tokenizer)).encode
+                "tokenizer=%r понят как путь к словарю RWKV World, но такого файла нет. "
+                "Передайте путь к rwkv_vocab_*.txt или готовый объект с .encode." % (tokenizer,))
+        return WorldTokenizer(p).encode
     if hasattr(tokenizer, "encode"):
         return tokenizer.encode
     raise TokenizerRequired("не понимаю tokenizer=%r" % (tokenizer,))
@@ -115,37 +118,29 @@ def _windows(chunks, encode, seq_len=SEQ_LEN, budget=TOKEN_BUDGET):
     return out
 
 
-def _signature(ckpt_path, tokenizer, corpus_path):
-    """Подпись входов сбора -- ключ кеша И запись в манифест.
-
-    Чекпоинт хешируется не целиком (гигабайты), а по размеру и первым
-    мегабайтам: этого хватает, чтобы поймать ПОДМЕНУ файла, ради которой
-    подпись и заводится -- статистика с другого чекпоинта уже была
-    источником тихих ошибок (закон 15)."""
-    h = hashlib.sha256()
-    st = os.stat(ckpt_path)
-    h.update(str(st.st_size).encode())
-    with open(ckpt_path, "rb") as f:
-        h.update(f.read(1 << 20))
-    with open(corpus_path, "rb") as f:
-        h.update(f.read())
-    h.update(type(tokenizer).__name__.encode())
-    return h.hexdigest()[:16]
+_TOK_MEMO = {}
 
 
-def collect(ckpt_path, tokenizer, corpus_path=CORPUS, seq_len=SEQ_LEN,
-            budget=TOKEN_BUDGET, cache=True, verbose=True):
-    """E[x^2] по входным каналам -> {ключ_веса: tensor[in_features]}."""
-    from rwkv_quant.models import rwkv7_ref as ref_mod
-    from rwkv_quant.models.rwkv7_ref import RWKV7Ref
+def _memo_key(tokenizer):
+    """Ключ памяти токенизации в пределах процесса. Путь -- вместе с размером и временем файла
+    (тот же путь с другим словарём -- другой ключ); объект -- по id, а сам объект держится в
+    памяти рядом с результатом, чтобы id не достался другому."""
+    if isinstance(tokenizer, (str, os.PathLike)):
+        p = os.fspath(tokenizer)
+        try:
+            st = os.stat(p)
+            return ("path", p, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return ("path", p, None, None)
+    return ("obj", id(tokenizer))
 
-    sig = _signature(ckpt_path, tokenizer, corpus_path)
-    cache_path = os.path.join(CACHE_DIR, "act_%s.pt" % sig)
-    if cache and os.path.exists(cache_path):
-        if verbose:
-            print("[act_stats] кеш %s" % cache_path)
-        return torch.load(cache_path), sig
 
+def calib_windows(tokenizer, corpus_path=CORPUS, seq_len=SEQ_LEN, budget=TOKEN_BUDGET):
+    """Калибровочные окна int32 [N, seq_len] -- ровно то, что уходит в модель при сборе."""
+    key = (_memo_key(tokenizer), corpus_path, seq_len, budget)
+    hit = _TOK_MEMO.get(key)
+    if hit is not None:
+        return hit[1]
     encode = _encoder(tokenizer)
     text = open(corpus_path, encoding="utf-8").read()
     chunks = [c.strip() for c in re.split(r"—+ CHUNK —+", text) if c.strip()]
@@ -155,6 +150,58 @@ def collect(ckpt_path, tokenizer, corpus_path=CORPUS, seq_len=SEQ_LEN,
             "калибровочный корпус не дал ни одного окна на %d токенов -- "
             "проверьте токенизатор" % seq_len)
     data = torch.tensor(wins, dtype=torch.int32)
+    _TOK_MEMO[key] = (tokenizer, data, len(chunks))
+    return data
+
+
+def tokens_sha(data):
+    """Хеш токенов окон (форма + int32). Он и есть «словарь» в подписях act_stats и measure."""
+    t = torch.as_tensor(data).to(torch.int32).contiguous()
+    h = hashlib.sha256(repr(tuple(t.shape)).encode())
+    h.update(t.numpy().tobytes())
+    return h.hexdigest()
+
+
+def _signature(ckpt_path, tokenizer, corpus_path, seq_len=SEQ_LEN, budget=TOKEN_BUDGET):
+    """Подпись входов сбора -- ключ кеша И запись в манифест.
+
+    Чекпоинт хешируется не целиком (гигабайты), а по размеру и первым
+    мегабайтам: этого хватает, чтобы поймать ПОДМЕНУ файла, ради которой
+    подпись и заводится -- статистика с другого чекпоинта уже была
+    источником тихих ошибок (закон 15).
+
+    06.10 (находка 2 проверки API, решение владельца -- вариант А): словарь входит в подпись
+    ХЕШЕМ ТОКЕНОВ калибровочных окон, а не type(tokenizer).__name__. Было: один словарь в формах
+    путь / функция / объект / связанный метод -- четыре ключа (str / function / имя класса /
+    method), а два РАЗНЫХ словаря одной формы -- один ключ, и второй молча получал статистику
+    первого. Корпус, seq_len и бюджет теперь тоже в подписи -- через те же токены.
+    Ключи кеша от этого сменились у всех: старые act_*.pt остаются на диске, но не читаются."""
+    h = hashlib.sha256()
+    st = os.stat(ckpt_path)
+    h.update(str(st.st_size).encode())
+    with open(ckpt_path, "rb") as f:
+        h.update(f.read(1 << 20))
+    h.update(b"tokens-v2:")
+    h.update(tokens_sha(calib_windows(tokenizer, corpus_path, seq_len, budget)).encode())
+    return h.hexdigest()[:16]
+
+
+def collect(ckpt_path, tokenizer, corpus_path=CORPUS, seq_len=SEQ_LEN,
+            budget=TOKEN_BUDGET, cache=True, verbose=True):
+    """E[x^2] по входным каналам -> {ключ_веса: tensor[in_features]}."""
+    from rwkv_quant.models import rwkv7_ref as ref_mod
+    from rwkv_quant.models.rwkv7_ref import RWKV7Ref
+
+    sig = _signature(ckpt_path, tokenizer, corpus_path, seq_len, budget)
+    cache_path = os.path.join(CACHE_DIR, "act_%s.pt" % sig)
+    if cache and os.path.exists(cache_path):
+        if verbose:
+            print("[act_stats] кеш %s" % cache_path)
+        return torch.load(cache_path), sig
+
+    data = calib_windows(tokenizer, corpus_path, seq_len, budget)
+    wins = data
+    chunks = range(_TOK_MEMO[(_memo_key(tokenizer), corpus_path, seq_len, budget)][2])
 
     model = RWKV7Ref(ckpt_path, device=os.environ.get("RWKVQ_DEVICE", "cpu"), dtype=torch.bfloat16)
     vocab = int(getattr(model, "vocab_size", 0) or 0)

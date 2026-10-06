@@ -274,15 +274,36 @@ def _file_hash(path):
     return h.hexdigest()[:16]
 
 
+_WIN_MEMO = {}
+
+
+def _measure_windows(tokenizer, corpus_path, seq_len):
+    """(окна, метки) измерения по квоте -- один раз на (словарь, корпус, длину, квоту) в процессе:
+    их берут и подпись, и сам measure."""
+    from . import act_stats as A
+    key = (A._memo_key(tokenizer), corpus_path, seq_len, repr(QUOTA))
+    hit = _WIN_MEMO.get(key)
+    if hit is None:
+        hit = _WIN_MEMO[key] = (tokenizer,) + tuple(_pick_windows(A._encoder(tokenizer), corpus_path, seq_len, QUOTA))
+    return hit[1], hit[2]
+
+
+def _tokens_term(tokenizer, corpus_path, seq_len):
+    """Словарь в подписи измерения -- хеш токенов его окон (06.10; было type(tokenizer).__name__,
+    та же ошибка, что в act_stats._signature)."""
+    from . import act_stats as A
+    return A.tokens_sha(_measure_windows(tokenizer, corpus_path, seq_len)[0])
+
+
 def _signature(ckpt_path, cfg, corpus_path, n, seq_len, tokenizer):
     """Подпись = ключ кеша И паспорт переносимого измерения: чекпоинт (выборка по всему
     файлу), конфиг (содержимое), AW-статистика (СОДЕРЖИМОЕ, не путь -- путь на другой
-    машине другой), корпус, словарь, квота окон, версия прибора."""
+    машине другой), корпус, словарь (хеш токенов окон), квота окон, версия прибора."""
     from . import act_stats as A
     h = _hashlib.sha256()
     h.update(_ckpt_signature(ckpt_path).encode())
     h.update(_file_hash(corpus_path).encode())
-    h.update(type(tokenizer).__name__.encode())
+    h.update(_tokens_term(tokenizer, corpus_path, seq_len).encode())
     h.update(repr(QUOTA).encode())
     h.update(repr(sorted(cfg.bits.items())).encode())
     h.update(repr(list(cfg.bits_overrides.items())).encode())
@@ -380,7 +401,7 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
         return _json.load(open(path))
     device = device or _os.environ.get("RWKVQ_DEVICE") or ("mps" if torch.backends.mps.is_available() else "cpu")
     t0 = _time.time()
-    wins, langs = _pick_windows(A._encoder(tokenizer), corpus_path, seq_len, QUOTA)   # квота -- на момент вызова
+    wins, langs = _measure_windows(tokenizer, corpus_path, seq_len)   # квота -- на момент вызова
     # "cuda:1,cuda:2" -- слои разнесены по картам (24.09); данные -- на первой
     devs = device.split(",") if isinstance(device, str) and "," in device else device
     M = RWKV7Ref(ckpt_path, device=devs, dtype=torch.bfloat16, compute_dtype=torch.float32)
