@@ -3022,3 +3022,7 @@ gptq_calib >= 600 окон не в README; mlx / rwkv-metal обязательн
 - **Не сделано сознательно:** недопустимые пары режим / биты (NotImplementedError из писателя посреди работы -- громко,
   таблицы поддержки в одном месте нет); group_scale, не делящий ширину (AssertionError с понятным текстом, тоже посреди
   работы); чужой словарь в пределах vocab (неотличим); device с опечаткой -- текст torch.
+- **Полный прогон гейтов на 1e01f3f** (/tmp/gates_all_final.log, 62 гейта, 06.10 19:22-20:05): 54 кода 0; справочные код 2 --
+  test_fast_ln_parity, test_prewkv_parity; шесть кодов 1 -- IndexError на sys.argv (гейты с аргументами: k3_from_canonical,
+  manifest_selfdesc, measure_multidev, mlx_affine_repack, rwkvq_container, wkv_var_model; с аргументами НЕ запускались).
+  После этого -- git push (слово владельца) и перевод серверного клона с bundle на GitHub.
