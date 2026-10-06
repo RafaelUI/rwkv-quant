@@ -794,8 +794,8 @@ without `group_scale` falls back to per-row rounding, which is only sound at
 on 0.1B), and 5-7 bit codes are stored one per byte, so the file is as large
 as at 8 bits and worse. `quantize()` refuses such a config with a `ValueError`
 before doing any work. `allow_per_row=True` overrides the check for research
-use; a config returned by `calibrate()` passes without it, because its per-row
-choices were measured against your budget. An unknown group name
+use. `calibrate()` never returns such a config: per-row rounding below 8 bits
+is not among its candidates. An unknown group name
 (`QuantConfig(prooj=4)`) and a `group_scale_mode` without a `group_scale` are
 errors too — both used to be accepted silently and ignored.
 

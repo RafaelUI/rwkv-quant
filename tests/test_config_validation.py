@@ -12,10 +12,10 @@
   V5 правка ПОСЛЕ сборки (cfg.bits["prooj"], cfg.group_scale_mode без scale): quantize() отказывает до любой работы,
      файл не создан;
   V6 чтение манифестов: config_from_json на реальных файлах и на манифесте с незнакомой группой НЕ падает (strict=False);
-  V7 конфиг с calibration_report и построчными 4 битами проходит предполётную проверку quantize(); тот же конфиг без
-     отчёта -- отказ.
+  V7 среди кандидатов calibrate() (schema_space) нет построчных точек ниже 8 бит ни при какой ширине; конфиг с
+     calibration_report и построчными 4 битами получает тот же отказ, что и любой другой (исключения нет).
 Мутации (--mutate): проверка имён выключена (V1); имена проверяются только в bits (V2); проверка режимов выключена (V4);
-quantize() не зовёт validate (V5); читалка строгая (V6); исключение calibrate убрано (V7).
+quantize() не зовёт validate (V5); читалка строгая (V6); в кандидаты calibrate возвращён rtn@4 (V7).
     python tests/test_config_validation.py [--mutate]"""
 import copy, os, sys, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -84,14 +84,13 @@ def props(d):
     except Exception as e:
         check("V6 манифесты читаются без отказов", False, "%s: %s" % (type(e).__name__, e))
 
+    # 06.10 (позже в тот же день): исключения для calibrate() больше нет -- он сам не выдаёт построчных точек ниже 8 бит
+    from rwkv_quant.calibration import schema_space as S
+    low = [(n, a, repr(c)) for n in (16, 64, 128, 768, 1024, 2048, 2560, 4096) for a in (True, False)
+           for c in S.candidates_for(n, have_act_stats=True, all_2d=a) if c.family == "rtn" and c.bits < 8]
     cal = QuantConfig(w_lora=4); cal.calibration_report = {"groups": {"w_lora": {"chosen": "rtn@4"}}}
-    f7 = os.path.join(d, "v7.rwkvq")
-    try:
-        api.quantize(CK, f7, tokenizer=None, config=cal, verbose=False); okc = os.path.exists(f7); infoc = ""
-    except Exception as e:
-        okc, infoc = False, "%s: %s" % (type(e).__name__, str(e).split("\n")[0])
-    okn, infon = raises(lambda: api.quantize(CK, os.path.join(d, "v7n.rwkvq"), tokenizer=None, config=QuantConfig(w_lora=4), verbose=False), "w_lora=4")
-    check("V7 конфиг calibrate() проходит, тот же без отчёта -- отказ", okc and okn, (infoc, infon))
+    okn, infon = raises(lambda: api.quantize(CK, os.path.join(d, "v7.rwkvq"), tokenizer=None, config=cal, verbose=False), "w_lora=4")
+    check("V7 calibrate() не предлагает построчных точек ниже 8 бит; отчёт calibrate отказа не снимает", not low and okn, (low[:3], infon))
     return R
 
 
@@ -116,14 +115,15 @@ def main():
                 ("проверка режимов выключена", lambda: setattr(Q, "_check_modes", lambda self: None), "V4"),
                 ("quantize() не зовёт validate", lambda: setattr(api, "_validate_config", lambda c: None), "V5"),
                 ("читалка строгая", lambda: setattr(Q, "__init__", strict_init), "V6"),
-                ("исключение calibrate убрано", lambda: setattr(api, "_is_calibrated", lambda c: False), "V7")]
+                ("в кандидаты calibrate возвращён rtn@4", lambda: setattr(__import__("rwkv_quant.calibration.schema_space", fromlist=["x"]), "RTN_BITS", (8, 4)), "V7")]
         for name, apply, expect in muts:
-            saved = (Q._check_names, Q._NAME_FIELDS, Q._check_modes, api._validate_config, api._is_calibrated)
+            saved = (Q._check_names, Q._NAME_FIELDS, Q._check_modes, api._validate_config)
             apply()
             try:
                 failed = run("МУТАЦИЯ «%s»" % name)
             finally:
-                Q._check_names, Q._NAME_FIELDS, Q._check_modes, api._validate_config, api._is_calibrated = saved
+                Q._check_names, Q._NAME_FIELDS, Q._check_modes, api._validate_config = saved
+                __import__("rwkv_quant.calibration.schema_space", fromlist=["x"]).RTN_BITS = (8,)
                 Q.__init__ = init0
             caught = any(f.startswith(expect) for f in failed)
             print("  -> %s (ожидалось падение %s)" % ("ПОЙМАНА" if caught else "НЕ ПОЙМАНА", expect))

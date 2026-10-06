@@ -42,8 +42,8 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
     ОТКАЗЫВАЕТ (ValueError до любой работы), если конфиг отправляет хоть одну матрицу в
     построчный путь ниже 8 бит. Варианты: копия пресета с правкой bits (как выше); свои
     group_scale / group_scale_mode; 8 бит; или allow_per_row=True -- осознанно, для
-    исследований (поведение и байты прежние). Конфиг, выданный calibrate(), проходит без
-    флага: его построчные точки измерены против бюджета.
+    исследований (поведение и байты прежние). calibrate() таких конфигов не выдаёт:
+    построчных 4 бит среди его кандидатов нет (06.10), исключений из отказа нет.
     Там же отказ на неизвестное имя группы (QuantConfig(prooj=4) раньше молча давал файл
     целиком в bf16) и на group_scale_mode без group_scale (режим молча игнорировался) --
     QuantConfig.validate(), зовётся и конструктором.
@@ -118,7 +118,7 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         config = copy.deepcopy(config)
 
     _validate_config(config)
-    if not allow_per_row and not _is_calibrated(config):
+    if not allow_per_row:
         _refuse_per_row(checkpoint_path, config)
     if autopick:
         _refuse_autopick(config)
@@ -234,14 +234,6 @@ def _validate_config(config):
     """Итоговый конфиг (после копии): неизвестные группы и режим без group_scale -- отказ.
     Конструктор QuantConfig проверяет то же, но поля -- словари, их правят и после сборки."""
     config.validate()
-
-
-def _is_calibrated(config):
-    """Конфиг выдан calibrate(): его построчные точки (rtn@4 у LoRA-групп -- самый дешёвый
-    кандидат schema_space) ИЗМЕРЕНЫ против бюджета ppl, это не «только биты» вслепую.
-    Без этого исключения цепочка calibrate() -> quantize(config=) упиралась в отказ
-    (поймано 06.10: 0.1B, w_lora -> rtn@4 при +0.46% ppl)."""
-    return bool(getattr(config, "calibration_report", None))
 
 
 def _refuse_per_row(ckpt, config):
