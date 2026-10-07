@@ -163,7 +163,9 @@ def calib_tokens(tokenizer, calib=None, n_windows=N_WINDOWS, seq_len=A.SEQ_LEN):
         import json
         enc = A._encoder(tokenizer)
         rows, short = [], 0
-        for line in open(CALIB_FILE, encoding="utf-8"):
+        with open(CALIB_FILE, encoding="utf-8") as _f:
+            _lines = _f.readlines()
+        for line in _lines:
             ids = enc(json.loads(line)["text"])
             if len(ids) < seq_len:
                 short += 1

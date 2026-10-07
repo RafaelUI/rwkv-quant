@@ -503,7 +503,8 @@ def _autopick(ckpt, config, tokenizer, budget, measure, device, verbose):
     if measure == "auto":
         m = ap.measure(ckpt, config, tokenizer, device=device, verbose=verbose)
     else:
-        m = json.load(open(measure))
+        with open(measure) as _f:
+            m = json.load(_f)
         if m.get("ckpt_sig") != ap._ckpt_signature(ckpt):
             raise ValueError("измерение %s -- от другого чекпоинта (ckpt_sig %s)"
                              % (measure, m.get("ckpt_sig")))

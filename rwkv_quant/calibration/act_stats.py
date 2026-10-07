@@ -148,7 +148,8 @@ def calib_windows(tokenizer, corpus_path=CORPUS, seq_len=SEQ_LEN, budget=TOKEN_B
     if hit is not None:
         return hit[1]
     encode = _encoder(tokenizer)
-    text = open(corpus_path, encoding="utf-8").read()
+    with open(corpus_path, encoding="utf-8") as _f:
+        text = _f.read()
     chunks = [c.strip() for c in re.split(r"—+ CHUNK —+", text) if c.strip()]
     wins = _windows(chunks, encode, seq_len, budget)
     if not wins:

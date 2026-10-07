@@ -236,7 +236,8 @@ def _pick_windows(encode, corpus_path, seq_len, quota=QUOTA):
     """Окна калибровочного корпуса по языковой квоте. Внутри языка -- по кругу между
     чанками (первое окно каждого чанка, затем вторые...), чтобы окна одного языка шли
     из разных текстов. -> (окна, метки)."""
-    text = open(corpus_path, encoding="utf-8").read()
+    with open(corpus_path, encoding="utf-8") as _f:
+        text = _f.read()
     chunks = [c.strip() for c in _re.split(r"—+ CHUNK —+", text) if c.strip()]
     by = {}
     for c in chunks:
@@ -398,7 +399,8 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
     if cache and _os.path.exists(path):
         if verbose:
             print("[autopick] измерение из кеша %s" % path)
-        return _json.load(open(path))
+        with open(path) as _f:
+            return _json.load(_f)
     device = device or _os.environ.get("RWKVQ_DEVICE") or ("mps" if torch.backends.mps.is_available() else "cpu")
     t0 = _time.time()
     wins, langs = _measure_windows(tokenizer, corpus_path, seq_len)   # квота -- на момент вызова
@@ -489,7 +491,8 @@ def measure(ckpt_path, cfg, tokenizer, device=None, seq_len=SEQ_LEN,
                kl_all=kl_all_cfg, kl_all_w=kl_all_w, file_bytes=file_bytes, arms=arms, seconds=round(_time.time() - t0, 1))
     if cache:
         _os.makedirs(MEASURE_CACHE, exist_ok=True)
-        _json.dump(out, open(path + ".tmp", "w"), indent=1)
+        with open(path + ".tmp", "w") as _f:
+            _json.dump(out, _f, indent=1)
         _os.replace(path + ".tmp", path)
     if verbose:
         print("[autopick] измерение: %d матриц, KL конфига %.6f, %.0f с -> %s" % (len(arms), kl_all_cfg, out["seconds"], path))
