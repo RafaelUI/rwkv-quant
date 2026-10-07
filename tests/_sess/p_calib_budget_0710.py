@@ -7,7 +7,8 @@
   V2  «бесплатный шаг»: сосед той же цены пробуется первым (байты те же); не помог -- указатель идёт дальше, группа
       не исчерпана; платный шаг -- как раньше;
   V3  V1 + прокси выигрыша обновляется: после подъёма iso_delta группы -- изолированная Δ НОВОГО кандидата (доп. прогон).
-V1-V3: предел шагов 60 вместо 20.
+  V4  V3 + бесплатный шаг V2 (добавлено по вопросу владельца 07.10): сосед той же цены пробуется первым, прокси обновляется.
+V1-V4: предел шагов 60 вместо 20. PCB_VARS=V3,V4 -- выбрать редакции.
     python p_calib_budget_0710.py <ckpt> <eval.pt> <device> <out.json> [порог=5]"""
 import json, os, sys, time
 if "/Develop/rwkv-quant/tests" in os.path.abspath(__file__): sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -66,7 +67,7 @@ def refine(var):
         for g in GROUPS:
             if g in exhausted or kw["bits"][g] >= 16 or cur[g] is None: continue
             cs = CANDS[g]; i = cur[g]
-            if var in ("V1", "V3"):
+            if var in ("V1", "V3"):  # V4 идёт по указателю, как V2
                 j = next((x for x in range(i + 1, len(cs)) if cs[x].eff_bits > cs[i].eff_bits + 1e-9), None)
             else:
                 j = ptr[g] + 1 if ptr[g] + 1 < len(cs) else None
@@ -87,17 +88,17 @@ def refine(var):
         trace.append((g, repr(nxt) if nxt else "bf16", round(d_new, 3), "принят" if ok else "откат"))
         if not ok:
             kw = prev
-            if var == "V2" and add <= 0: ptr[g] = j      # бесплатный не помог -- идём дальше, группа жива
+            if var in ("V2", "V4") and add <= 0: ptr[g] = j      # бесплатный не помог -- идём дальше, группа жива
             else: exhausted.add(g)
             continue
         cur[g] = ptr[g] = j; d_all = d_new
-        if var == "V3" and nxt is not None: iso[g] = iso_delta(g, nxt)
+        if var in ("V3", "V4") and nxt is not None: iso[g] = iso_delta(g, nxt)
     return dict(var=var, delta=d_all, reached=d_all <= TH, steps=guard, runs=len(RUNS) - n0, sec=time.time() - t0,
                 mb_groups=size_mb(cur), final={g: (repr(CANDS[g][cur[g]]) if cur[g] is not None else "bf16") for g in GROUPS},
                 exhausted=sorted(exhausted), trace=trace)
 RES = dict(ckpt=CK, baseline=base, th=TH, n_iso=N_ISO, sec_iso=T_ISO, delta_before=D0, mb_before=size_mb(CI),
            chosen={g: (repr(CANDS[g][CI[g]]) if CI[g] is not None else "bf16") for g in GROUPS}, iso=ISO, variants=[])
-for var in ("V0", "V1", "V2", "V3"):
+for var in os.environ.get("PCB_VARS", "V0,V1,V2,V3").split(","):
     r = refine(var); RES["variants"].append(r); json.dump(RES, open(OUT, "w"), ensure_ascii=False, indent=1)
     print("== %s: композит %+.2f%% (%s), шагов %d, новых прогонов %d, %.0f с, квантуемые группы %.1f МБ (до доводки %.1f)" % (
         var, r["delta"], "в бюджете" if r["reached"] else "ВЫШЕ бюджета", r["steps"], r["runs"], r["sec"], r["mb_groups"], RES["mb_before"]))
