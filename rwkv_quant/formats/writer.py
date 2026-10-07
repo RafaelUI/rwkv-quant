@@ -454,6 +454,35 @@ def per_row_low_bits(checkpoint_path: str, cfg: QuantConfig):
     return out
 
 
+def _transposes(key, ndim):
+    """Квантует ли писатель этот тензор транспонированным (LoRA World вдоль оси редукции, 28.08).
+    Одно условие для quantize_tensor и для предполётной проверки формы."""
+    return (os.environ.get("RWKVQ_LORA_TRANSPOSE", "1") != "0"
+            and codec.is_raw_lora_world(key) and ndim == 2)
+
+
+def unsupported_gw(checkpoint_path: str, cfg: QuantConfig):
+    """Тензоры, которые реальный писатель (real_gw=True) с этим cfg записать НЕ сможет:
+    [(ключ, группа, режим, биты, причина)]. Ветка и форма -- теми же функциями, что у
+    quantize_tensor / _quantize_impl, причина -- из groupwise.real_gw_refusal (единая таблица).
+    До 07.10 такие конфиги падали из писателя посреди работы. Гейт: tests/test_gw_support.py."""
+    out = []
+    for key, w in _open_sd(checkpoint_path).items():
+        group = _match_group(key)
+        if not _is_quantized(key, group, w.dim()):
+            continue
+        bits = _bits_of(key, group, cfg)
+        gs = getattr(cfg, "group_scale", {}).get(group)
+        if not (gs and bits < 16):
+            continue
+        mode = getattr(cfg, "group_scale_mode", {}).get(group, "asym")
+        shape = tuple(w.shape)[::-1] if _transposes(key, w.dim()) else tuple(w.shape)
+        why = _gw.real_gw_refusal(mode, bits, gs, shape, cfg.outlier_fracs.get(group, 0.0))
+        if why:
+            out.append((key, group, mode, bits, why))
+    return out
+
+
 def unmatched_overrides(checkpoint_path: str, cfg: QuantConfig):
     """Шаблоны bits_overrides, не совпавшие НИ С ОДНИМ квантуемым тензором чекпоинта: опечатка в
     шаблоне раньше молча ничего не делала (06.10) -- тот же класс, что опечатка в имени группы."""
@@ -481,11 +510,13 @@ def _quantize_impl(key: str, w: torch.Tensor, cfg: QuantConfig,
         mode = getattr(cfg, "group_scale_mode", {}).get(group, "asym")
         if real_gw:
             # реальная упаковка формата v2 вместо dense fake-dequant
-            if mode in ("asym_sb6", "asym_sb6_search", "asym_sb6_aw") and bits in (4, 5, 6):
+            # ветка -- по ЕДИНОЙ таблице groupwise.REAL_GW_SUPPORT (07.10); порядок прежний
+            fam = _gw.real_gw_family(mode, bits)
+            if fam == "sb6":
                 ex2 = _get_ex2(sp, key, w) if mode == "asym_sb6_aw" else None
                 return _make_qt_gw_sb6(key, group, bits, w, gs, ex2,
                                        search=(mode != "asym_sb6"))
-            if mode.startswith("sym") and bits in (6, 8):
+            if fam == "sym":
                 if cfg.outlier_fracs.get(group, 0.0):
                     raise NotImplementedError(
                         f"real_gw: sym не хранит выбросы, а у группы "
@@ -493,9 +524,9 @@ def _quantize_impl(key: str, w: torch.Tensor, cfg: QuantConfig,
                         f"{cfg.outlier_fracs[group]} ({key})")
                 ex2 = _get_ex2(sp, key, w) if mode.endswith("_aw") else None
                 return _make_qt_gw_sym(key, group, bits, w, gs,
-                                       max(1, 256 // gs), ex2,
+                                       _gw.sym_super(gs), ex2,
                                        search=not mode.endswith("_plain"))
-            if mode == "asym" and 5 <= bits <= 8:
+            if fam == "asym":
                 return _make_qt_gw_asym(key, group, bits, w, gs)
             raise NotImplementedError(f"real_gw: mode={mode} bits={bits} ({key})")
         if mode.startswith("sym"):
@@ -671,8 +702,7 @@ def quantize_tensor(key: str, w: torch.Tensor, cfg: QuantConfig,
     KL 0.003303 -> 0.002101, top-1 96.649 -> 97.309%, +192 байта.
     """
     raw = codec.is_raw_lora_world(key)
-    if (os.environ.get("RWKVQ_LORA_TRANSPOSE", "1") != "0"
-            and raw and w.dim() == 2):
+    if _transposes(key, w.dim()):
         w = w.T.contiguous()
         raw = False
     qt = _quantize_impl(key, w, cfg, real_gw)

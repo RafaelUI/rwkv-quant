@@ -121,6 +121,13 @@ class QuantConfig:
                 "QuantConfig: group_scale_mode задан без group_scale для: %s. Режим действует только "
                 "вместе с размером блока (group_scale); без него он молча игнорировался, и группа "
                 "уходила в построчный RTN." % ", ".join(bad))
+        # 07.10 (решение владельца: отказ): неизвестное имя режима. Реальный писатель падал на нём
+        # посреди работы, а измерительный путь молча считал его как "asym".
+        from .groupwise import GW_MODES
+        bad = sorted("%s=%r" % (g, m) for g, m in (self.group_scale_mode or {}).items() if m not in GW_MODES)
+        if bad:
+            raise ValueError("QuantConfig: неизвестный group_scale_mode: %s. Есть: %s."
+                             % (", ".join(bad), ", ".join(GW_MODES)))
 
     def _check_values(self):
         """Значения, которые раньше либо молча делали не то (биты 12 построчно -- файл как при 8;

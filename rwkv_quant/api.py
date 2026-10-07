@@ -11,6 +11,7 @@
 import copy
 import os
 import time
+import warnings
 
 import torch
 
@@ -128,11 +129,14 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
         config = copy.deepcopy(config)
 
     _validate_config(config)
+    _warn_calibration_over_budget(config)
     if not allow_per_row:
         _refuse_per_row(checkpoint_path, config)
     if autopick:
         _refuse_autopick(config)
     _refuse_unmatched_overrides(checkpoint_path, config)
+    if real_gw:
+        _refuse_unsupported_gw(checkpoint_path, config)
 
     calib_sig = None
     needs_aw = any(str(m).endswith("_aw")
@@ -220,6 +224,8 @@ def quantize(checkpoint_path: str, output_path: str, preset: str = "reduction",
 # которую он сделан: лестница 4 / 5 / 6 бит -> bf16 в режимах asym_sb6*, байты (b + 0.5) / 8.
 _AUTOPICK_GROUPS = ("proj", "cmix", "emb", "head")
 _AUTOPICK_BITS = (4, 5, 6)
+from .calibration.groupwise import REAL_GW_SUPPORT as _RGS  # noqa: E402 (единая таблица режимов, 07.10)
+_SB6_MODES, _SYM_MODES = _RGS["sb6"][0], _RGS["sym"][0]
 
 
 def _autopick_unsupported(config):
@@ -230,7 +236,7 @@ def _autopick_unsupported(config):
         if b >= 16:
             continue
         mode = (config.group_scale_mode or {}).get(g)
-        if not (config.group_scale or {}).get(g) or not str(mode).startswith("asym_sb6") or b not in _AUTOPICK_BITS:
+        if not (config.group_scale or {}).get(g) or mode not in _SB6_MODES or b not in _AUTOPICK_BITS:
             bad.append((g, mode, b))
     return bad
 
@@ -346,7 +352,7 @@ def _gptq_has_targets(config):
     from .calibration import gptq as G
     def ok(g):
         mode = str((config.group_scale_mode or {}).get(g, "asym"))
-        return bool((config.group_scale or {}).get(g)) and (mode in G._SB_BITS or mode.startswith("sym"))
+        return bool((config.group_scale or {}).get(g)) and (mode in _SB6_MODES or mode in _SYM_MODES)
     return any(ok(g) for g in ("proj", "cmix", "head"))
 
 
@@ -354,6 +360,29 @@ def _validate_config(config):
     """Итоговый конфиг (после копии): неизвестные группы и режим без group_scale -- отказ.
     Конструктор QuantConfig проверяет то же, но поля -- словари, их правят и после сборки."""
     config.validate()
+
+
+def _refuse_unsupported_gw(ckpt, config):
+    """Отказ ДО любой работы, если реальный писатель не умеет записать то, что заказано: пара
+    режим / биты вне таблицы groupwise.REAL_GW_SUPPORT, ширина не кратна блоку, не 2-D тензор в
+    группе с group_scale (07.10; раньше -- NotImplementedError / AssertionError / «too many values
+    to unpack» из писателя посреди работы). Гейт: tests/test_gw_support.py."""
+    from .formats import writer as _w
+    from .calibration.groupwise import REAL_GW_SUPPORT
+    bad = _w.unsupported_gw(ckpt, config)
+    if not bad:
+        return
+    by = {}
+    for key, group, mode, bits, why in bad:
+        by.setdefault((group, mode, bits, why), []).append(key)
+    what = "\n".join("  %s: режим %s, %s бит -- %s (%d тензоров, напр. %s)" % (g, m, b, why, len(ks), ks[0])
+                     for (g, m, b, why), ks in sorted(by.items(), key=lambda kv: tuple(map(str, kv[0]))))
+    table = "; ".join("%s -- биты %s" % (" / ".join(modes), ", ".join(map(str, bs)))
+                      for modes, bs in REAL_GW_SUPPORT.values())
+    raise ValueError(
+        "конфиг заказывает то, что формат .rwkvq не пишет:\n%s\n"
+        "Пишется: %s. sb6 и sym требуют ширину, кратную суперблоку; блочные режимы -- только 2-D.\n"
+        "Измерить такую схему без записи кодов можно с real_gw=False." % (what, table))
 
 
 def _refuse_per_row(ckpt, config):
@@ -519,6 +548,30 @@ def _mk_config(kw, act_stats_path):
                        **kw["bits"])
 
 
+def _budget_warning(delta, threshold, final, exhausted, n_steps):
+    """Текст предупреждения о невыполненном бюджете calibrate() либо None. Отдельной функцией, чтобы
+    гейт проверял текст без прогона модели (tests/test_calibrate_refine.py)."""
+    if delta <= threshold:
+        return None
+    left = sorted(g for g, c in final.items() if c != "bf16")
+    return ("calibrate: бюджет %.1f%% НЕ достигнут: композит Δppl = %+.2f%% после %d шагов доводки. "
+            "Группы, оставшиеся квантованными: %s; исчерпаны (подъём не улучшал композит): %s. "
+            "Конфиг возвращён как есть -- файл по нему даст эту деградацию. Что можно сделать: поднять "
+            "ppl_threshold_pct, передать act_stats_path (AW-режимы) или взять пресет."
+            % (threshold, delta, n_steps, ", ".join("%s=%s" % (g, final[g]) for g in left) or "нет",
+               ", ".join(exhausted) or "нет"))
+
+
+def _warn_calibration_over_budget(config):
+    """quantize(config=) с конфигом от calibrate(), чей композит выше заказанного бюджета, -- предупредить:
+    раньше отчёт молча ехал в поле calibration_report, и файл писался без единого слова (07.10)."""
+    rep = getattr(config, "calibration_report", None) or {}
+    d, th = rep.get("combined_delta_pct"), rep.get("threshold_pct")
+    if d is not None and th is not None and d > th:
+        warnings.warn("quantize: конфиг получен от calibrate() с НЕвыполненным бюджетом: композит Δppl = "
+                      "%+.2f%% при заказанных %.1f%%." % (d, th), stacklevel=3)
+
+
 def calibrate(checkpoint_path: str, eval_corpus_path: str, device: str = "mps",
               ppl_threshold_pct: float = 5.0, act_stats_path: str = None,
               groups=None, n_seq: int = None, seq_len: int = None,
@@ -551,8 +604,9 @@ def calibrate(checkpoint_path: str, eval_corpus_path: str, device: str = "mps",
     там это именно СКРИН, а не гарантия: восемь групп, каждая в пределах
     5%, дают композит заметно выше 5% -- ошибки складываются (закон 5).
     Поэтому после изолированного отбора идёт доводка, которая поднимает
-    группы, пока композит не уложится в бюджет, и честно сообщает, если
-    не уложился.
+    группы, пока композит не уложится в бюджет (schema_space.refine), и
+    сообщает через warnings.warn (независимо от verbose), если не уложился;
+    итог -- в cfg.calibration_report ("budget_met", "final", "refine_steps").
 
     act_stats_path: без него AW-режимы не рассматриваются вовсе, потому
     что без статистики они ВЫРОЖДАЮТСЯ в свои _search-варианты и
@@ -657,66 +711,48 @@ def calibrate(checkpoint_path: str, eval_corpus_path: str, device: str = "mps",
     # застряла: rtn@8 и asym@8 равны по битам, поэтому «следующим по
     # цене» каждый раз оказывался один и тот же asym@8. Одиннадцать
     # прогонов подряд с одинаковым результатом, прежде чем это заметили.
+    # 07.10: сама доводка -- чистая функция schema_space.refine (правила и история ошибки -- в её docstring;
+    # гейт tests/test_calibrate_refine.py гоняет её на записанной таблице прогонов 0.1B).
     cur_i = {g: report[g].get("cand_i") for g in groups}
-    exhausted = set()
-    guard, upgrades = 0, []
-    while delta_all > ppl_threshold_pct and guard < 20:
-        guard += 1
-        best, best_gain, best_next, best_i = None, None, None, None
-        for g in groups:
-            if g in exhausted or kw["bits"][g] >= 16 or cur_i[g] is None:
-                continue
-            cands = _ss.candidates_for(
-                report[g]["in_features"], have_act_stats=have_act,
-                all_2d=report[g].get("all_2d", True))
-            i = cur_i[g]
-            nxt = cands[i + 1] if i + 1 < len(cands) else None
-            add_bits = ((nxt.eff_bits if nxt else 16.0) - cands[i].eff_bits)
-            if add_bits <= 0:
-                exhausted.add(g)
-                continue
-            gain = report[g]["iso_delta"] / add_bits
-            if best_gain is None or gain > best_gain:
-                best, best_gain, best_next, best_i = g, gain, nxt, i + 1
-        if best is None:
-            break
+    cands_of = {g: (_ss.candidates_for(report[g]["in_features"], have_act_stats=have_act,
+                                       all_2d=report[g].get("all_2d", True)) if cur_i[g] is not None else [])
+                for g in groups}
 
-        prev = (dict(kw["bits"]), dict(kw["group_scale"]),
-                dict(kw["group_scale_mode"]))
-        if best_next is None:
-            kw["bits"][best] = 16
-            kw["group_scale"].pop(best, None)
-            kw["group_scale_mode"].pop(best, None)
-        else:
-            best_next.apply_to(kw, best)
-        cfg = _mk_config(kw, act_stats_path)
-        ppl_new = perplexity(model, data, cfg)
-        delta_new = 100 * (ppl_new - baseline) / baseline
+    def _kw_of(state):
+        k = {"bits": {g: 16 for g in GROUPS}, "group_scale": {}, "group_scale_mode": {}}
+        for g, i in state.items():
+            if i is not None:
+                cands_of[g][i].apply_to(k, g)
+        return k
 
-        # Подъём обязан УЛУЧШАТЬ композит. Если не улучшил -- откатываем и
-        # больше эту группу не трогаем: платить биты за ухудшение бессмысленно,
-        # а взаимодействие групп непредсказуемо (закон 5), так что "поднял
-        # и стало хуже" -- нормальный исход, а не аномалия.
-        if delta_new >= delta_all - 1e-9:
-            kw["bits"], kw["group_scale"], kw["group_scale_mode"] = prev
-            exhausted.add(best)
-            cfg = _mk_config(kw, act_stats_path)
-            if verbose:
-                print(f"[calibrate] {best} -> {best_next or 'bf16'} не помог "
-                      f"({delta_new:+.2f}% против {delta_all:+.2f}%), откат")
-            continue
-        cur_i[best] = best_i if best_next is not None else None
-        ppl_all, delta_all = ppl_new, delta_new
-        upgrades.append({"group": best, "to": repr(best_next) if best_next else "bf16",
-                         "delta_pct": delta_all})
+    _ppl_of = {}
+
+    def _measure(state):
+        p = perplexity(model, data, _mk_config(_kw_of(state), act_stats_path))
+        _ppl_of[tuple(sorted(state.items()))] = p
+        return 100 * (p - baseline) / baseline
+
+    def _log(g, j, d_new, d_old, ok, free):
         if verbose:
-            print(f"[calibrate] поднимаю {best} -> {best_next or 'bf16'}: "
-                  f"композит Δ={delta_all:+.2f}%")
+            to = repr(cands_of[g][j]) if j is not None else "bf16"
+            print(f"[calibrate] {g} -> {to}{' (та же цена)' if free else ''}: композит Δ={d_new:+.2f}% "
+                  f"против {d_old:+.2f}% -- {'принят' if ok else 'откат'}")
 
-    if delta_all > ppl_threshold_pct and verbose:
-        print(f"[calibrate] ВНИМАНИЕ: бюджет {ppl_threshold_pct:.1f}% не достигнут "
-              f"за {guard} шагов (сейчас {delta_all:+.2f}%). Либо бюджет слишком "
-              f"жёсткий для этого чекпоинта, либо расширьте пространство схем.")
+    res = _ss.refine(cands_of, cur_i, {g: report[g]["iso_delta"] for g in groups}, delta_all,
+                     _measure, lambda g, i: _measure({g: i}), ppl_threshold_pct, log=_log)
+    kw = _kw_of(res["cur"])
+    cfg = _mk_config(kw, act_stats_path)
+    delta_all = res["delta"]
+    ppl_all = _ppl_of.get(tuple(sorted(res["cur"].items())), ppl_all)   # без принятых шагов -- прежний замер
+    _name = lambda g, j: repr(cands_of[g][j]) if j is not None else "bf16"
+    upgrades = [{"group": s_["group"], "to": _name(s_["group"], s_["to"]), "delta_pct": s_["delta_pct"]}
+                for s_ in res["steps"] if s_["accepted"]]
+    final = {g: _name(g, res["cur"][g]) for g in groups}
+    msg = _budget_warning(delta_all, ppl_threshold_pct, final, res["exhausted"], res["n_steps"])
+    if msg:
+        # warnings.warn, а не print под verbose (07.10): раньше при verbose=False о невыполненном бюджете
+        # не сообщалось вовсе, а текст винил «слишком жёсткий бюджет», когда группы не пробовались.
+        warnings.warn(msg, stacklevel=2)
 
     if verbose:
         print(f"\n{cfg}")
@@ -728,5 +764,7 @@ def calibrate(checkpoint_path: str, eval_corpus_path: str, device: str = "mps",
         "n_pred": n_pred, "threshold_pct": ppl_threshold_pct,
         "combined_ppl": ppl_all, "combined_delta_pct": delta_all,
         "groups": report, "upgrades": upgrades,
+        "budget_met": res["met"], "final": final, "exhausted": res["exhausted"],
+        "refine_steps": [dict(s_, to=_name(s_["group"], s_["to"])) for s_ in res["steps"]],
     }
     return cfg

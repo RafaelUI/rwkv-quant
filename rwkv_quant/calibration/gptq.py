@@ -245,9 +245,10 @@ def run(ckpt, tokenizer, cfg, n_windows=N_WINDOWS, damp=DAMP, device=None, verbo
         if not gs or bits >= 16:
             return None
         # ex2 -- ровно как writer.quantize_tensor: sb6 -- только "asym_sb6_aw"; sym -- mode.endswith("_aw")
-        if mode in _SB_BITS and bits in (4, 5, 6):
+        fam = gw.real_gw_family(mode, bits)         # единая таблица groupwise.REAL_GW_SUPPORT (07.10)
+        if fam == "sb6":
             kind, aw, x = "sb6", mode == "asym_sb6_aw", _SB_BITS[mode]
-        elif mode.startswith("sym") and bits in (6, 8) and not cfg.outlier_fracs.get(group, 0.0):
+        elif fam == "sym" and not cfg.outlier_fracs.get(group, 0.0):
             kind, aw, x = "sym", mode.endswith("_aw"), not mode.endswith("_plain")
         else:
             return None

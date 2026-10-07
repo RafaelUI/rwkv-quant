@@ -33,6 +33,7 @@ __all__ = [
     "groupwise_fake_dequant", "groupwise_sym_fake_dequant",
     "mxfp4_fake_dequant", "load_act_stats", "get_ex2",
     "GW_MODES", "mode_needs_act_stats",
+    "REAL_GW_SUPPORT", "SB6_SUPER", "sym_super", "real_gw_family", "real_gw_refusal",
 ]
 
 # Режимы group_scale_mode, которые понимает и калибровка, и writer.
@@ -51,6 +52,61 @@ GW_MODES = {
 
 def mode_needs_act_stats(mode: str) -> bool:
     return GW_MODES.get(mode, (False, ""))[0]
+
+
+# ---------------- что умеет записать РЕАЛЬНЫЙ писатель (07.10) ----------------
+# ЕДИНСТВЕННОЕ место, где сказано, какие пары «режим / биты» пакуются в .rwkvq и чего они требуют от
+# формы. Читают: writer._quantize_impl (выбор ветки), writer.unsupported_gw (предполётная проверка
+# quantize()), gptq.run.plan, api (цель GPTQ, autopick), schema_space (кандидаты calibrate).
+# До 07.10 эти условия были переписаны в семи местах и расходились: писатель брал любой режим на
+# «sym» ("sym_typo" = sym с поиском), а неподдержанная пара падала NotImplementedError / AssertionError
+# из писателя посреди работы. Fake-путь (real_gw=False, fake_quant.q) ШИРЕ намеренно (решение
+# владельца 07.10): mxfp4 и любые биты там -- исследовательские, в файл не пишутся.
+# Семейство -> (режимы, биты). Гейт: tests/test_gw_support.py.
+REAL_GW_SUPPORT = {
+    "sb6":  (("asym_sb6", "asym_sb6_search", "asym_sb6_aw"), (4, 5, 6)),
+    "sym":  (("sym", "sym_plain", "sym_aw"), (6, 8)),
+    "asym": (("asym",), (5, 6, 7, 8)),
+}
+SB6_SUPER = 8                       # блоков в суперблоке sb6 (codec.pack_gw_sb6)
+
+
+def sym_super(gs: int) -> int:
+    """Блоков в суперблоке sym: суперблок -- 256 весов (Q6_K-подобная раскладка)."""
+    return max(1, 256 // gs)
+
+
+def real_gw_family(mode, bits):
+    """Семейство упаковки для пары (режим, биты) либо None, если реальный писатель её не пишет."""
+    for fam, (modes, bs) in REAL_GW_SUPPORT.items():
+        if mode in modes and bits in bs:
+            return fam
+    return None
+
+
+def real_gw_refusal(mode, bits, gs, shape, outlier_frac=0.0):
+    """Почему реальный писатель НЕ запишет тензор формы shape (форма -- какой её видит писатель,
+    то есть ПОСЛЕ транспонирования LoRA) в режиме mode на bits битах с блоком gs. None -- запишет."""
+    if mode not in GW_MODES:
+        return "неизвестный режим %r (есть: %s)" % (mode, ", ".join(GW_MODES))
+    fam = real_gw_family(mode, bits)
+    if fam is None:
+        own = [bs for modes, bs in REAL_GW_SUPPORT.values() if mode in modes]
+        if not own:
+            return "режим %r только измерительный (real_gw=False), в файл не пишется" % mode
+        return "режим %r пишется на битах %s, задано %s" % (mode, "/".join(map(str, own[0])), bits)
+    if len(shape) != 2:
+        return "блочная раскладка (group_scale) только для 2-D матриц, форма %s" % (tuple(shape),)
+    IN = shape[1]
+    if fam == "sb6":
+        if IN % gs or (IN // gs) % SB6_SUPER:
+            return "sb6: ширина %d должна делиться на group_scale*%d = %d" % (IN, SB6_SUPER, gs * SB6_SUPER)
+    elif fam == "sym":
+        if IN % (gs * sym_super(gs)):
+            return "sym: ширина %d должна делиться на суперблок %d" % (IN, gs * sym_super(gs))
+        if outlier_frac:
+            return "sym не хранит выбросы, а outlier_frac = %s" % outlier_frac
+    return None
 
 
 # ---------------- статистика активаций (AW-режимы) ----------------

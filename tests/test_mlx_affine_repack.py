@@ -61,6 +61,11 @@ def main():
         if len(seen.setdefault(sh, [])) < PER_SHAPE:
             seen[sh].append(k)
             picked.append((k, m))
+    if not picked:
+        # 07.10: на файле без sb6 (например пресет reduction) гейт печатал «ПРОЙДЕН» при нуле проверок.
+        print("ГЕЙТ НЕ ПРИМЕНИМ: в файле нет тензоров sb6 -- проверять нечего (нужен файл с asym_sb6*, "
+              "например пресет compression). Код 1, а не зелёный без единой проверки.")
+        return 1
 
     fixture, n_el = {}, 0
     n_dead_total, n_blocks_total = [0], [0]

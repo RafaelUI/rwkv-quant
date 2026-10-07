@@ -3157,3 +3157,53 @@ gptq_calib >= 600 окон не в README; mlx / rwkv-metal обязательн
 - **Уборка (удаляет владелец).** Mac: /tmp/g1_0710 (2.3 ГБ: свежие сборки, копии контейнера rt_*, сайдкары sc_*),
   /tmp/p3_grid_0710.*, /tmp/NEXT_SESSION_before_0710.md; свободно 11 ГиБ. Сервер: /tmp/rq_p4_0710, /tmp/pcb_*, /tmp/pcb2_*,
   /tmp/p_calib_budget_0710.py, /tmp/g1_multidev_0710.log.
+
+### 07.10 (день) — ПРАВКИ ПО РЕШЕНИЯМ ВЛАДЕЛЬЦА: ЕДИНАЯ ТАБЛИЦА ПОДДЕРЖКИ, ДОВОДКА calibrate, affine_repack
+Решения владельца 07.10: п. 3 -- точный список sym, отказ на неизвестном режиме в QuantConfig (strict=False -- для
+старых манифестов), fake-путь остаётся шире реального; calibrate -- чинить остановку и сообщение, редакцию выбрать по
+числам V4; affine_repack -- поправить (гейт нужен: SwiftRWKV берёт эталон из его --dump).
+- **П. 3, единая таблица** groupwise.REAL_GW_SUPPORT (семейство -> режимы, биты) + real_gw_family / real_gw_refusal /
+  sym_super / SB6_SUPER. Читают: writer._quantize_impl (ветка; порядок прежний), новая writer.unsupported_gw (форма --
+  после того же транспонирования LoRA, общее условие вынесено в writer._transposes), api._refuse_unsupported_gw
+  (ValueError до работы, только при real_gw=True, после остальных отказов), gptq.run.plan, цель GPTQ и autopick в api,
+  schema_space (SB6_MODES / SB6_BITS / SB6_SB берутся из таблицы). QuantConfig._check_modes отказывает на режиме вне
+  GW_MODES. ИЗМЕНЕНИЕ ПОВЕДЕНИЯ: строка на «sym», не входящая в {sym, sym_plain, sym_aw}, больше не sym (в писателе --
+  NotImplementedError, в конфиге -- ValueError). Fake-ветки писателя и fake_quant._gw_dequant НЕ тронуты.
+  Гейт tests/test_gw_support.py (26 свойств с CKS на 0.4B / 1.5B g1j / 2.9B): P1 таблица == писатель на сетке 4320
+  точек настоящих тензоров 0.1B; якоря бит по режимам; LoRA после транспонирования; пресеты чисты на четырёх
+  чекпоинтах; отказ до работы (sb6 на 7 битах, блок 64 на ширине 768, group_scale у small); real_gw=False пишет;
+  sym_typo / bogus. Мутаций 6 -- все пойманы. Байты: сборки 0.1B (оба пресета, gptq=False, autopick=False) до / после --
+  sha256 равны (ef75e2a350e00d20, ab92324c266b5502; «до» -- из git archive прежнего HEAD в /tmp/rq_base);
+  bits_ref_0510 на трёх файлах == /tmp/bits_ref_after_mis.json.
+- **calibrate: доводка -- чистая функция schema_space.refine, редакция V4** (V3 + сосед той же цены пробуется первым).
+  Проба V4 (сервер, /tmp/pcb4_*.log): размер квантуемых групп РАВЕН V3 на всех четырёх масштабах, композит чуть ниже:
+  0.1B +3.97% (V3 +4.00%) 143.7 МБ | 0.4B +4.10% (+4.22%) 306.1 | 1.5B +4.63% (+4.74%) 1142.1 | 2.9B +4.53% (+4.69%)
+  2140.7; цена -- в 2-3 раза больше прогонов доводки (2.9B: 1521 с против 522). По критерию «файл не больше V3» взят V4.
+  api.calibrate: изолированная стадия не тронута; доводка зовёт refine; о невыполненном бюджете -- warnings.warn
+  (api._budget_warning: Δ, порог, оставшиеся квантованными и исчерпанные группы) НЕЗАВИСИМО от verbose;
+  calibration_report получил "budget_met", "final", "exhausted", "refine_steps" ("upgrades" -- прежнего вида);
+  quantize(config=) с отчётом выше порога предупреждает (api._warn_calibration_over_budget) до отказов и работы.
+  Предел шагов 60 (был 20). README: строка про бюджет дополнена.
+  Гейт tests/test_calibrate_refine.py (14 свойств) на ЗАПИСАННОЙ таблице прогонов 0.1B tests/data/calib_refine_0p1b.json
+  (48 состояний, сервер cuda, /tmp/pcb5_0p1b.log): траектория == записанной V4 шаг в шаг; бюджет; размер == V4 и < V2;
+  синтетика на управление (равная цена, «ничто не помогает», обновление прокси); тексты предупреждений; P7 --
+  настоящий calibrate(verbose=False) на 0.1B с недостижимым бюджетом даёт UserWarning и budget_met=False.
+  Мутаций 5 -- все пойманы (равная цена = тупик возвращает +10.02%).
+  Сквозной прогон на Mac (tests/_sess/e2e_calibrate_0710.py, 0.1B, mps, умолчания): композит +3.96% (было +10.05%),
+  бюджет выполнен, файл 144.11 МБ (было 122.78), 910 с (было ~600 на изолированную стадию + доводка), своп за прогон 0.
+  ОСТАЁТСЯ ВЕРНЫМ: calibrate без act_stats проигрывает пресетам (1.5B: 1142 МБ при +4.6% против COMPRESSION 996.5 при
+  +3.1%); на 0.4B-2.9B новая доводка проверена только пробой (той же логикой), не самим api.calibrate.
+- **test_mlx_affine_repack**: на файле без sb6 -- «ГЕЙТ НЕ ПРИМЕНИМ», код 1 (был «ПРОЙДЕН» при нуле проверок).
+  compression 0.1B -- 8 / 8 ok, как раньше.
+- **Необязательное, отложено по решению владельца:** (1) calibrate с AW сам (act_stats="auto", как в quantize) --
+  сейчас AW включается только передачей act_stats_path; перед этим замер «calibrate с AW против COMPRESSION»;
+  (2) поматричные решения и GPTQ в calibrate -- дублировали бы autopick, смысла мало.
+- **Полный прогон гейтов после правок** (/tmp/gates_all_0710.log, 64 гейта, 07.10 13:48-14:36): 56 кодов 0;
+  справочные код 2 -- test_fast_ln_parity, test_prewkv_parity; шесть кодов 1 -- гейты с аргументами. Они же на файлах:
+  сборки 0.1B НОВЫМ кодом (/tmp/p3_checks) -- selfdesc 16 / 16 и container 18 / 18 на обоих пресетах, affine 8 / 8 и
+  k3 8 / 8 на compression. test_wkv_var_model ru60m -- [OK], max_abs 0, токены совпали (model.safetensors 122.7 МБ
+  скачан с huggingface.co/ImpulseLeap/ru60m в ~/Develop/WKV-kvant/ru60m/, sha256 сверен с LFS: 29116c22...).
+- **Не сделано:** ResourceWarning (open() без закрытия в act_stats.py:151 и gptq.py:166). Сервер -- на старом коде
+  (09b8a7e): новые гейты на CUDA и с установленного колеса не гонялись; ждёт push.
+- **Уборка (удаляет владелец).** Mac: /tmp/p3_checks, /tmp/rq_base, /tmp/e2e_calib_0p1b.*, /tmp/p3_grid_0710.*,
+  /tmp/gw_support_*.log, /tmp/calref_1.log. Сервер: /tmp/rq_p4_0710, /tmp/pcb*, /tmp/p_calib_budget_*.py.

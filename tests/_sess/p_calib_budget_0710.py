@@ -33,8 +33,12 @@ def delta_of(kw):
         RUNS[key] = 100 * (perplexity(model, data, A._mk_config(kw, None)) - base) / base
     return RUNS[key]
 def empty(): return {"bits": {g: 16 for g in GROUPS}, "group_scale": {}, "group_scale_mode": {}}
+REC = {}                                    # таблица для гейта: состояние {группа: индекс кандидата | -1 = bf16} -> Δ%
+def skey(state): return json.dumps(sorted((g, (-1 if i is None else i)) for g, i in state.items()))
 def iso_delta(g, c):
-    t = empty(); c.apply_to(t, g); return delta_of(t)
+    t = empty(); c.apply_to(t, g); d = delta_of(t)
+    st = {x: None for x in GROUPS}; st[g] = CANDS[g].index(c); REC[skey(st)] = d
+    return d
 def numel(g):
     n = 0
     for k, t in sd.items():
@@ -52,7 +56,7 @@ for g in GROUPS:
         d = iso_delta(g, c)
         if d <= TH: CI[g], ISO[g] = ci, d; c.apply_to(kw0, g); break
 N_ISO = len(RUNS); T_ISO = time.time() - T0
-D0 = delta_of(kw0)
+D0 = delta_of(kw0); REC[skey(CI)] = D0
 def size_mb(cur):
     return sum(NUM[g] * (CANDS[g][cur[g]].eff_bits if cur[g] is not None else 16.0) for g in GROUPS) / 8e6
 print("ckpt %s  baseline %.4f  порог %.1f%%  изолированно %d прогонов %.0f с  композит до доводки %+.2f%%" % (os.path.basename(CK), base, TH, N_ISO, T_ISO, D0))
@@ -85,6 +89,7 @@ def refine(var):
         if nxt is None: kw["bits"][g] = 16; kw["group_scale"].pop(g, None); kw["group_scale_mode"].pop(g, None)
         else: nxt.apply_to(kw, g)
         d_new = delta_of(kw); ok = d_new < d_all - 1e-9
+        st = dict(cur); st[g] = j; REC[skey(st)] = d_new
         trace.append((g, repr(nxt) if nxt else "bf16", round(d_new, 3), "принят" if ok else "откат"))
         if not ok:
             kw = prev
@@ -99,7 +104,10 @@ def refine(var):
 RES = dict(ckpt=CK, baseline=base, th=TH, n_iso=N_ISO, sec_iso=T_ISO, delta_before=D0, mb_before=size_mb(CI),
            chosen={g: (repr(CANDS[g][CI[g]]) if CI[g] is not None else "bf16") for g in GROUPS}, iso=ISO, variants=[])
 for var in os.environ.get("PCB_VARS", "V0,V1,V2,V3").split(","):
-    r = refine(var); RES["variants"].append(r); json.dump(RES, open(OUT, "w"), ensure_ascii=False, indent=1)
+    r = refine(var); RES["variants"].append(r)
+    RES["table"] = dict(runs=REC, numel=NUM, cands={g: [dict(repr=repr(c), eff_bits=c.eff_bits) for c in CANDS[g]] for g in GROUPS},
+                        chosen_i={g: CI[g] for g in GROUPS})
+    json.dump(RES, open(OUT, "w"), ensure_ascii=False, indent=1)
     print("== %s: композит %+.2f%% (%s), шагов %d, новых прогонов %d, %.0f с, квантуемые группы %.1f МБ (до доводки %.1f)" % (
         var, r["delta"], "в бюджете" if r["reached"] else "ВЫШЕ бюджета", r["steps"], r["runs"], r["sec"], r["mb_groups"], RES["mb_before"]))
     for t in r["trace"]: print("     %-7s -> %-36s %+8.3f%%  %s" % t)

@@ -1067,7 +1067,8 @@ contribute:
   tuning pass.
 - **`calibrate()` screens groups in isolation.** It picks each group's
   scheme independently and then refines the composite until it fits the
-  budget, but it does not model interaction effects during the search; a
+  budget (if it cannot, it emits a warning and sets
+  `calibration_report["budget_met"]` to `False`), but it does not model interaction effects during the search; a
   joint search would be more accurate and much more expensive.
 - **Schemes are chosen per *group*, not per *tensor*.** A group is
   quantized with one scheme, so a group whose tensors have mixed shapes

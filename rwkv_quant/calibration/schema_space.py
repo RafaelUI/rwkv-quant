@@ -43,11 +43,12 @@ NEXT_SESSION, и оба меняют решения:
      подтверждённый теперь и для внутреннего пути.
 """
 
-SB6_MODES = ("asym_sb6", "asym_sb6_search", "asym_sb6_aw")
-SB6_BITS = (4, 5, 6)
+from .groupwise import REAL_GW_SUPPORT, SB6_SUPER  # noqa: E402 (единая таблица писателя, 07.10)
+SB6_MODES, SB6_BITS = REAL_GW_SUPPORT["sb6"]
 # см. пункт 1 в докстринге: при 5..8 размер одинаков, значит смысл имеет
 # только максимум
 ASYM_BITS = (8,)
+assert set(ASYM_BITS) <= set(REAL_GW_SUPPORT["asym"][1])
 # см. пункт 2: 5..7 неотличимы по размеру от 8
 # 06.10 (решение владельца): построчных 4 бит среди кандидатов НЕТ. quantize() отказывает на
 # построчном RTN ниже 8 бит, и calibrate() не должен выдавать то, что quantize() не примет.
@@ -67,7 +68,7 @@ def _rtn_cost(bits, in_features):
     scale на строку."""
     return (4.0 if bits <= 4 else 8.0) + 16.0 / max(in_features, 1)
 
-SB6_GS, SB6_SB = 32, 8
+SB6_GS, SB6_SB = 32, SB6_SUPER
 ASYM_GS = 64
 
 
@@ -188,3 +189,61 @@ def group_shapes(state_dict, group, patterns):
 def group_in_features(state_dict, group, patterns):
     """Совместимость: только число каналов (см. group_shapes)."""
     return group_shapes(state_dict, group, patterns)[0]
+
+
+# ---------------- доводка композита до бюджета (07.10) ----------------
+REFINE_MAX_STEPS = 60
+
+
+def refine(cands, cur_i, iso, delta0, measure, measure_iso, threshold, max_steps=REFINE_MAX_STEPS, log=None):
+    """Поднимать группы, пока Δppl композита не уложится в threshold. Чистая функция: модель видна только через
+    measure(state) -> Δ% композита и measure_iso(group, i) -> изолированная Δ% кандидата i;
+    state = {группа: индекс кандидата в cands[группа] | None = bf16}.
+
+    Правила (решение владельца 07.10; проба tests/_sess/p_calib_budget_0710.py, редакция V4, 0.1B-2.9B):
+      * сосед ТОЙ ЖЕ цены (другой режим на той же ступени) -- не тупик, а бесплатный шаг: пробуется первым;
+        не помог -- указатель группы идёт дальше, группа остаётся в игре. До 07.10 такая группа считалась
+        исчерпанной, и proj / cmix / emb / head выбывали, ни разу не попробовав следующую битность:
+        композит останавливался на +9...+10% при бюджете 5%;
+      * платный шаг берётся у группы с наибольшим «изолированная Δ на добавленный бит»; после принятого шага
+        изолированная Δ группы ПЕРЕМЕРЯЕТСЯ на новом кандидате (иначе жадный выбор гонит одну группу до упора:
+        1.5B -- 1458 МБ вместо 1142 при том же бюджете);
+      * шаг принимается, только если улучшил композит; платный шаг без улучшения исключает группу.
+    -> {"delta", "cur", "met", "steps": [{"group", "to", "delta_pct", "accepted", "free"}], "exhausted", "n_steps"}."""
+    cur, ptr, iso = dict(cur_i), dict(cur_i), dict(iso)
+    exhausted, steps, delta, n = set(), [], delta0, 0
+    while delta > threshold and n < max_steps:
+        n += 1
+        best = None
+        for g in cands:
+            if g in exhausted or cur.get(g) is None:
+                continue
+            cs = cands[g]
+            j = ptr[g] + 1 if ptr[g] + 1 < len(cs) else None
+            cost = (cs[j].eff_bits if j is not None else 16.0) - cs[cur[g]].eff_bits
+            free = cost <= 0
+            gain = float("inf") if free else iso[g] / cost
+            if best is None or gain > best[1]:
+                best = (g, gain, j, free)
+        if best is None:
+            break
+        g, _, j, free = best
+        trial = dict(cur)
+        trial[g] = j
+        d_new = measure(trial)
+        ok = d_new < delta - 1e-9
+        steps.append({"group": g, "to": j, "delta_pct": d_new, "accepted": ok, "free": free})
+        if log:
+            log(g, j, d_new, delta, ok, free)
+        if not ok:
+            if free:
+                ptr[g] = j
+            else:
+                exhausted.add(g)
+            continue
+        cur[g] = ptr[g] = j
+        delta = d_new
+        if j is not None:
+            iso[g] = measure_iso(g, j)
+    return {"delta": delta, "cur": cur, "met": delta <= threshold, "steps": steps,
+            "exhausted": sorted(exhausted), "n_steps": n}
