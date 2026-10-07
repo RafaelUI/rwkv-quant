@@ -3207,3 +3207,25 @@ gptq_calib >= 600 окон не в README; mlx / rwkv-metal обязательн
   (09b8a7e): новые гейты на CUDA и с установленного колеса не гонялись; ждёт push.
 - **Уборка (удаляет владелец).** Mac: /tmp/p3_checks, /tmp/rq_base, /tmp/e2e_calib_0p1b.*, /tmp/p3_grid_0710.*,
   /tmp/gw_support_*.log, /tmp/calref_1.log. Сервер: /tmp/rq_p4_0710, /tmp/pcb*, /tmp/p_calib_budget_*.py.
+
+### 07.10 (вечер) — ВЕРСИЯ 0.3.0, PUSH, ПРОВЕРКА НА CUDA; СЕРВЕР УПАЛ, calibrate НА 0.4B-2.9B НЕ СОБРАН
+- **944d0f5 опубликован** (слово владельца): pyproject 0.3.0 (на PyPI НЕ выпускалось -- решение владельца); шесть
+  open() без закрытия переведены на with (act_stats.py, gptq.py, три в autopick.py, один в api.py) -- девять гейтов
+  вокруг с -W error::ResourceWarning коды 0 (оставшиеся ResourceWarning -- из самих гейтов, не из пакета).
+  Сервер: git pull --ff-only до 944d0f5, дерево чистое.
+- **Сервер, CUDA, новый код** (/tmp/rq_0710b): test_gw_support --mutate -- ЗЕЛЁНЫЙ (26 свойств, CKS 0.4B / 1.5B / 2.9B);
+  test_calibrate_refine --mutate -- ЗЕЛЁНЫЙ (14 свойств, P7 на cuda:0). tests/_sess/api_misuse_0610.py с колеса
+  rwkv_quant-0.3.0 (cwd=/tmp), 51 случай; против /tmp/api_misuse_cuda2.log (06.10) изменились ровно четыре, все как
+  задумано -- было из писателя посреди работы, стало ValueError до работы: биты 3 в sb6, неизвестный режим
+  (QuantConfig), group_scale 33, 7 бит через bits_overrides. Пропало предупреждение «unclosed file» в случае 13.
+- **НЕ СОБРАНО: сквозной api.calibrate() новым кодом на 0.4B / 1.5B / 2.9B** (tests/_sess/e2e_calibrate_0710.py,
+  запущен 07.10 ~15:25 МСК на cuda:1-3, журналы /tmp/rq_0710b/e2e_*.log). В 16:20 МСК сервер перестал отвечать по ssh
+  («timed out during banner exchange» при открытом порте 6666), в 16:43 -- «Connection refused»: похоже на
+  перезагрузку; /tmp после неё пуст. Причина не выяснена; мои процессы -- три calibrate по одной карте, до того такая
+  нагрузка (четыре пробы разом) сервер не роняла. Когда поднимется: проверить uptime и /tmp/rq_0710b; нет журналов --
+  перезапустить (команда: PYTHONPATH=<клон> ~/venv/bin/python tests/_sess/e2e_calibrate_0710.py <ckpt>
+  ~/rwkvq/eval_text_heldout.pt cuda:N <out.json>; ожидание по пробе V4: 0.4B +4.10%, 1.5B +4.63%, 2.9B +4.53%, бюджет
+  выполнен). На 0.1B сам api.calibrate проверен (Mac: +3.96%, 144.11 МБ).
+- **До перехода в rwkv-metal осталось:** (1) этот прогон; (2) решение владельца про PyPI; (3) уборка /tmp (удаляет
+  владелец; на сервере, если не перезагружался, ещё /tmp/rq_0710b). Необязательное и то, что уже работа в портах, --
+  в записи «07.10 (день)» и в списке от 06.10 (потоковый префилл против цельного max|dlogit| 0.17-0.19 -- не разобран).
