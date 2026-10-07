@@ -3300,3 +3300,37 @@ gptq_calib >= 600 окон не в README; mlx / rwkv-metal обязательн
   0.004958 / 0.004707 = +5.3% и 0.002280 / 0.002160 = +5.6%. Остаток -- плотные тензоры (emb, нормы, LoRA-ветки модели)
   в bf16 (-0.5...-1.1% при fp16, на 1.5B не значимо) и bf16-счёт остальной модели. НЕ делалось: перевод параметров
   модели на fp16 затрагивает всю модель (смешение типов), отдельное решение.
+
+### 08.10 (ночь) — rwkv-metal: ПАМЯТЬ ЗАГРУЗКИ QLoRA-БАЗЫ И РАНГИ 0.4B (d50ccbc, 446c896 в rwkv-metal; локально, не запушены)
+rwkv-quant 5647f38 и rwkv-metal 0465d1e запушены 07.10 по слову владельца. Сервер по-прежнему недоступен (Connection refused).
+- **Память загрузки** (та же болезнь, что лечилась в Metal-бэкенде rwkv-quant 05.10). Замер: tests/_sess/mem_probe_0710.py,
+  mem_vmmap_0710.py, 1.5B files_0110. Было у COMPRESSION native=True (умолчание load_rwkvq_model), файл 950 МиБ:
+  footprint после загрузки 5353 МиБ, пик загрузки 5.6 ГБ, активная память MLX 2308; vmmap: «Malloc Large (empty)» 1.4 ГБ.
+  Причины: (а) родная упаковка MLX (rwkvq_native) перекладывала тензор целиком с int32-кодами на хосте (4 байта на вес),
+  K3-интерлив (_load_rwkvq_direct) -- тоже целиком; освобождённые крупные области macOS не отдаёт; (б) _SIDECAR_CACHE после
+  сборки держал K3-буферы (~0.9 ГБ MLX), которые native-модулям уже не нужны; (в) кеш MLX после загрузки не отпускался.
+  Правка: перекладка полосами строк (rwkvq_linear.HOST_BAND_MB = 16, _mx_bands), в конце публичных загрузчиков
+  add_rwkvq._finish_load: drop_sidecar_cache(path) + mx.clear_cache().
+  Стало: COMPRESSION native -- footprint 1740 МиБ, пик загрузки 3.3 ГБ, активная 1397, «Malloc Large (empty)» 243 МиБ;
+  COMPRESSION native=False -- footprint 1.7 -> 1.4 ГБ (активная 1284 -> 1178); REDUCTION -- активная 1684 -> 1547,
+  «empty» 180 МиБ (не менялось). Выход побитно прежний: tests/_sess/bits_ref_0710.py (логиты и градиенты адаптеров, 0.1B
+  reduction, compression native / свой кернель) до == после.
+  Гейт tests/test_load_memory.py: 9 свойств (K3 полосами == codec.sb6_to_k3 целиком на всех sb6-тензорах; родная упаковка
+  полосами == целиком по формам, включая голову; после загрузки файла нет в кеше; отпущенный кеш >= 90% K3-байт активной
+  памяти; отпечаток модели не зависит от полосы 1/8 МиБ / 16 / целиком на трёх конфигурациях), 3 мутации пойманы;
+  на 1.5B -- зелёный.
+  НЕ тронуто: кеш MLX между шагами обучения (1.6-2.3 ГБ на 1.5B, T=512; footprint в обучении 3.4-4.3 ГБ) -- лечится
+  mx.set_cache_limit у вызывающего; остаток «вне MLX» 340-430 МиБ.
+- **НАХОДКА 3: rwkv7-g1d-0.4b не открывался в rwkv-metal вовсе** (ни .pth, ни .rwkvq: «конверсия не чистая»). RWKV7X070
+  строился с рангами по формуле lora_ranks(D); у 0.4B (D=1024) ветка g имеет ранг 128, формула даёт 160 (у 0.1B / 1.5B /
+  2.9B формула совпадает с файлом). Правка: convert._ranks_from_shapes -- ранги по формам blocks.N.att.{w,a,v,g}1 во всех
+  трёх загрузчиках (load_pretrained, load_pretrained_partial, load_pretrained_rwkvq); формула -- запасной вариант.
+  Гейт tests/test_ranks_from_shapes.py: 7 свойств (ранги == снятым torch; плотная 0.1B и 0.4B сходятся с RWKV7Ref:
+  KL 8.9e-5 и 2.6e-5, top-1 100%; .rwkvq 0.4B обоих пресетов грузятся), 2 мутации пойманы. Отпечатки 0.1B не изменились.
+- Прогон гейтов rwkv-metal после всех правок (/tmp/rm_gates2/summary.txt): load_memory, dense_target, base_dtype (все с
+  мутациями), lincast, sym_dequant_bf16, rwkvq_sym_base, dev_rwkvq_only_vs_pth (оба пресета) на 0.1B; load_memory и
+  sym_gemm_fused на 1.5B; test_wkv7_backward / infer_var / state -- коды 0. Не гонялись: dev_rwkvq_direct (нужен сайдкар),
+  test_packaging_data.
+- **Что осталось.** rwkv-quant: сквозной calibrate() на 0.4B-2.9B (ждёт сервера), решение про PyPI, уборка /tmp.
+  rwkv-metal: параметры модели (emb, нормы, LoRA-ветки) в bf16 -- остаток разрыва +5.3...+5.6% KL к Metal-бэкенду;
+  SwiftRWKV (нет sym, нет чтения .rwkvq) -- отложен владельцем.
