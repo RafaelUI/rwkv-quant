@@ -3381,3 +3381,44 @@ rwkv-quant 5647f38 и rwkv-metal 0465d1e запушены 07.10 по слову 
 - /tmp Mac, новое: rm_head_0810, pdt_*, pdl_*, bf16_*.npz, *_0810.py/.sh/.log, rq_downstream_0810.log, run_gates*_0810.*.
 - В рабочем дереве rwkv-metal удалены runs/ru60m_curriculum/{run.json, eval_retrieval_from_checkpoint.json} -- не мной,
   в коммиты не вошли.
+
+### 08.10 (вечер) — ПЕРЕД SwiftRWKV: ПУШ, scale РОДНОГО БЭКЕНДА В fp16, САЙДКАР НА НЫНЕШНИХ ПРЕСЕТАХ, ЭТАЛОНЫ ДЛЯ ПОРТА
+- Запушено по слову владельца: rwkv-quant 4318d5f, rwkv-metal c029b73; серверный клон rwkv-quant обновлён.
+- **rwkv-metal, RwkvqNativeLinear: scale / bias в fp16** там, где деквант не меняется (fp32-вход quantized_matmul с fp16-scale
+  даёт тот же выход побитно). 1.5B COMPRESSION: 134 из 144 тензоров, активная память 1391 -> 1252 МиБ; 10 cmix.key остаются
+  fp32 -- у них блоки со scale на зажиме 1e-8 (в fp16 он ноль) при НЕнулевых кодах. Логиты и градиенты адаптеров побитно
+  прежние (сверено с кодом до правки). Гейт tests/test_native_scale_fp16.py (2 свойства, 2 мутации).
+  НАХОДКА (не правка): у зажатых блоков деквант Metal (fma) и codec (numpy, два округления) расходятся в 1 ulp -- 4870 эл.
+  на 1.5B COMPRESSION; так было и до правки, гейт печатает число.
+- **Сайдкар export_mlx на нынешних пресетах не работал вовсе**: load_lora_rwkvq_model(pth, сайдкар) -- «раскладка 'dense'
+  не поддержана» (o_proj слоя 0) на обоих, «sym-буферов нет» на REDUCTION. Правка: kind из манифеста сайдкара, плотная цель
+  из ::dense, sym -- новый SymQuantLinear.from_interleaved в rwkv-quant (одна реализация, закон 23). Гейт
+  tests/test_sidecar_presets.py: (pth, сайдкар) == (pth, .rwkvq) побитно на обоих, sym-деквант 73/73; 2 мутации.
+  dev_rwkvq_direct выбирает класс по раскладке -- пройден на обоих пресетах.
+- test_packaging_data rwkv-metal: колесо и sdist содержат словарь, байт в байт -- зелёный.
+- **Эталоны для порта SwiftRWKV**: tools/gen_rwkvq_fixtures.py -> ~/Develop/SwiftRWKV/.testdata/rwkvq2_{reduction,compression}
+  {_dequant.safetensors, _model.safetensors, .json} (вне git порта). 0.1B files_0110, .rwkvq напрямую. Деквант codec (fp32)
+  по 2 тензора на каждое (kind, bits, форма), emb/head -- строки [0:1024]; модель: input_ids[1,64], blk_out[L,64,D],
+  logits_metal (умолчание rwkv-metal: параметры fp16, база fp16) и logits_ref (fp32-параметры, точный счёт), состояние после
+  префилла, потоковый декод 8 токенов. KL(ref||metal) 4.7e-6 (red.) / 3.7e-6 (comp.), на декоде 3.2e-6 / 1.5e-6 -- ориентир
+  допуска для порта. Прежние фикстуры .testdata (июль, сайдкар sb6-REDUCTION) не тронуты.
+- Финальный прогон гейтов (/tmp/final_gates_0810.log): rwkv-metal -- downstream, param_dtype, native_scale_fp16,
+  sidecar_presets, dense_target, base_dtype, load_memory, ranks, sym_base, lincast, sym_dequant_bf16, wkv7_state / backward,
+  reranker smoke, only_vs_pth (оба пресета); rwkv-quant -- sym_* (6 гейтов), torch_free_import, mlx_affine_repack -- зелёные.
+  Своп за прогон 0.
+- Локально, не запушено: rwkv-quant 7c43c83 (from_interleaved) + эта записка; rwkv-metal 5e42df6 c3efcca 7d8f23e 94740fe .
+- /tmp Mac, новое за вечер: sc_0810 (сайдкары), rm_sidecar_gate, nat_*.npz, nsf_0810.log, g3*_0810.*, final_gates_0810.*,
+  pkg_metal_0810.log, wb.log, *_0810.py.
+
+#### Осталось (решения владельца)
+- PyPI rwkv-quant 0.3.0; выпуск rwkv-metal (CHANGELOG «Unreleased» собран); лимит кеша MLX в обучении по умолчанию;
+  уборка /tmp (Mac, сервер). Не на сейчас: fp16 на 7.2B+ (Mac не вмещает), качество QLoRA на COMPRESSION-базе на длинном
+  обучении, CUDA-бэкенд, исследовательские пункты README (sym в calibrate, NF4, «запечь» адаптер в квантованный файл).
+
+#### Что порт SwiftRWKV должен догнать (по сверке 07.10 и правкам 07-08.10)
+1. Раскладка sym (Q6_K, блок 16, int8-scale, fp16 d; 6 и 8 бит) -- без неё REDUCTION не открывается.
+2. Чтение .rwkvq напрямую (safetensors + JSON-манифест; codec.py -- образец), сайдкар -- необязательный кеш.
+3. Деквант в fp16 (норма rwkv-quant с 02.10), матмул базы в fp16; плотные параметры модели в fp16.
+4. Плотная цель (o_proj слоя 0 в обоих пресетах) -- замороженная плотная база под LoRA.
+5. Ранги low-rank веток по формам тензоров (0.4B: g = 128, формула даёт 160).
+6. Нулевой scale-зажим 1e-8 в sb6 (минимальная субнормаль fp16 ~6e-8) -- см. codec.sb6_to_mlx_affine.
