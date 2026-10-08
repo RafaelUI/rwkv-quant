@@ -772,6 +772,26 @@ class SymQuantLinear:
                    codes_packed=codes_packed, qh=qh, qh2=qh2, qs=qs, d=d)
         return obj
 
+    @classmethod
+    def from_interleaved(cls, *, shape, bits, qblk, qs, d):
+        """Из УЖЕ собранного интерлива -- тех буферов qblk / qs / d, что кладёт
+        в сайдкар formats/export_mlx (08.10). Нужен rwkv-metal: его прежний вход
+        через сайдкар на sym-тензорах падал, потому что объект строился только
+        из канонических буферов .rwkvq."""
+        OUT, IN = shape
+        assert IN % 256 == 0, f"sym-кернель: IN={IN} не кратен суперблоку 256"
+        obj = cls.__new__(cls)
+        obj.out_features, obj.in_features = OUT, IN
+        obj.bits = bits
+        obj.NB, obj.NSB = IN // 16, IN // 256
+        obj.qblk = mx.array(qblk).reshape(OUT, -1)
+        obj.qs = mx.array(qs)
+        obj.d = mx.array(d)
+        assert obj.qs.dtype == mx.uint8 and obj.d.dtype == mx.float16, (obj.qs.dtype, obj.d.dtype)
+        mx.eval(obj.qblk, obj.qs, obj.d)
+        obj.cfg_override = None
+        return obj
+
     def _build(self, *, shape, bits, codes, codes_packed, qh, qh2, qs, d):
         OUT, IN = shape
         assert IN % 256 == 0, f"sym-кернель: IN={IN} не кратен суперблоку 256"
