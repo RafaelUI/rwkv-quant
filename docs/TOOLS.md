@@ -1,4 +1,7 @@
-## QLoRA поверх `.rwkvq` в rwkv-metal (19-20.07, актуально)
+## QLoRA поверх `.rwkvq` в rwkv-metal (19-20.07; история)
+
+> Актуальное состояние — в rwkv-metal, `docs/lora.md`: обе раскладки пресетов (sym у REDUCTION, sb6 у
+> COMPRESSION) и плотные тензоры как база, точность базы, память загрузки. Таблица ниже — замеры июля.
 
 Всё бит-в-бит сверено с `rwkv_quant.formats.reader`. MLX-порт sb6/asym
 dequant (`rwkv_metal/lora/rwkvq_linear.py`, `rwkvq_kernel.py`) — 0

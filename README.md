@@ -53,8 +53,11 @@ What both do is described under [Quick start](#quick-start).
 
 - **Text** — 36 windows of 512 tokens from Wikipedia, 12 each in English,
   Russian and Serbian.
-- **Code** — 24 windows of Python and Swift. The code set is private and is
-  not published.
+- **Code** — 24 windows of Python and Swift from a private set. An open set
+  of 48 windows (`tests/data/eval_code_open.json`, same isolation check)
+  was added later; on it the library files score within 10% of KL of the
+  private set, and no conclusion changes (the [article](docs/ARTICLE-1.md),
+  section 13, has the full table on the open set).
 - **Isolation.** Neither set shares a single 16-token sequence with the
   activation-statistics corpus, nor with the GPTQ calibration corpus; this is
   checked before every measurement.
@@ -90,7 +93,8 @@ The real path and the server path agree:
 
 Points of Δppl, real minus server. The Metal kernels are faithful: the same
 file decoded into PyTorch gives the real-path numbers within 0.02 points
-(1.5B `compression`: +1.99% / +1.84% against +1.97% / +1.82%).
+(1.5B `compression`, one run on 2026-10-02: +1.99% / +1.84% against
++1.97% / +1.82% on Metal).
 
 The larger `compression` differences come from the server column. It
 measures the research prototype's GPTQ, and that lands on different codes
@@ -624,7 +628,7 @@ from rwkv_quant import quantize
 # near-lossless: 2.1x smaller, +0.27% ppl on 1.5B, +0.09% on 2.9B (held-out text, table above)
 quantize("model.pth", "model.rwkvq", preset="reduction", tokenizer=tok)
 
-# 3.1x smaller, +1.97% ppl on 1.5B, +1.32% on 2.9B, fastest decode
+# 3.1x smaller, +1.98% ppl on 1.5B, +1.32% on 2.9B, fastest decode
 quantize("model.pth", "model.rwkvq", preset="compression", tokenizer=tok)
 
 # on a CUDA machine, layers spread over several cards
@@ -691,7 +695,6 @@ notice. `gptq=False` turns it off; `gptq_calib=` takes your own windows: a
 at least 600 of them — the first 600 windows and the first 512 tokens of each
 are used, and a smaller set is rejected with a `ValueError`. The run is
 recorded in the file manifest.
-```
 
 With `preset="compression"`, `quantize()` also runs **autopick** by default:
 it measures how much each matrix's quantization error costs this particular
@@ -703,9 +706,10 @@ by 17.6% on held-out text and 13.5% on held-out code. Text is Wikipedia
 en/ru/sr with no 16-gram shared with the calibration corpus. The perplexity
 gap goes +3.88% -> +3.25% on the text and +3.86% -> +3.32% on the code.
 
-Together with GPTQ the two gains nearly multiply on five of the six model
-sizes. The exception is 2.9B, where autopick adds only 5% on top of GPTQ;
-see the table at the top.
+Together with GPTQ the two gains mostly stack: on top of GPTQ, autopick still
+cuts text KL by 12-17% on 0.4B-13.3B and by 41% on 0.1B, against 16-21% and
+39% without GPTQ (files written by `quantize()`, scored on the server;
+[article](docs/ARTICLE-1.md), section 13).
 The measurement needs the dense model in memory and takes about an hour for
 1.5B on an M4 (linear in model depth x windows; cached under
 `~/.cache/rwkv-quant/measure`). If the dense model would take more than 30%
@@ -776,8 +780,32 @@ logits, state = model.step(token_ids, state)   # prefill AND decode
 
 Presets are calibrated on `rwkv7-g1h-1.5b` — see
 [Why presets aren't universal](#why-quantization-sensitivity-doesnt-transfer-across-scale).
-For a checkpoint-specific config run `calibrate()`, or start from a preset
-and change what you need:
+For a checkpoint-specific config run `calibrate()`:
+
+```python
+from rwkv_quant import calibrate, quantize
+
+cfg = calibrate("model.pth", "eval_tokens.pt",      # [N, T] token ids, or {"tokens": ...}
+                ppl_threshold_pct=5.0,              # budget for the whole model
+                act_stats_path="stats.pt")          # optional: enables AW candidates
+quantize("model.pth", "model.rwkvq", tokenizer=tok, config=cfg, gptq=True)
+```
+
+It screens every group's applicable layouts in isolation, then raises the
+weakest groups until the *whole* quantized model fits the threshold:
+isolated errors add up, and eight groups at 5% each are well above 5%
+together. If the budget cannot be met it says so with a warning and
+`cfg.calibration_report["budget_met"]` is `False`; `"final"` holds the
+measured composite. At 5% the budget was met on 0.1B, 0.4B, 1.5B and 2.9B
+(+3.96 / +4.10 / +4.63 / +4.53%). A config of your own does not get GPTQ or
+autopick implicitly; `gptq=True` adds GPTQ. Without `act_stats_path` the
+activation-weighted modes are not searched. On the reference sizes the
+`compression` preset is still both smaller and closer to bf16 than a 5%
+`calibrate()` config (1.5B: 996.5 MB against 1143.8 MB) — it adds GPTQ and
+autopick to a layout chosen by measurement — so `calibrate()` is for
+checkpoints the presets were not validated on.
+
+Or start from a preset and change what you need:
 
 ```python
 import copy
@@ -813,7 +841,8 @@ whose ids all fall inside the model's range.
 
 ## Format
 
-`.rwkvq` stores two block layouts, chosen per parameter group.
+`.rwkvq` stores three block layouts, chosen per parameter group, plus
+per-row rounding and dense (bf16) tensors.
 
 **`sym`** (Q6_K-style, what `reduction` uses for `proj`/`cmix`/`emb`/`head`):
 blocks of **16** weights share one **int8** scale, superblocks of 16 blocks
@@ -824,13 +853,28 @@ separate min is paid for twice (six bits for the min *and* a scale
 truncated to six bits), while halving the block and giving the scale a
 whole byte spends the same budget better.
 
-**`sb6`** (group-wise asymmetric, what `compression` uses and what the LoRA
-branches use in both presets): blocks of 32 weights share a 6-bit scale/min
+**`sb6`** (group-wise asymmetric, what `compression` uses for
+`proj`/`cmix`/`emb`/`head`): blocks of 32 weights share a 6-bit scale/min
 pair (`qs`/`qm`), superblocks of 256 share an fp16 pair (`d`/`dm`) that the
 6-bit pairs multiply. Codes are packed as nibbles; INT5/INT6 add one/two
 bit-planes on top. Scale search is
-activation-weighted where it helps (per-group setting). The format is
-backend-independent; per-tensor bits and modes live in the file, not in code.
+activation-weighted where it helps (per-group setting).
+
+**`asym`** (what the LoRA branches `w`/`a`/`v` use in both presets): blocks
+of 64 weights with an fp32 scale and min each, one code per byte — 9 bits per
+weight at any bit depth (see [What a bit actually costs on
+disk](#what-a-bit-actually-costs-on-disk)). `g_lora` is 8-bit per-row, and
+`small`, plus layer 0's output projection, stay dense in both presets.
+
+The format is backend-independent; per-tensor bits and modes live in the
+file, not in code. The writer stores exactly these combinations: `sb6` at
+4/5/6 bits (`asym_sb6`, `asym_sb6_search`, `asym_sb6_aw`), `sym` at 6/8
+(`sym`, `sym_plain`, `sym_aw`) and `asym` at 5-8. `sb6` and `sym` also need
+the input width to be a multiple of their superblock (256 weights at the
+presets' block sizes). A config
+asking for anything else — another bit depth, an unknown mode, a width that
+does not divide — is refused by `quantize()` with a `ValueError` that lists
+the offending tensors, before any work starts.
 
 **The container is safetensors, not pickle.** A `.rwkvq` file is a
 safetensors archive: flat `key::field` buffers plus one JSON manifest in
@@ -997,7 +1041,8 @@ SpQR-style sparse-outlier path is retained in `calibration/` for study.
 
 The search in `calibrate()` minimizes file size, so its cost model is
 measured, not derived (`tests/probe_schema_cost.py --check` re-verifies it
-against the writer):
+against the writer). `sym`, the `reduction` layout, is listed for
+comparison; `calibrate()` does not search it:
 
 | scheme | bits/weight | | scheme | bits/weight |
 |---|---|---|---|---|
@@ -1005,7 +1050,8 @@ against the writer):
 | sb6 @5 | 5.500 | | asym gw64 @6 | **9.000** |
 | sb6 @6 | 6.500 | | asym gw64 @8 | **9.000** |
 | per-row RTN @4 | 4.021 | | per-row RTN @6 | **8.021** |
-| | | | per-row RTN @8 | **8.021** |
+| sym @6 | 6.5625 | | per-row RTN @8 | **8.021** |
+| sym @8 | 8.5625 | | | |
 
 Two consequences that are easy to miss:
 
@@ -1032,8 +1078,9 @@ Two consequences that are easy to miss:
   will work but may prefer different (simdgroups x rows) configs.
 - ppl deltas are measured on 36 windows of Wikipedia text and 24 windows of
   code (60 x 512 tokens). Treat them as relative quality signals, not
-  benchmarks. The code set is private, so that column cannot be reproduced
-  from this repository.
+  benchmarks. The code column of the Results table uses a private set; the
+  open set in `tests/data/eval_code_open.json` reproduces the same
+  conclusions (article, section 13).
 - `scripts/` and `examples/` are placeholders for now — the maintained entry
   points are `rwkv_quant.api` and the benches/gates under `tests/`.
 - CUDA backend is an empty stub; Metal is the only real inference path today.
@@ -1084,6 +1131,9 @@ contribute:
   number of bits and only changes a 16-entry lookup table in the kernel —
   the classic "free quality" lever, and the one most likely to unlock a
   lower bit width. Not tried.
+- **`calibrate()` does not search the `sym` layout**, so it cannot land on
+  a `reduction`-like point; its candidates are `sb6`, `asym` and 8-bit
+  per-row. For near-lossless files start from the `reduction` preset.
 - **Presets are calibrated on 1.5B and validated on 2.9B.** Smaller and
   much larger checkpoints are open, and sensitivity is known to shift
   (see [Why quantization sensitivity doesn't transfer across

@@ -22,6 +22,7 @@ import torch
 
 from rwkv_quant.calibration.group_config import QuantConfig
 from rwkv_quant.calibration import schema_space as ss
+from rwkv_quant.calibration import groupwise as _gw
 from rwkv_quant.formats import writer
 from rwkv_quant.formats.writer import TENSOR_FIELDS
 
@@ -68,6 +69,14 @@ def main(check=False):
             QuantConfig(cmix=bits, group_scale={"cmix": 64},
                         group_scale_mode={"cmix": "asym"}),
             ss.ASYM_COST)
+    # sym (раскладка REDUCTION) в поиске calibrate() не участвует, но её
+    # цена стоит в README рядом с остальными -- и сверяется тут же.
+    # Модель: коды + int8-scale на блок 16 + fp16 d на суперблок 256.
+    for bits in (6, 8):
+        row(f"sym gs16@{bits}",
+            QuantConfig(cmix=bits, group_scale={"cmix": 16},
+                        group_scale_mode={"cmix": "sym"}),
+            bits + 8 / 16 + 16 / (16 * _gw.sym_super(16)))
     for bits in (4, 6, 8):
         row(f"rtn per-row@{bits}", QuantConfig(cmix=bits),
             ss._rtn_cost(bits, IN))
