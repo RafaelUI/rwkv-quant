@@ -7,8 +7,6 @@ rwkv-quant/
 ├── STRUCTURE.md
 ├── NEXT_SESSION.md                 # working notes (state, measurements, open items)
 ├── LICENSE
-├── k3_patch.py                     # history: one-off patch that added kernel 3 to
-│                                   #   quant_linear_gw.py; already applied, refuses to rerun
 ├── rwkv_quant/
 │   ├── __init__.py                 # lazy imports: `formats.codec` must import without torch
 │   ├── api.py                      # quantize(checkpoint, output, preset | config), calibrate()
