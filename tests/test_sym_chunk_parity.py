@@ -16,6 +16,8 @@ test_groupwise_parity; симметричная нарезки не имела �
 
     python tests/test_sym_chunk_parity.py [ckpt] [device]
 """
+import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _ckpt import ckpt_1p5b  # 1.5B: RWKVQ_CKPT_1P5B, g1h или g1j
 import os
 import sys
 
@@ -25,8 +27,7 @@ import torch
 
 from rwkv_quant.calibration import groupwise as gw
 
-CKPT = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser(
-    "~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
+CKPT = sys.argv[1] if len(sys.argv) > 1 else ckpt_1p5b()
 DEV = sys.argv[2] if len(sys.argv) > 2 else "mps"
 
 

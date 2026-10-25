@@ -23,6 +23,8 @@
 
     python tests/test_emb_aw_is_noop.py [checkpoint.pth] [act_stats.pt]
 """
+import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _ckpt import ckpt_1p5b  # 1.5B: RWKVQ_CKPT_1P5B, g1h или g1j
 import copy
 import hashlib
 import os
@@ -36,7 +38,7 @@ from rwkv_quant.presets import REDUCTION  # noqa: E402
 from rwkv_quant.formats.writer import quantize_tensor, TENSOR_FIELDS  # noqa: E402
 
 CKPT = (sys.argv[1] if len(sys.argv) > 1 else
-        os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth"))
+        ckpt_1p5b())
 STATS = sys.argv[2] if len(sys.argv) > 2 else "/tmp/act_stats_1p5b_ml.pt"
 
 

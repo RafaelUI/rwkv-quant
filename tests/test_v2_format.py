@@ -5,6 +5,8 @@ LoRA@6 gw64) квантуем один живой тензор 1.5B двумя �
   fake: quantize_tensor(real_gw=False) -> dense bf16
   real: quantize_tensor(real_gw=True)  -> packed -> reader._dequantize_one
 и требуем ПОБИТОВОГО равенства bf16. Один процесс, без модели -- быстро."""
+import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _ckpt import ckpt_1p5b  # 1.5B: RWKVQ_CKPT_1P5B, g1h или g1j
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
@@ -12,7 +14,7 @@ from rwkv_quant.calibration.group_config import QuantConfig
 from rwkv_quant.formats.writer import quantize_tensor
 from rwkv_quant.formats.reader import _dequantize_one
 
-CKPT = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
+CKPT = ckpt_1p5b()
 
 CHAMPION = QuantConfig(
     proj=5, cmix=4, emb_head=5,

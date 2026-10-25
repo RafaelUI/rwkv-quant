@@ -27,6 +27,8 @@
 
     python tests/test_sym_packer_parity.py [ckpt ...]
 """
+import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _ckpt import ckpt_1p5b  # 1.5B: RWKVQ_CKPT_1P5B, g1h или g1j
 import glob
 import os
 import sys
@@ -40,8 +42,7 @@ from rwkv_quant.calibration.group_config import QuantConfig  # noqa: E402
 from rwkv_quant.formats import codec, writer  # noqa: E402
 from rwkv_quant.formats.reader import _dequantize_one  # noqa: E402
 
-CKPTS = sys.argv[1:] or [os.path.expanduser(
-    "~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")]
+CKPTS = sys.argv[1:] or [ckpt_1p5b()]
 KEYS = ["blocks.3.ffn.key.weight", "blocks.3.ffn.value.weight",
         "blocks.3.att.key.weight", "emb.weight", "head.weight"]
 MAX_ROWS = 4096          # emb/head целиком не нужны: раскладка вдоль IN

@@ -1,6 +1,8 @@
 """Негативный контроль бит-точности: тест test_v2_format мог бы проходить
 'тривиально' (общий кэш, пронос dense). Здесь: (1) порча одного байта
 каждого packed-поля ДОЛЖНА менять деквант; (2) деквант != исходный w."""
+import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _ckpt import ckpt_1p5b  # 1.5B: RWKVQ_CKPT_1P5B, g1h или g1j
 import sys, os, copy
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
@@ -9,7 +11,7 @@ from rwkv_quant.formats.reader import _dequantize_one
 from rwkv_quant.formats import codec
 from test_v2_format import CHAMPION
 
-CKPT = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
+CKPT = ckpt_1p5b()
 sd = torch.load(CKPT, map_location="cpu")
 
 for key in ["blocks.0.att.receptance.weight", "blocks.0.ffn.key.weight",

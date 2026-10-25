@@ -7,6 +7,8 @@ group_scale_mode при bits=6:
   cmix      -> mode="asym_sb6_aw"   (с AW, с search)       -- xbits=2, search=True
   emb_head  -> mode="asym_sb6_aw"   (с AW, с search)       -- xbits=2, search=True
 """
+import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _ckpt import ckpt_1p5b  # 1.5B: RWKVQ_CKPT_1P5B, g1h или g1j
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch, numpy as np, mlx.core as mx
@@ -22,7 +24,7 @@ from ablate_sym_composite import LEGACY_REDUCTION
 REDUCTION = copy.deepcopy(LEGACY_REDUCTION)
 REDUCTION.act_stats_path = os.path.expanduser("~/Develop/WKV-kvant/artifacts/act_stats_1p5b_ml.pt")
 
-CKPT = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
+CKPT = ckpt_1p5b()
 sd = torch.load(CKPT, map_location="cpu")
 torch.manual_seed(0)
 

@@ -5,13 +5,15 @@ rwkv7-g1h-1.5b, см. diagnose_one.py). Ожидаем: guard детектиру
 относительно допуска и откатывает g_lora (или другую branch) вверх по
 битности, пока не уложится в допуск.
 """
+import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _ckpt import ckpt_1p5b  # 1.5B: RWKVQ_CKPT_1P5B, g1h или g1j
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 from rwkv_quant.models.rwkv7_ref import RWKV7Ref
 from rwkv_quant.calibration.ablation import perplexity, combined_sanity_check
 
-CKPT_PTH = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
+CKPT_PTH = ckpt_1p5b()
 CORPUS = os.path.expanduser("~/Develop/WKV-kvant/eval_corpus_world.pt")
 
 model = RWKV7Ref(CKPT_PTH, device="cpu", dtype=torch.float32)

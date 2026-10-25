@@ -1,5 +1,7 @@
 """Численная сверка GwQuantLinear (GEMV sb6 + GEMM-путь) с референсом
 x @ dequant(qt).T в fp32 на живых тензорах чемпион-конфига."""
+import os as _os, sys as _sys; _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from _ckpt import ckpt_1p5b  # 1.5B: RWKVQ_CKPT_1P5B, g1h или g1j
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch, numpy as np, mlx.core as mx
@@ -8,7 +10,7 @@ from rwkv_quant.formats.reader import _dequantize_one
 from rwkv_quant.backends.metal.quant_linear_gw import GwQuantLinear
 from test_v2_format import CHAMPION
 
-CKPT = os.path.expanduser("~/Develop/WKV-kvant/rwkv7-g1h-1.5b-ctx10240.pth")
+CKPT = ckpt_1p5b()
 sd = torch.load(CKPT, map_location="cpu")
 torch.manual_seed(0)
 
