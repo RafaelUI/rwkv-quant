@@ -2,68 +2,90 @@
 
 ```
 rwkv-quant/
-├── pyproject.toml
-├── README.md
+├── pyproject.toml                  # rwkv-quant 0.3.0; mlx and rwkv-metal on macOS only
+├── README.md                       # results, method, quick start, format, kernels
 ├── STRUCTURE.md
+├── NEXT_SESSION.md                 # working notes (state, measurements, open items)
 ├── LICENSE
+├── k3_patch.py                     # history: one-off patch that added kernel 3 to
+│                                   #   quant_linear_gw.py; already applied, refuses to rerun
 ├── rwkv_quant/
-│   ├── __init__.py
-│   ├── api.py                     # high-level entry points: quantize(), calibrate()
-│   ├── presets.py                 # "reduction" / "compression" QuantConfig presets
+│   ├── __init__.py                 # lazy imports: `formats.codec` must import without torch
+│   ├── api.py                      # quantize(checkpoint, output, preset | config), calibrate()
+│   ├── presets.py                  # "reduction" / "compression" as ready QuantConfigs
+│   ├── world_tokenizer.py          # RWKV World tokenizer (trie), pure Python
 │   │
-│   ├── calibration/                # platform-agnostic. pure PyTorch. no backend
-│   │   ├── __init__.py             # code lives here -- this is the actual "brain"
-│   │   ├── outlier_scan.py         # per-channel max/mean ratio profiling
-│   │   ├── fake_quant.py           # symmetric RTN + percentile-clip + SpQR sparse
-│   │   ├── group_config.py         # QuantConfig, GROUPS, bit/outlier-frac/clip fields
-│   │   └── ablation.py             # perplexity ablation harness (single-group,
-│   │                                #   mixed-config, bit/percentile sweeps)
+│   ├── calibration/                # platform-agnostic, pure PyTorch -- the "brain"
+│   │   ├── group_config.py         # QuantConfig, GROUPS (quantized parameter groups)
+│   │   ├── fake_quant.py           # symmetric RTN, percentile clip, SpQR sparse outliers
+│   │   ├── groupwise.py            # block-wise schemes (sb6, sym) in fake form
+│   │   ├── gptq.py                 # GPTQ on the sb6 and sym grids
+│   │   ├── act_stats.py            # E[x^2] per input channel, collected in the library
+│   │   ├── autopick.py             # "weak spot -> bit" rule, both directions
+│   │   ├── schema_space.py         # which schemes apply to which tensor
+│   │   ├── outlier_scan.py         # per-channel max/mean profiling
+│   │   └── ablation.py             # perplexity ablation harness (groups, bits, clips)
 │   │
-│   ├── formats/                    # the portable quantized checkpoint format.
-│   │   ├── __init__.py             #   this is the missing "unified format" gap
-│   │   ├── schema.py               #   in the RWKV ecosystem -- per-tensor bits +
-│   │   ├── codec.py                #   sparse outlier indices/values, backend-agnostic
-│   │   ├── writer.py               # codec.py: НОРМАТИВНАЯ раскладка на чистом
-│   │   ├── reader.py               #   numpy, без torch -- с неё портируются
-│   │   └── export_mlx.py           #   rwkv-metal и SwiftRWKV (гейт:
-│   │                               #   tests/test_codec_parity.py)
+│   ├── formats/                    # the portable .rwkvq format
+│   │   ├── codec.py                # NORMATIVE layout in numpy, no torch: container,
+│   │   │                           #   bit layout, dequant of every layout; ports
+│   │   │                           #   (rwkv-metal, SwiftRWKV) follow this file
+│   │   ├── schema.py, reader.py    # torch twins of codec (faster dequant; gate
+│   │   │                           #   tests/test_codec_parity.py)
+│   │   ├── writer.py               # real (not fake) quantization + save to .rwkvq
+│   │   └── export_mlx.py           # torch-free MLX sidecar: safetensors + JSON manifest
 │   │
 │   ├── models/
-│   │   ├── __init__.py
-│   │   ├── rwkv7_ref.py            # reference forward pass, used ONLY for
-│   │   │                            #   calibration/validation (slow, exact --
-│   │   │                            #   not for production inference)
-│   │   └── naming.py               # detects checkpoint naming scheme (custom
-│   │                                #   vs. official BlinkDL "world" naming) and
-│   │                                #   normalizes to one internal representation
+│   │   ├── rwkv7_ref.py            # reference forward (PyTorch), for calibration and
+│   │   │                           #   validation only -- not an inference path
+│   │   └── naming.py               # custom vs official BlinkDL tensor naming
 │   │
-│   └── backends/                   # platform-specific inference. consumes
-│       ├── __init__.py             #   the .rwkvq format from formats/, produced
-│       ├── metal/                  #   by calibration/. this is the ONLY layer
-│       │   ├── __init__.py         #   that's platform-specific.
-│       │   ├── quant_model.py      # QuantRWKV7: stateful decode/prefill, fused paths
-│       │   ├── quant_linear_gw.py  # sb6 GEMV/GEMM kernels (кернель-3), N-batch verify
-│       │   ├── quant_linear_v2.py  # per-row packed linears (loras/small)
-│       │   └── quant_linear.py     # legacy
-│       └── cuda/                   # empty stub for now
-│           └── __init__.py
+│   ├── data/                       # bundled calibration text (calib_corpus.txt,
+│   │                               #   gptq_calib.jsonl)
+│   │
+│   └── backends/                   # the only platform-specific code
+│       ├── metal/                  # MLX inference over .rwkvq (macOS)
+│       │   ├── quant_model.py      # QuantRWKV7: model from .rwkvq, prefill and stateful
+│       │   │                       #   decode; WKV kernels come from rwkv-metal
+│       │   ├── generate.py         # generation with an async_eval pipeline
+│       │   ├── quant_linear_gw.py  # sb6 ("compression"): GEMV/GEMM kernels, kernel 3
+│       │   ├── quant_linear_sym.py # sym ("reduction", Q6_K-like): GEMV kernels
+│       │   ├── gw_dequant_kernel.py# one-pass sb6 dequant kernel -> fp16
+│       │   ├── fused_prewkv.py     # pre-WKV block (w, a, kk, k/v update) in one function
+│       │   ├── fused_tail.py       # TMix tail (group norm + bonus + gate) in one kernel
+│       │   ├── quant_linear_v2.py  # int8 per-row scale GEMV (older format)
+│       │   ├── quant_linear.py     # v1 int8 + SpQR linear, kept as the reference for v2
+│       │   └── gw_linear_tiled.py  # stub: tiled GEMM not written yet; for now an alias
+│       │                           #   of the dense path (the reference it must match)
+│       └── cuda/                   # empty: no CUDA inference backend yet (quantize()
+│                                   #   and calibration do run on CUDA, multi-GPU)
 │
-├── scripts/                        # CLI wrappers -- EMPTY STUBS for now,
-│   ├── calibrate.py                #   use rwkv_quant.api directly
-│   ├── quantize.py
-│   └── benchmark.py
+├── docs/
+│   ├── LAWS.md                     # measurement methodology rules
+│   ├── ARTICLE-1.md                # article draft: what breaks across model sizes
+│   ├── VS-GGUF-MLX.md              # .rwkvq vs GGUF and MLX (numbers dated 08.10)
+│   ├── TOOLS.md, REFERENCE.md      # history: QLoRA over .rwkvq, old preset tables
+│   └── LOG-*.md                    # session logs split out of NEXT_SESSION.md
 │
-├── tests/                          # gates (test_*), benches (bench_*),
-│   ├── test_gw_kernel*.py          #   profilers, spec-decode demos, eval
-│   ├── test_gw_nb_parity.py        #   harnesses; venv/ lives here.
-│   ├── test_fuse_parity.py         #   Naming: гейты бит-в-бит и численные,
-│   ├── bench_*.py, profile_*.py    #   бенчи только A/B в одном процессе
-│   ├── spec_decode_*.py            #   (см. законы в NEXT_SESSION.md)
-│   └── fixtures/                   # small synthetic checkpoints, NOT the real
-│                                    #   61M/1.5B models (too large for the repo)
+├── tests/                          # flat: test_* -- gates (bit-exact and numeric,
+│   │                               #   64 files); bench_* -- A/B benches in one process;
+│   │                               #   eval_*, probe_*, diagnose_*, profile_*, spec_*,
+│   │                               #   ablate_* -- instruments
+│   ├── mutate_streaming_gate.py    # mutation cap for test_streaming_inference
+│   ├── _sess/                      # one-off session instruments (named in NEXT_SESSION)
+│   ├── dev/                        # MLX dequant prototypes, reference dumps
+│   ├── ane_probe/                  # Swift probes of Core ML / ANE
+│   ├── data/                       # eval sets and calibration measurements (JSON)
+│   └── fixtures/                   # small golden files; real checkpoints are not
+│                                   #   in the repo
 │
-└── examples/
-    └── quantize_ru60m.md           # reproducible walkthrough on a small model
+├── tests_local/                    # local helpers: rebuilding checkpoint names,
+│                                   #   quantizing 0.4B
+├── tools/
+│   └── convert_pth_to_gguf.py      # RWKV-7 .pth -> GGUF (F16) for llama.cpp comparisons
+│
+└── scripts/                        # calibrate.py, quantize.py, benchmark.py -- empty
+                                    #   stubs; use rwkv_quant.api
 ```
 
 ## Design principles
@@ -116,8 +138,9 @@ because calibration results feed directly into the quantization decisions
 shipped to backends.
 
 **`backends/` are the only platform-specific code.** `metal/` wraps
-[rwkv-metal](https://github.com/)'s kernels; `cuda/` is a separate
-implementation. Both are expected to consume the same `.rwkvq` files
+[rwkv-metal](https://github.com/RafaelUI/rwkv-metal)'s WKV kernels and adds
+its own GEMV/GEMM kernels for the quantized layouts; `cuda/` is meant to be a
+separate implementation and is not written yet. Both are expected to consume the same `.rwkvq` files
 produced by `calibration/` + `formats/writer.py` — no backend-specific
 calibration logic.
 
